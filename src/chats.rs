@@ -582,10 +582,13 @@ impl Chat {
     }
 }
 
-/// A name or title from someone else on one clean line.
+/// A name or title from someone else on one clean line, capped like a
+/// preview: a chat title is drawn (and so re-measured) every frame, and a
+/// sender can make it any length.
 fn one_line(text: &str) -> String {
     let clean = text::clean(text);
-    clean.split_whitespace().collect::<Vec<_>>().join(" ")
+    let line = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    text::first_chars(&line, PREVIEW_CHARS).to_string()
 }
 
 /// How much of the last message a chat list row keeps.

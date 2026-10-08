@@ -910,9 +910,14 @@ impl App {
                 if let Some(user_id) = info.user_id
                     && info.kind == crate::meta::ChatKind::Dm
                 {
-                    self.users
-                        .entry(user_id)
-                        .or_insert_with(|| text::clean(&info.title));
+                    // One line, like every other name path: the title is a
+                    // person's name here, and a sender's name can hold breaks.
+                    self.users.entry(user_id).or_insert_with(|| {
+                        text::clean(&info.title)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    });
                 }
                 self.chats.upsert(&info);
             }
@@ -1902,7 +1907,7 @@ impl App {
         matches!(self.screen, Screen::Main)
             && self.present()
             && matches!(self.focus, Focus::Messages | Focus::Input)
-            && self.settings_menu.is_none()
+            && !self.popup_over_chat()
             && self.open.as_ref().is_some_and(|o| {
                 o.chat_id == chat_id
                     && o.at_newest
@@ -2672,6 +2677,15 @@ impl App {
 
     /// A popup, a prompt or the composer is taking keys.
     fn busy(&self) -> bool {
+        self.popup_over_chat() || self.focus == Focus::Input
+    }
+
+    /// A modal layer is up over the chat: a confirm, menu, picker, prompt,
+    /// the photo viewer, settings or the resize bar. These cover the view
+    /// and take every key, so the user isn't reading the chat behind them —
+    /// which is why `watching` (read receipts) must treat them as not seen,
+    /// not just the settings menu.
+    fn popup_over_chat(&self) -> bool {
         self.confirm.is_some()
             || self.settings_menu.is_some()
             || self.delete_menu.is_some()
@@ -2681,7 +2695,6 @@ impl App {
             || self.picker.is_some()
             || self.resizing.is_some()
             || self.prompt.is_some()
-            || self.focus == Focus::Input
     }
 
     fn open_externally(&mut self, target: &str) {
@@ -2872,11 +2885,21 @@ impl App {
         match pasted.content {
             Ok(Paste::Files(paths)) => {
                 // Copied files have absolute paths; anything else would be
-                // looked for wherever tuimeta was started.
-                let (paths, relative): (Vec<_>, Vec<_>) =
-                    paths.into_iter().partition(|p| p.is_absolute());
-                if !relative.is_empty() {
-                    self.status = Some("Copied files without a full path were left out".into());
+                // looked for wherever tuimeta was started. A `\\server\share`
+                // path is absolute but on another machine, and even stat-ing
+                // it hands that server the user's login hash, so it's dropped
+                // unlooked-at too (same rule as a dropped/text paste, via
+                // attach::on_another_machine).
+                let total = paths.len();
+                let paths: Vec<_> = paths
+                    .into_iter()
+                    .filter(|p| p.is_absolute() && !attach::on_another_machine(p))
+                    .collect();
+                if paths.len() != total {
+                    self.status = Some(
+                        "Copied files without a full path, or on another machine, were left out"
+                            .into(),
+                    );
                 }
                 self.attach(paths, None);
             }
@@ -3448,6 +3471,14 @@ mod tests {
         app.mark_seen();
         assert!(sent(&app).is_empty(), "a popup covers it");
         app.settings_menu = None;
+
+        // A popup the user opens without leaving the newest message (the
+        // picker, a prompt, the resize bar) still covers the chat: a message
+        // that arrives behind it isn't seen, so no receipt goes out.
+        app.picker = Some(crate::picker::ChatPicker::new());
+        app.mark_seen();
+        assert!(sent(&app).is_empty(), "the finder covers it");
+        app.picker = None;
 
         app.open.as_mut().unwrap().selected = Some(SUNNY_IN_DEMO);
         app.mark_seen();

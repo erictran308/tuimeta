@@ -13,6 +13,9 @@
 ///   fillers of "invisible" Telegram names, the soft hyphen, zero-width
 ///   spaces and the like. Joiners and variation selectors stay, since emoji
 ///   need them.
+/// - the line and paragraph separators (U+2028, U+2029): not control
+///   characters, but a terminal that breaks a line on them would push the
+///   rest of a message body out of the bubble the layout drew for it.
 /// - the private character kitty uses to place images, so text can't pose
 ///   as one.
 pub fn is_hidden(c: char) -> bool {
@@ -32,6 +35,8 @@ pub fn is_hidden(c: char) -> bool {
                 | '\u{17B5}'
                 | '\u{180E}'
                 | '\u{200B}'
+                | '\u{2028}'
+                | '\u{2029}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{206A}'..='\u{206F}'
                 | '\u{3164}'
@@ -64,6 +69,8 @@ mod tests {
         assert_eq!(clean("a\u{1b}[2Jb\rc\u{7}d\u{9b}e"), "a[2Jbcde");
         assert_eq!(clean("one\ntwo\tthree"), "one\ntwo\tthree");
         assert_eq!(clean("עברית and العربية"), "עברית and العربية");
+        // Line and paragraph separators go, so a body can't break its bubble.
+        assert_eq!(clean("legit\u{2028}spoof\u{2029}more"), "legitspoofmore");
     }
 
     #[test]

@@ -55,8 +55,12 @@ fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
         // On Windows even creating a folder there hands that server your
         // login hash, and the session would live on it. A single leading
         // slash can also name one there (`\??\UNC\…`); `C:\` does the rest.
+        // A relative path on Windows would sit under the working directory,
+        // whose permissions aren't checked (the private_place guard below is
+        // Unix-only), so it's refused: the error promises a drive letter.
         let elsewhere = attach::on_another_machine(&dir)
-            || (cfg!(windows) && matches!(dir.as_os_str().as_encoded_bytes(), [b'/' | b'\\', ..]));
+            || (cfg!(windows) && matches!(dir.as_os_str().as_encoded_bytes(), [b'/' | b'\\', ..]))
+            || (cfg!(windows) && !dir.is_absolute());
         if elsewhere {
             bail!("TM_DATA_DIR must be a folder on this computer, with a drive letter on Windows");
         }

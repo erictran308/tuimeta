@@ -161,7 +161,8 @@ func (s *e2eeStore) remove(ctx context.Context, chat, sender, id string) error {
 	return err
 }
 
-// prune keeps the newest MaxStoredPerChat messages of each chat.
+// prune keeps the newest MaxStoredPerChat messages of each chat. It runs
+// once at startup to bound a store grown over-cap by an older build.
 func (s *e2eeStore) prune(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM tuimeta_e2ee_message WHERE rowid IN (
@@ -169,6 +170,17 @@ func (s *e2eeStore) prune(ctx context.Context) error {
 				SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat ORDER BY ts DESC) AS n FROM tuimeta_e2ee_message
 			) WHERE n > ?
 		)`, MaxStoredPerChat)
+	return err
+}
+
+// pruneChat keeps the newest MaxStoredPerChat messages of one chat. It runs
+// after each insert, so a chat's decrypted messages never pile up past the
+// cap on disk (the store isn't encrypted at rest).
+func (s *e2eeStore) pruneChat(ctx context.Context, chat string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM tuimeta_e2ee_message WHERE chat=? AND rowid NOT IN (
+			SELECT rowid FROM tuimeta_e2ee_message WHERE chat=? ORDER BY ts DESC LIMIT ?
+		)`, chat, chat, MaxStoredPerChat)
 	return err
 }
 

@@ -65,6 +65,11 @@ func (m *Messenger) openStore(gen int) {
 			hlog.Error("messenger: can't clear the encrypted chats' store", hlog.Kind(err))
 		}
 	}
+	// Trim anything an older build kept past the per-chat cap before it's
+	// read back, so the reload stays bounded too.
+	if err := st.prune(ctx); err != nil {
+		hlog.Error("messenger: can't prune the encrypted chats' store", hlog.Kind(err))
+	}
 	kept, err := st.all(ctx)
 	if err != nil {
 		hlog.Error("messenger: can't read the encrypted chats' store", hlog.Kind(err))
@@ -310,10 +315,14 @@ func (m *Messenger) receiveWA(evt *events.FBMessage) {
 		var app []byte
 		app, err = gproto.Marshal(evt.FBApplication)
 		if err == nil {
+			chat := evt.Info.Chat.String()
 			err = st.put(ctx, storedMessage{
-				Chat: evt.Info.Chat.String(), Sender: evt.Info.Sender.ToNonAD().String(), ID: evt.Info.ID,
+				Chat: chat, Sender: evt.Info.Sender.ToNonAD().String(), ID: evt.Info.ID,
 				TS: evt.Info.Timestamp, FromMe: evt.Info.IsFromMe, App: app,
 			})
+			if err == nil {
+				err = st.pruneChat(ctx, chat)
+			}
 		}
 	}
 	if err != nil {
