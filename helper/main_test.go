@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/erictran308/tuimeta/helper/internal/fake"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 	"github.com/erictran308/tuimeta/helper/internal/wiretest"
 )
@@ -74,6 +75,24 @@ func (h *helper) login(n proto.Network) {
 	if l.Error != nil {
 		h.t.Fatalf("login %s: %s", n, l.Raw)
 	}
+}
+
+// link logs a linking network in with its QR code, which the fake takes as
+// scanned fake.LinkAfter later.
+func (h *helper) link(n proto.Network) {
+	h.t.Helper()
+	l := h.c.Call("login_link", map[string]any{"network": n})
+	if l.Error != nil {
+		h.t.Fatalf("link %s: %s", n, l.Raw)
+	}
+}
+
+// quickLinks makes fake links take d for the rest of the test. Call it
+// before startHelper, so the helper has stopped when it's put back.
+func quickLinks(t *testing.T, d time.Duration) {
+	old := fake.LinkAfter
+	fake.LinkAfter = d
+	t.Cleanup(func() { fake.LinkAfter = old })
 }
 
 func (h *helper) ok(method string, params any) json.RawMessage {
@@ -178,6 +197,212 @@ func TestFakeLoginNeedsTheRequiredCookieNames(t *testing.T) {
 		t.Fatalf("instagram with messenger cookies: %s", l.Raw)
 	}
 	h.login(proto.Instagram)
+}
+
+func TestFakeWhatsAppLinksByQRCode(t *testing.T) {
+	h := startHelper(t, t.TempDir())
+	if l := h.c.Call("login_cookies", map[string]any{"network": "whatsapp", "cookies": goodCookies[proto.Messenger]}); l.Error == nil || l.Error.Code != proto.BadRequest {
+		t.Fatalf("cookies for whatsapp: %s", l.Raw)
+	}
+	began := time.Now()
+	from := h.c.Mark()
+	id := h.c.Request("login_link", map[string]any{"network": "whatsapp"})
+	code := h.c.Event("login_code", from, nil)
+	ev := wiretest.Decode[proto.LoginCodeEvent](t, json.RawMessage(code.Raw))
+	now := time.Now()
+	if ev.Network != proto.WhatsApp || !strings.HasPrefix(ev.QR, "2@fake") || ev.Pairing != "" ||
+		ev.Expires <= now.Unix() || ev.Expires > now.Add(61*time.Second).Unix() {
+		t.Fatalf("code: %s", code.Raw)
+	}
+	resp := h.c.Response(id)
+	if resp.Error != nil {
+		t.Fatalf("login_link: %s", resp.Raw)
+	}
+	if d := time.Since(began); d < fake.LinkAfter-200*time.Millisecond {
+		t.Errorf("linked after %v", d)
+	}
+	ready := h.c.Event("account", code.Seq, func(l wiretest.Line) bool {
+		return wiretest.Field[string](t, l, "state") == "ready"
+	})
+	acct := wiretest.Decode[proto.AccountEvent](t, json.RawMessage(ready.Raw))
+	if acct.Network != proto.WhatsApp || acct.UserID <= 0 || acct.Name == "" || ready.Seq > resp.Seq {
+		t.Errorf("ready (line %d, answer %d): %s", ready.Seq, resp.Seq, ready.Raw)
+	}
+
+	chats := h.loadChats(proto.WhatsApp, 4)
+	if len(chats) != 6 {
+		t.Fatalf("whatsapp has %d chats", len(chats))
+	}
+	var groups, muted, archived, unread int
+	for _, c := range chats {
+		if c.Network != proto.WhatsApp || !c.Encrypted || c.Request || !c.CanSend || c.LastMessage == nil {
+			t.Errorf("chat: %+v", c)
+		}
+		for _, flag := range []struct {
+			on bool
+			n  *int
+		}{{c.Kind == proto.Group, &groups}, {c.Muted, &muted}, {c.Archived, &archived}, {c.Unread > 0, &unread}} {
+			if flag.on {
+				*flag.n++
+			}
+		}
+	}
+	if groups != 2 || muted != 1 || archived != 1 || unread != 4 {
+		t.Errorf("groups %d, muted %d, archived %d, unread %d", groups, muted, archived, unread)
+	}
+	if l := h.c.Call("login_link", map[string]any{"network": "whatsapp"}); l.Error == nil || l.Error.Code != proto.BadRequest {
+		t.Errorf("linking again while linked: %s", l.Raw)
+	}
+}
+
+func TestFakeWhatsAppLinksByPhoneNumber(t *testing.T) {
+	quickLinks(t, 200*time.Millisecond)
+	h := startHelper(t, t.TempDir())
+	from := h.c.Mark()
+	for _, bad := range []string{"12345", "+0 7700 900100", "+44 7700 900100 1234567"} {
+		if l := h.c.Call("login_link", map[string]any{"network": "whatsapp", "phone": bad}); l.Error == nil || l.Error.Code != proto.BadRequest {
+			t.Errorf("phone %q: %s", bad, l.Raw)
+		}
+	}
+	for _, l := range h.c.Lines()[from:] {
+		if l.Event == "login_code" || l.Event == "account" && !strings.Contains(l.Raw, `"logged_out"`) {
+			t.Errorf("a refused number got as far as: %s", l.Raw)
+		}
+	}
+	from = h.c.Mark()
+	id := h.c.Request("login_link", map[string]any{"network": "whatsapp", "phone": "+44 7700 900100"})
+	code := h.c.Event("login_code", from, nil)
+	ev := wiretest.Decode[proto.LoginCodeEvent](t, json.RawMessage(code.Raw))
+	now := time.Now()
+	if ev.Pairing != "FAKE-C0DE" || ev.QR != "" || ev.Expires <= now.Add(170*time.Second).Unix() || ev.Expires > now.Add(181*time.Second).Unix() {
+		t.Fatalf("code: %s", code.Raw)
+	}
+	if resp := h.c.Response(id); resp.Error != nil {
+		t.Fatalf("login_link: %s", resp.Raw)
+	}
+	if got := h.loadChats(proto.WhatsApp, 10); len(got) != 6 {
+		t.Errorf("%d chats after linking by number", len(got))
+	}
+}
+
+func TestFakeWhatsAppLinkEndsWhenCancelledReplacedOrLoggedOut(t *testing.T) {
+	quickLinks(t, 400*time.Millisecond)
+	h := startHelper(t, t.TempDir())
+	cancelled := func(id uint64) wiretest.Line {
+		t.Helper()
+		resp := h.c.Response(id)
+		if resp.Error == nil || resp.Error.Code != proto.Cancelled {
+			t.Fatalf("waiting login_link: %s", resp.Raw)
+		}
+		return resp
+	}
+
+	from := h.c.Mark()
+	id := h.c.Request("login_link", map[string]any{"network": "whatsapp"})
+	h.c.Event("login_code", from, nil)
+	h.ok("cancel_login", map[string]any{"network": "whatsapp"})
+	resp := cancelled(id)
+	if l, ok := h.c.WaitFor(fake.LinkAfter+600*time.Millisecond, resp.Seq, func(l wiretest.Line) bool {
+		return l.Event == "account" && strings.Contains(l.Raw, `"ready"`)
+	}); ok {
+		t.Fatalf("a cancelled link logged in: %s", l.Raw)
+	}
+	if l := h.c.Call("load_chats", map[string]any{"network": "whatsapp", "limit": 5}); l.Error == nil || l.Error.Code != proto.NotLoggedIn {
+		t.Errorf("load_chats after cancelling: %s", l.Raw)
+	}
+
+	from = h.c.Mark()
+	id = h.c.Request("login_link", map[string]any{"network": "whatsapp"})
+	h.c.Event("login_code", from, nil)
+	h.ok("logout", map[string]any{"network": "whatsapp"})
+	cancelled(id)
+
+	from = h.c.Mark()
+	first := h.c.Request("login_link", map[string]any{"network": "whatsapp"})
+	h.c.Event("login_code", from, nil)
+	second := h.c.Request("login_link", map[string]any{"network": "whatsapp", "phone": "+44 7700 900100"})
+	cancelled(first)
+	if resp := h.c.Response(second); resp.Error != nil {
+		t.Fatalf("the newer login_link: %s", resp.Raw)
+	}
+	readies := 0
+	for _, l := range h.c.Lines()[from:] {
+		if l.Event == "account" && strings.Contains(l.Raw, `"ready"`) {
+			readies++
+		}
+	}
+	if readies != 1 {
+		t.Errorf("%d ready accounts for one link", readies)
+	}
+}
+
+func TestFakeWhatsAppHistoryHasWhatTheUIDraws(t *testing.T) {
+	quickLinks(t, 50*time.Millisecond)
+	h := startHelper(t, t.TempDir())
+	h.link(proto.WhatsApp)
+	chats := h.loadChats(proto.WhatsApp, 10)
+	priya := chats[0] // the newest
+	if priya.Title != "Priya Shah" || priya.Kind != proto.DM || priya.Unread != 2 {
+		t.Fatalf("first chat: %+v", priya)
+	}
+	all := h.everything(priya.ID, 20)
+	newestPage := h.history(map[string]any{"chat_id": priya.ID, "limit": 20}).Messages
+	var album []proto.Message
+	var reply *proto.Message
+	var edited, file, mine, link, pre, code bool
+	for i, m := range all {
+		if m.Album != 0 {
+			album = append(album, m)
+		}
+		if m.ReplyTo != nil && m.ReplyTo.MessageID < newestPage[0].ID && reply == nil {
+			reply = &all[i]
+		}
+		edited = edited || m.Edited
+		file = file || m.Media != nil && m.Media.Kind == proto.FileMedia && m.Media.Name == "lisbon-booking.pdf"
+		for _, e := range m.Entities {
+			link = link || e.Type == proto.Link && e.URL != ""
+			pre = pre || e.Type == proto.Pre
+			code = code || e.Type == proto.InlineCode
+		}
+		for _, r := range m.Reactions {
+			mine = mine || r.Mine
+		}
+	}
+	if len(album) != 3 || album[1].ID != album[0].ID+1 || album[2].Text == "" {
+		t.Errorf("album: %+v", album)
+	}
+	if reply == nil {
+		t.Fatal("no reply to a message older than the newest page")
+	}
+	got := wiretest.Decode[struct {
+		Message proto.Message `json:"message"`
+	}](t, h.ok("get_message", map[string]any{"chat_id": priya.ID, "message_id": reply.ReplyTo.MessageID}))
+	if got.Message.SenderID != reply.ReplyTo.SenderID {
+		t.Errorf("get_message of the answered message: %+v", got.Message)
+	}
+	if !edited || !file || !mine || !link || !pre || !code {
+		t.Errorf("edited %v, file %v, mine %v, link %v, pre %v, code %v", edited, file, mine, link, pre, code)
+	}
+
+	// People are found by name or number, and those without a chat can
+	// get one.
+	res := wiretest.Decode[struct {
+		Results []proto.SearchResult `json:"results"`
+	}](t, h.ok("search", map[string]any{"network": "whatsapp", "query": "+44 7700 900108"})).Results
+	if len(res) != 1 || res[0].Title != "Hannah Berg" || res[0].ChatID != 0 || res[0].Username != "" {
+		t.Fatalf("search by number: %+v", res)
+	}
+	dm := wiretest.Decode[struct {
+		ChatID int64 `json:"chat_id"`
+	}](t, h.ok("open_dm", map[string]any{"network": "whatsapp", "user_id": res[0].UserID})).ChatID
+	if dm == 0 {
+		t.Error("open_dm made no chat")
+	}
+	if res := wiretest.Decode[struct {
+		Results []proto.SearchResult `json:"results"`
+	}](t, h.ok("search", map[string]any{"network": "whatsapp", "query": "5-a-side"})).Results; len(res) != 1 || res[0].Kind != proto.Group {
+		t.Errorf("search for the group: %+v", res)
+	}
 }
 
 func TestFakeChatsPageUntilHasMoreIsFalse(t *testing.T) {
@@ -336,12 +561,18 @@ func TestFakeHistoryPagesEveryWay(t *testing.T) {
 }
 
 func TestFakeContentCoversWhatTheUIDraws(t *testing.T) {
+	quickLinks(t, 50*time.Millisecond)
 	h := startHelper(t, t.TempDir())
 	h.login(proto.Messenger)
 	h.login(proto.Instagram)
+	h.link(proto.WhatsApp)
 	found := map[string]bool{}
+	onWhatsApp := map[string]bool{}
 	for _, c := range h.loadChats("", 20) {
 		for _, m := range h.everything(c.ID, 50) {
+			if c.Network == proto.WhatsApp {
+				whatsAppHas(onWhatsApp, m)
+			}
 			if m.Service != "" {
 				found["service"] = true
 				if m.Text != "" {
@@ -393,6 +624,41 @@ func TestFakeContentCoversWhatTheUIDraws(t *testing.T) {
 		if !found[want] {
 			t.Errorf("no %s", want)
 		}
+	}
+	for _, want := range []string{"service", "poll", "location", "forwarded", "album", "file", "sticker", "video",
+		"voice", "view once", "edited", "mine", "rtl", "bold", "italic", "code", "strike", "pre", "quote", "link", "mention"} {
+		if !onWhatsApp[want] {
+			t.Errorf("no %s on WhatsApp", want)
+		}
+	}
+}
+
+// whatsAppHas notes what kinds of content m is.
+func whatsAppHas(found map[string]bool, m proto.Message) {
+	note := func(on bool, what string) {
+		if on {
+			found[what] = true
+		}
+	}
+	note(m.Service != "", "service")
+	note(m.Unsupported == "[Poll]", "poll")
+	note(m.Unsupported == "[Location]", "location")
+	note(m.Forwarded, "forwarded")
+	note(m.Album != 0, "album")
+	note(m.Edited, "edited")
+	note(strings.ContainsRune(m.Text, 'ع'), "rtl")
+	if md := m.Media; md != nil {
+		note(md.Kind == proto.FileMedia && md.Mime == "application/pdf", "file")
+		note(md.Kind == proto.Sticker, "sticker")
+		note(md.Kind == proto.Video && md.Thumbnail != nil, "video")
+		note(md.Kind == proto.Voice, "voice")
+		note(md.ViewOnce && md.FileID == 0, "view once")
+	}
+	for _, r := range m.Reactions {
+		note(r.Mine, "mine")
+	}
+	for _, e := range m.Entities {
+		found[string(e.Type)] = true
 	}
 }
 
@@ -679,6 +945,7 @@ func snapshot(t *testing.T, dir string) string {
 	h := startHelper(t, dir)
 	h.login(proto.Messenger)
 	h.login(proto.Instagram)
+	h.link(proto.WhatsApp)
 	var b strings.Builder
 	for _, c := range h.loadChats("", 20) {
 		b.WriteString(c.Title)
@@ -695,6 +962,7 @@ func snapshot(t *testing.T, dir string) string {
 }
 
 func TestFakeRunsAreTheSameEveryTime(t *testing.T) {
+	quickLinks(t, 50*time.Millisecond)
 	hour := time.Now().Truncate(time.Hour)
 	a := snapshot(t, t.TempDir())
 	b := snapshot(t, t.TempDir())

@@ -117,8 +117,11 @@ type networkDef struct {
 }
 
 func definition(n proto.Network) networkDef {
-	if n == proto.Instagram {
+	switch n {
+	case proto.Instagram:
 		return instagram()
+	case proto.WhatsApp:
+		return whatsapp()
 	}
 	return messenger()
 }
@@ -165,6 +168,34 @@ func instagram() networkDef {
 			{netID: "400004", kind: proto.DM, members: []string{"200007"}, groupPhoto: -1, request: true, unread: 2, strangers: true, specials: dealsChat()},
 			{netID: "400005", kind: proto.DM, members: []string{"200004"}, groupPhoto: -1, specials: noorChat(), fillerStart: 21},
 			{netID: "400006", kind: proto.DM, members: []string{"200006"}, groupPhoto: -1, specials: junChat(), fillerStart: 27},
+		},
+	}
+}
+
+// whatsapp is a phone's chats: people known by their numbers (no
+// usernames, no "active" times, which only a presence subscription would
+// give), and every chat end-to-end encrypted.
+func whatsapp() networkDef {
+	return networkDef{
+		self: personDef{"447700900100", "Robin Hale", "", 1, 0},
+		people: []personDef{
+			{"447700900101", "Priya Shah", "", 2, 0},
+			{"447700900102", "Tom Okafor", "", 6, 0},
+			{"447700900103", "Mum", "", 5, 0},
+			{"447700900104", "Lucas Ferreira", "", 3, 0},
+			{"447700900105", "Aisha Rahman", "", 0, 0},
+			{"447700900106", "Kenji Watanabe", "", -1, 0},
+			{"447700900107", "Grace O'Neill", "", 4, 0},
+			{"447700900108", "Hannah Berg", "", -1, 0},
+		},
+		offset: 11 * time.Minute,
+		chats: []chatDef{
+			{netID: "447700900101", kind: proto.DM, members: []string{"447700900101"}, groupPhoto: -1, encrypted: true, unread: 2, specials: priyaChat(), fillerStart: 4},
+			{netID: "120363000000000001", kind: proto.Group, title: "Family 🏡", members: []string{"447700900103", "447700900102", "447700900105"}, groupPhoto: 3, encrypted: true, unread: 5, specials: familyChat(), fillerStart: 13},
+			{netID: "447700900102", kind: proto.DM, members: []string{"447700900102"}, groupPhoto: -1, encrypted: true, muted: true, unread: 3, specials: tomChat(), fillerStart: 7},
+			{netID: "120363000000000002", kind: proto.Group, title: "5-a-side Thursdays ⚽", members: []string{"447700900102", "447700900104", "447700900106", "447700900107"}, groupPhoto: -1, encrypted: true, specials: footballChat(), fillerStart: 19},
+			{netID: "447700900104", kind: proto.DM, members: []string{"447700900104"}, groupPhoto: -1, encrypted: true, outboxLag: true, specials: lucasChat(), fillerStart: 25},
+			{netID: "447700900105", kind: proto.DM, members: []string{"447700900105"}, groupPhoto: -1, encrypted: true, archived: true, unread: 1, specials: aishaChat(), fillerStart: 31},
 		},
 	}
 }

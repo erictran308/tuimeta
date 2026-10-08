@@ -267,10 +267,9 @@ func (m *Messenger) sendEncrypted(ctx context.Context, c *chat, out *backend.Out
 		resp, err := e2ee.SendFBMessage(ctx, jid, app, meta, whatsmeow.SendRequestExtra{ID: id})
 		if err != nil {
 			hlog.Info("messenger: encrypted send failed", hlog.Kind(err))
-			if len(parts) > 0 {
-				out.Sent(parts...) // what went out before the failure
-			}
-			return requestError(err)
+			err = requestError(err)
+			out.Partly(err, parts...) // what went out before the failure, and what didn't
+			return err
 		}
 		ts := resp.Timestamp
 		if ts.IsZero() {

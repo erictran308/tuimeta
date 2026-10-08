@@ -94,6 +94,14 @@ func (m *Manager) removeLeftovers() {
 	}
 }
 
+// Remove deletes a downloaded file, once what it came with is gone (a
+// message deleted, or disappeared). Nothing happens if it isn't on disk.
+func (m *Manager) Remove(ref ids.FileRef) {
+	if err := os.Remove(m.Path(ref)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		hlog.Warn("can't delete a download", hlog.Kind(err))
+	}
+}
+
 // Path is where the file is saved: named after its key's hash, so the same
 // content is found again next run, and its own name made safe.
 func (m *Manager) Path(ref ids.FileRef) string {

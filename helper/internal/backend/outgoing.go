@@ -128,7 +128,12 @@ func (o *Outgoing) Sent(msgs ...proto.Message) bool {
 
 // Failed reports the message couldn't be sent. A *proto.Error's message is
 // shown; any other error's text never is.
-func (o *Outgoing) Failed(err error) bool {
+func (o *Outgoing) Failed(err error) bool { return o.Partly(err) }
+
+// Partly reports a send that stopped with err after msgs went out (one per
+// part, in order): the temporary ids paired with them get message_sent, the
+// ones left message_failed. With no msgs it's Failed.
+func (o *Outgoing) Partly(err error, msgs ...proto.Message) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if !o.finish() {
@@ -139,9 +144,16 @@ func (o *Outgoing) Failed(err error) bool {
 	if errors.As(err, &pe) {
 		msg = pe.Message
 	}
-	hlog.Warn("send failed", hlog.Str("network", string(o.Chat.Network)), hlog.Kind(err))
-	for _, temp := range o.TempIDs {
-		o.box.events.messageFailed(o.Chat.ID, temp, msg)
+	hlog.Warn("send failed", hlog.Str("network", string(o.Chat.Network)), hlog.Int("sent", int64(len(msgs))), hlog.Kind(err))
+	for i, temp := range o.TempIDs {
+		if i < len(msgs) {
+			o.box.events.messageSent(o.Chat.ID, temp, msgs[i])
+		} else {
+			o.box.events.messageFailed(o.Chat.ID, temp, msg)
+		}
+	}
+	for _, m := range msgs[min(len(o.TempIDs), len(msgs)):] {
+		o.box.events.Message(m)
 	}
 	return true
 }

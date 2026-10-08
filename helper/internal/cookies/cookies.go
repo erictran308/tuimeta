@@ -46,6 +46,9 @@ func bad(msg string) error { return proto.Err(proto.BadCookies, msg) }
 // there. Errors are *proto.Error with code bad_cookies and never quote what
 // was pasted.
 func Parse(n proto.Network, input string) (Set, error) {
+	if _, ok := Required[n]; !ok {
+		return Set{}, bad(n.Title() + " doesn't log in with cookies.")
+	}
 	if len(input) > MaxInput {
 		return Set{}, bad("That's too long to be cookies; copy just the site's cookies.")
 	}

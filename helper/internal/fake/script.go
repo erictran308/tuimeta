@@ -255,6 +255,104 @@ func junChat() map[int]spec {
 	}
 }
 
+// WhatsApp ------------------------------------------------------------------
+
+// priyaChat: a dm with most kinds of message, WhatsApp's monospace among them.
+func priyaChat() map[int]spec {
+	return map[int]spec{
+		3:  say(1, "Are we still on for Lisbon in November? 🇵🇹"),
+		6:  say(0, "100%! Flights are booked, details coming").react(r(1, "🙌")),
+		12: say(1, "Checklist: passport, an adapter, and the Wi-Fi password is tram28-amarelo").with(bold("Checklist:"), italic("adapter"), code("tram28-amarelo")),
+		16: say(0, "Table for two at 8 8:30 pm, they moved us").with(strike("8")),
+		20: say(1, "This is the flat: https://example.com/stays/alfama-loft and it has a rooftop!").
+			with(link("https://example.com/stays/alfama-loft")).react(r(1, "❤️"), r(0, "❤️")),
+		24: say(0, "Here's my plan: we land, drop the bags at the flat, take the 28 tram up to the castle while it's still light, and save the whole of Saturday for Sintra. If it rains we swap the days and spend Saturday in the tile museum and the bookshops instead. Sound good? 🤔"),
+		30: say(1, "Pastéis de nata research 🥮 strictly for science").attach(square(4), wide(6), tall(0)).react(r(0, "😍")),
+		33: say(0, "I want to go back already").react(r(1, "😂")),
+		41: say(0, "Booking confirmation").attach(document("lisbon-booking.pdf", "Booking: Alfama Loft, 4 nights")),
+		44: say(1, "What time do we land?"),
+		45: say(0, "We land at 14:35 local time, not 13:35").edit(),
+		46: say(1, "Perfect, lunch by the river then 🍷"),
+		47: say(0, "Deal").reply(46),
+		52: say(1, "For the taxi app:\nRua dos Remédios 47\n1100-449 Lisboa").with(pre("Rua dos Remédios 47\n1100-449 Lisboa")),
+		58: say(1, "Remember the custard tart promise? 😄").reply(3),
+		59: say(1, "Also: I found a fado bar for Friday 🎶"),
+	}
+}
+
+// familyChat: a group with events, a mention, a voice message, a sticker,
+// a location and a poll.
+func familyChat() map[int]spec {
+	return map[int]spec{
+		0:  event(1, "Mum named the group Family 🏡"),
+		1:  event(2, "Tom added Aisha"),
+		8:  say(1, "Sunday lunch at ours, 1pm. Bring a dessert 🍰"),
+		14: say(3, "I'll make the lemon drizzle"),
+		19: spec{from: 1, unsup: "[Location]"},
+		22: say(1, "@Tom can you pick up Nana on the way?").with(mention("@Tom", 2)),
+		23: say(2, "Yes, I'll be there by 12:30").reply(22),
+		27: spec{from: 1}.attach(voice(23)),
+		31: spec{from: 2}.attach(sticker(2)),
+		36: spec{from: 3, unsup: "[Poll]"},
+		40: say(0, "Running 10 minutes late, save me a seat 🙏").react(r(1, "👍"), r(2, "👍")),
+		44: say(1, "Photos from Sunday ❤️").attach(wide(1)),
+		48: say(2, "Road closures on the A40 this weekend, leave early").forwarded(),
+		57: say(1, "Who's taking the leftovers? 😅"),
+	}
+}
+
+// tomChat: a muted dm with a photo, a video and a voice message.
+func tomChat() map[int]spec {
+	return map[int]spec{
+		10: say(1, "Check out the new board 🏄"),
+		20: spec{from: 1}.attach(wide(7)),
+		29: say(1, "Surf on Saturday if the swell holds?"),
+		30: say(0, "In! What time?").reply(29),
+		50: say(1, "Last session 🎬").attach(video("VID-20261003-WA0004.mp4", 21, 2)),
+		57: spec{from: 1}.attach(voice(9)),
+	}
+}
+
+// footballChat: a group of five with a line-up block, a quote, a PDF, an
+// edit and a long link.
+func footballChat() map[int]spec {
+	return map[int]spec{
+		0:  event(0, "You created the group"),
+		2:  event(1, "Tom added Grace"),
+		11: say(2, "Line-up for Thursday:\nGK  Kenji\nDEF Tom, Robin\nFWD Lucas, Grace").with(pre("GK  Kenji\nDEF Tom, Robin\nFWD Lucas, Grace")),
+		18: say(3, "Bring both kits\nWhich ones, the blue and the white?").with(quoted("Bring both kits")),
+		25: say(4, "Pitch is booked, receipt attached").attach(document("pitch-booking.pdf", "Pitch 3, Thursday 19:00-20:00")),
+		36: say(2, "Player of the match: Grace, no contest 🏆").react(r(0, "🔥"), r(1, "🔥"), r(3, "🔥")),
+		42: say(3, "Kick-off moved to 19:15").edit(),
+		47: say(0, "Same time next week?").react(r(2, "👍")),
+		48: say(4, "Yes!").sameTime(),
+		53: say(1, "Rules for the new league: https://example.org/leagues/thursday-5s/rules-and-fixtures-for-the-autumn-season-2026").
+			with(link("https://example.org/leagues/thursday-5s/rules-and-fixtures-for-the-autumn-season-2026")),
+	}
+}
+
+// lucasChat: your last two messages aren't read yet; a photo shown only
+// once and a floor plan.
+func lucasChat() map[int]spec {
+	return map[int]spec{
+		15: say(1, "Olha só! The new place is ready 🏠"),
+		30: say(0, "Congrats!! Housewarming when?").react(r(1, "❤️")),
+		40: spec{from: 1}.attach(viewOnce()),
+		44: say(1, "The floor plan, if you're curious").attach(document("floor-plan.pdf", "Floor plan: 3rd floor, 2 bedrooms")),
+		58: say(0, "Saturday works for me"),
+		59: say(0, "I'll bring the playlist 🎧"),
+	}
+}
+
+// aishaChat: archived, one unread.
+func aishaChat() map[int]spec {
+	return map[int]spec{
+		20: say(1, "السلام عليكم! How's the new job going?"),
+		33: spec{from: 0}.attach(sticker(3)),
+		59: say(1, "Coffee next week? ☕"),
+	}
+}
+
 // Fillers -------------------------------------------------------------------
 
 var fillers = []string{

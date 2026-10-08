@@ -68,6 +68,45 @@ func (l *loginRecorder) LoginCookies(_ context.Context, _ cookies.Set, as browse
 	return nil
 }
 
+// linkRecorder is a linking network that remembers what it was asked and
+// shows one code per link.
+type linkRecorder struct {
+	backend.Unavailable
+	mu       sync.Mutex
+	phones   []string
+	cancels  int
+	accepted chan struct{}
+}
+
+func (l *linkRecorder) Link(ctx context.Context, phone string, attempt uint64) error {
+	l.mu.Lock()
+	l.phones = append(l.phones, phone)
+	l.mu.Unlock()
+	if phone == "" {
+		l.Events.LoginCode(l.Net, attempt, "2@qr,code", "", time.Unix(1700000060, 0))
+	} else {
+		l.Events.LoginCode(l.Net, attempt, "", "ABCD-EFGH", time.Unix(1700000180, 0))
+	}
+	select {
+	case <-l.accepted:
+		return nil
+	case <-ctx.Done():
+		return proto.Err(proto.Cancelled, "Linking was cancelled.")
+	}
+}
+
+func (l *linkRecorder) CancelLink(uint64) {
+	l.mu.Lock()
+	l.cancels++
+	l.mu.Unlock()
+}
+
+func (l *linkRecorder) asked() ([]string, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.phones), l.cancels
+}
+
 func (l *loginRecorder) named() []browser.Identity {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,6 +121,7 @@ type harness struct {
 	done   chan struct{}
 	stub   *stub
 	ig     *loginRecorder
+	wa     *linkRecorder
 	logBuf *syncBuffer
 }
 
@@ -119,7 +159,9 @@ func start(t *testing.T) *harness {
 	srv.Add(st)
 	ig := &loginRecorder{Unavailable: backend.Unavailable{Net: proto.Instagram, Events: srv.Events}}
 	srv.Add(ig)
-	h := &harness{t: t, srv: srv, stdin: inW, done: make(chan struct{}), stub: st, ig: ig, logBuf: logBuf}
+	wa := &linkRecorder{Unavailable: backend.Unavailable{Net: proto.WhatsApp, Events: srv.Events}, accepted: make(chan struct{}, 4)}
+	srv.Add(wa)
+	h := &harness{t: t, srv: srv, stdin: inW, done: make(chan struct{}), stub: st, ig: ig, wa: wa, logBuf: logBuf}
 	h.c = wiretest.New(t, inW, outR)
 	go func() {
 		srv.Run(context.Background(), inR)
@@ -143,12 +185,65 @@ func TestTheFirstLineIsHello(t *testing.T) {
 		t.Errorf("version = %d", v)
 	}
 	nets := wiretest.Field[[]string](t, first, "networks")
-	if strings.Join(nets, ",") != "messenger,instagram" {
+	if strings.Join(nets, ",") != "messenger,instagram,whatsapp" {
 		t.Errorf("networks = %v", nets)
 	}
 	// Then each network's account.
-	h.c.Event("account", 1, func(l wiretest.Line) bool { return wiretest.Field[string](t, l, "network") == "messenger" })
-	h.c.Event("account", 1, func(l wiretest.Line) bool { return wiretest.Field[string](t, l, "network") == "instagram" })
+	for _, n := range nets {
+		h.c.Event("account", 1, func(l wiretest.Line) bool { return wiretest.Field[string](t, l, "network") == n })
+	}
+}
+
+func TestWhatsAppLinksWithACodeAndNeverTakesCookies(t *testing.T) {
+	h := start(t)
+	r := h.c.Call("login_cookies", map[string]any{"network": "whatsapp", "cookies": "c_user=1; xs=2; datr=3"})
+	if r.Error == nil || r.Error.Code != proto.BadRequest {
+		t.Fatalf("cookies for whatsapp: %s", r.Raw)
+	}
+	r = h.c.Call("login_link", map[string]any{"network": "instagram"})
+	if r.Error == nil || r.Error.Code != proto.BadRequest {
+		t.Fatalf("linking instagram: %s", r.Raw)
+	}
+	for _, bad := range []string{"0123 456 789", "+1 555", "+44 20 7946 0958 0000 1", "555-CALL-NOW", ""} {
+		r = h.c.Call("login_link", map[string]any{"network": "whatsapp", "phone": bad})
+		if r.Error == nil || r.Error.Code != proto.BadRequest {
+			t.Fatalf("phone %q: %s", bad, r.Raw)
+		}
+	}
+	if phones, _ := h.wa.asked(); len(phones) != 0 {
+		t.Fatalf("the network was asked to link %v", phones)
+	}
+
+	h.wa.accepted <- struct{}{}
+	id := h.c.Request("login_link", map[string]any{"network": "whatsapp", "phone": "+1 (555) 010-0100"})
+	code := h.c.Event("login_code", 0, func(l wiretest.Line) bool { return wiretest.Field[string](t, l, "network") == "whatsapp" })
+	if got := wiretest.Field[string](t, code, "pairing"); got != "ABCD-EFGH" {
+		t.Errorf("pairing = %q", got)
+	}
+	if got := wiretest.Field[int64](t, code, "expires"); got != 1700000180 {
+		t.Errorf("expires = %d", got)
+	}
+	if r := h.c.Response(id); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+
+	h.wa.accepted <- struct{}{}
+	id = h.c.Request("login_link", map[string]any{"network": "whatsapp"})
+	code = h.c.Event("login_code", 0, func(l wiretest.Line) bool { return strings.Contains(l.Raw, `"qr":"2@qr,code"`) })
+	if strings.Contains(code.Raw, "pairing") {
+		t.Errorf("a QR code came with a pairing code: %s", code.Raw)
+	}
+	h.c.Response(id)
+	if r := h.c.Call("cancel_login", map[string]any{"network": "whatsapp"}); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+	phones, cancels := h.wa.asked()
+	if !slices.Equal(phones, []string{"15550100100", ""}) || cancels != 1 {
+		t.Errorf("asked to link %q, cancelled %d times", phones, cancels)
+	}
+	if strings.Contains(h.logBuf.String(), "5550100") {
+		t.Error("the phone number reached the log")
+	}
 }
 
 func TestMalformedLinesAreAnsweredAndReadingGoesOn(t *testing.T) {

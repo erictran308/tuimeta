@@ -23,6 +23,8 @@ var handlers map[string]handler
 func init() {
 	handlers = map[string]handler{
 		"login_cookies": (*Server).loginCookies,
+		"login_link":    (*Server).loginLink,
+		"cancel_login":  (*Server).cancelLogin,
 		"logout":        (*Server).logout,
 		"load_chats":    (*Server).loadChats,
 		"history":       (*Server).history,
@@ -76,11 +78,11 @@ func limit(n int) int {
 func (s *Server) network(name string) (proto.Network, backend.Backend, error) {
 	n := proto.Network(name)
 	if name == "" {
-		return "", nil, proto.Err(proto.BadRequest, "Say which network: messenger or instagram.")
+		return "", nil, proto.Err(proto.BadRequest, "Say which network: messenger, instagram or whatsapp.")
 	}
 	b := s.backend(n)
 	if !n.Valid() || b == nil {
-		return "", nil, proto.Err(proto.BadRequest, "Unknown network; use messenger or instagram.")
+		return "", nil, proto.Err(proto.BadRequest, "Unknown network; use messenger, instagram or whatsapp.")
 	}
 	return n, b, nil
 }
@@ -149,6 +151,9 @@ func (s *Server) loginCookies(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if n.Links() {
+		return nil, proto.Err(proto.BadRequest, n.Title()+" logs in by linking tuimeta to your phone, not with cookies.")
+	}
 	if s.Events.State(n) == proto.Ready {
 		return nil, proto.Err(proto.BadRequest, "Already logged in to "+n.Title()+"; log out first.")
 	}
@@ -172,6 +177,62 @@ func (s *Server) loginCookies(c *call) (any, error) {
 		return nil, err
 	}
 	hlog.Info("logged in", hlog.Str("network", string(n)))
+	return nil, nil
+}
+
+func (s *Server) loginLink(c *call) (any, error) {
+	p, err := decode[struct {
+		Network string  `json:"network"`
+		Phone   *string `json:"phone"`
+		Attempt uint64  `json:"attempt"`
+	}](c.params)
+	if err != nil {
+		return nil, err
+	}
+	n, b, err := s.network(p.Network)
+	if err != nil {
+		return nil, err
+	}
+	l, ok := b.(backend.Linker)
+	if !ok || !n.Links() {
+		return nil, proto.Err(proto.BadRequest, n.Title()+" logs in with cookies, not by linking a device.")
+	}
+	if s.Events.State(n) == proto.Ready {
+		return nil, proto.Err(proto.BadRequest, "Already logged in to "+n.Title()+"; log out first.")
+	}
+	phone, how := "", "qr"
+	if p.Phone != nil {
+		var ok bool
+		if phone, ok = backend.PhoneDigits(*p.Phone); !ok {
+			return nil, proto.Err(proto.BadRequest, "That isn't a phone number in international form; write it with the country code, like +1 555 010 0100.")
+		}
+		how = "phone"
+	}
+	// The number is the account's: it's never logged.
+	hlog.Info("linking", hlog.Str("network", string(n)), hlog.Str("with", how))
+	if err := l.Link(c.ctx, phone, p.Attempt); err != nil {
+		hlog.Info("linking failed", hlog.Str("network", string(n)), hlog.Kind(err))
+		return nil, err
+	}
+	hlog.Info("linked", hlog.Str("network", string(n)))
+	return nil, nil
+}
+
+func (s *Server) cancelLogin(c *call) (any, error) {
+	p, err := decode[struct {
+		Network string `json:"network"`
+		Attempt uint64 `json:"attempt"`
+	}](c.params)
+	if err != nil {
+		return nil, err
+	}
+	_, b, err := s.network(p.Network)
+	if err != nil {
+		return nil, err
+	}
+	if l, ok := b.(backend.Linker); ok {
+		l.CancelLink(p.Attempt)
+	}
 	return nil, nil
 }
 

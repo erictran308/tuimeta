@@ -22,7 +22,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "s",
-                "Find a chat, or someone on Messenger or Instagram to write to",
+                "Find a chat, or someone on Messenger, Instagram or WhatsApp to write to",
             ),
             ("H", "Highlight or unhighlight the selected chat"),
             (
@@ -96,7 +96,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-u", "Delete back to the start of the line"),
             (
                 "*bold*",
-                "Formatting, as Messenger reads it: _italic_ ~strike~ `code`",
+                "Formatting, as the networks read it: _italic_ ~strike~ `code`",
             ),
             (":smile", "Suggests emoji; Tab puts one in"),
             ("Ctrl-v", "Paste a photo, files or text from the clipboard"),
@@ -114,6 +114,11 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "Photo viewer",
         &[
+            ("h / l", "The photo before / after it in the chat"),
+            (
+                "j / k",
+                "Zoom in / out (also + / -), up to filling the window",
+            ),
             ("o", "Open the photo in your computer's viewer"),
             ("y", "Copy the photo"),
             ("Enter / Esc / q", "Close"),
@@ -133,7 +138,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "Find popup",
         &[
-            ("Type", "Search your chats, and both networks for people"),
+            ("Type", "Search your chats, and every network for people"),
             ("Up / Down", "Move (also Ctrl-p / Ctrl-n, Tab)"),
             ("Enter", "Open it, or start a chat"),
             ("Esc", "Cancel"),
@@ -155,6 +160,18 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "y / n",
                 "Go ahead or not, when asked about a file, a link or logging out",
             ),
+        ],
+    ),
+    (
+        "Logging in (:login)",
+        &[
+            ("j / k", "Pick a network"),
+            ("Enter", "Log in to it, or ask WhatsApp for a new code"),
+            (
+                "p",
+                "WhatsApp: link with your phone number instead of a QR code",
+            ),
+            ("Esc", "Back, and stop a link that waits"),
         ],
     ),
 ];

@@ -2,34 +2,35 @@
 
 # tuimeta
 
-**Messenger and Instagram at the speed of your keyboard.**
+**Messenger, Instagram and WhatsApp at the speed of your keyboard.**
 
-A terminal client (TUI) for your own Facebook Messenger and Instagram chats, with vim keys, inline photos and reactions.<br>
+A terminal client (TUI) for your own Facebook Messenger, Instagram and WhatsApp chats, with vim keys, inline photos and reactions.<br>
 The same app as [tuigram](https://github.com/erictran308/tuigram), for Meta's messengers.
 
 </div>
 
 > [!WARNING]
-> **tuimeta isn't made or allowed by Meta.** Meta offers no way for an app like this to use a personal account, so it speaks Messenger's and Instagram's own protocols, through [mautrix-meta](https://github.com/mautrix/meta). Using it is against Meta's terms, and **an account can be locked, checkpointed or banned for it**. Use it like a person (no bulk messages, no messages to people who don't know you), turn on two-factor authentication, and try it with an account you can afford to lose first.
+> **tuimeta isn't made or allowed by Meta.** Meta offers no way for an app like this to use a personal account, so it speaks Messenger's, Instagram's and WhatsApp's own protocols, through [mautrix-meta](https://github.com/mautrix/meta) and [whatsmeow](https://github.com/tulir/whatsmeow). Using it is against Meta's terms, and **an account can be locked, checkpointed or banned for it**. Use it like a person (no bulk messages, no messages to people who don't know you), turn on two-factor authentication, and try it with an account you can afford to lose first.
 
 > [!IMPORTANT]
-> **For personal use only.** tuimeta is for reaching your own Messenger and Instagram chats from your own account. It is not for automation, scraping, bulk or unsolicited messaging, bots, collecting other people's data, or any commercial or business use. See the [disclaimer](#disclaimer) below.
+> **For personal use only.** tuimeta is for reaching your own Messenger, Instagram and WhatsApp chats from your own accounts. It is not for automation, scraping, bulk or unsolicited messaging, bots, collecting other people's data, or any commercial or business use. See the [disclaimer](#disclaimer) below.
 
 ---
 
 ## What it does
 
-- **Both networks, one list.** Log in to Messenger, Instagram or both. Tabs over the chat list go round All, Messenger, Instagram and the archive, each with its unread chats.
+- **Three networks, one list.** Log in to Messenger, Instagram, WhatsApp, or any of them. Tabs over the chat list go round All, each network you're in, and the archive, each with its unread chats.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop.
-- **Encrypted chats.** Messenger's end-to-end encrypted chats work, marked with a 🔒 that a name can't fake. tuimeta joins your account as a new device, so it has the encrypted messages sent from the moment you log in on. Older encrypted history isn't there, and there's nowhere to enter the 6-digit PIN Messenger asks for to restore it: that PIN unlocks Messenger's encrypted backup, which the libraries tuimeta builds on can't open. Read older encrypted messages on your phone or at facebook.com.
-- **Photos inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal. `Enter` on a photo shows it as big as the window allows.
+- **WhatsApp, linked like WhatsApp Web.** Scan a QR code with your phone (or type a code on it), and tuimeta becomes one of your linked devices. It has the chats your phone sends it when you link it and everything after, and asks your phone for older messages as you scroll up (the phone has to be online for that: WhatsApp keeps no history on its servers). Disappearing messages disappear here too, and view-once photos stay on your phone.
+- **Encrypted chats.** Every WhatsApp chat, and Messenger's end-to-end encrypted chats, are marked with a 🔒 that a name can't fake, and their notifications never show what was said. tuimeta joins your account as a new device, so it has the encrypted messages sent from the moment you log in on. Older encrypted history isn't there, and there's nowhere to enter the 6-digit PIN Messenger asks for to restore it: that PIN unlocks Messenger's encrypted backup, which the libraries tuimeta builds on can't open. Read older encrypted messages on your phone or at facebook.com.
+- **Photos inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal. `Enter` on a photo shows it as big as the window allows: `h` / `l` go through the chat's photos, `j` / `k` zoom in and out, and `o` opens it in your default app.
 - **Reactions.** `R` offers Messenger's reactions and common emoji, and `/` finds any emoji by name. You have one reaction per message: `Enter` on yours, or `X`, takes it back.
 - **Replies, edits, unsend.** `r` replies, `gd` jumps to what a reply answers, `e` edits your message while the network allows, `d` unsends it.
 - **Send files.** `a` attaches a file by path, `p` or `Ctrl-v` pastes copied files or an image, and dropping files on the window attaches them.
-- **Find anyone.** `s` searches your chats, and both networks for people to start a chat with.
-- **Privacy first.** Read receipts go out only when you're actually looking at the newest message, typing only while you type, and tuimeta never sets an "active now" status. (Instagram works out "Active now" on its own servers and may count tuimeta's connection: turn off Activity Status in Instagram's settings to be sure.) Links that hide where they go, and files that could run code, ask before opening.
+- **Find anyone.** `s` searches your chats, and the networks for people to start a chat with (on WhatsApp, your contacts, or any number on WhatsApp typed with `+` and its country code).
+- **Privacy first.** Read receipts go out only when you're actually looking at the newest message, typing only while you type, and tuimeta never sets an "active now" or "online" status (so on WhatsApp it never moves your last seen, and you'll rarely see others typing: WhatsApp tells only devices that say they're online). (Instagram works out "Active now" on its own servers and may count tuimeta's connection: turn off Activity Status in Instagram's settings to be sure.) Links that hide where they go, and files that could run code, ask before opening.
 
-**What tuigram has that tuimeta doesn't**, because Messenger and Instagram don't have it, or tuimeta can't reach it yet: secret chats with timers (Messenger's encryption is per chat instead), forum topics, bots' buttons, polls (shown as `[Poll]`), stickers to send, pinned messages, voice messages played in the terminal (they open in your player), searching a chat's history, forwarding, and folders.
+**What tuigram has that tuimeta doesn't**, because Meta's messengers don't have it, or tuimeta can't reach it yet: secret chats with timers (Messenger's encryption is per chat instead, and WhatsApp's disappearing-messages timer is set on the phone), forum topics, bots' buttons, polls and locations (shown as `[Poll]` and `[Location]`), stickers to send, calls, pinned messages, voice messages played in the terminal (they open in your player), searching a chat's history, forwarding, and folders.
 
 ## Get started
 
@@ -48,7 +49,7 @@ You need Rust 1.88 or newer and Go 1.27.
 
 ### Logging in
 
-tuimeta logs in with your browser's session cookies, so it never sees your password:
+tuimeta logs in to Messenger and Instagram with your browser's session cookies, so it never sees your password:
 
 1. Log in to [facebook.com](https://www.facebook.com) (for Messenger) or [instagram.com](https://www.instagram.com) in your browser.
 2. Open the developer tools: Application (Chrome, Edge) or Storage (Firefox) → Cookies → the site.
@@ -57,7 +58,18 @@ tuimeta logs in with your browser's session cookies, so it never sees your passw
 
 These cookies are your whole session: anyone who has them is logged in as you. tuimeta keeps them only in its data folder, readable by you alone. It's the same session as the browser's: logging out there ends tuimeta's too. `:logout` in tuimeta is local — it disconnects and deletes everything tuimeta kept for that network (for Messenger, its encrypted-chat device store too), but it does **not** end the session on Meta's side. Your Facebook or Instagram session stays logged in until you end it yourself, in the browser you copied the cookies from or in the site's list of logged-in devices.
 
-`:login` adds the other network, or logs in again.
+`:login` adds another network, or logs in again.
+
+#### WhatsApp
+
+WhatsApp has no cookies: tuimeta links itself to your account as a new device, the way WhatsApp Web does.
+
+1. Pick WhatsApp on the login screen. tuimeta shows a QR code (the window needs to be about 72×40 for it).
+2. On your phone, open WhatsApp → Settings → Linked devices → Link a device, and scan it.
+
+Or press `p`, type your phone number with its country code, and type the code tuimeta shows on your phone (Link a device → Link with phone number instead). If WhatsApp asks to confirm with a passkey, tuimeta can't do that: try the other way.
+
+Your phone lists tuimeta as Chrome on this computer's system, like WhatsApp Web. People who aren't in your phone's address book show with a "~" before the name they gave WhatsApp, and their number next to it, as on the phone, so nobody can pass for "Mum" by calling themselves that. `:logout` unlinks it (your phone and other linked devices stay logged in) and deletes everything tuimeta kept for WhatsApp; you can also log it out from the phone's list, and WhatsApp drops linked devices left unused for weeks.
 
 #### Log in as your own Chrome
 
@@ -71,7 +83,7 @@ tuimeta then sends that Chrome's user agent and client hints, for this computer'
 
 ### Try it first
 
-`tuimeta --demo` shows made-up chats without starting anything (keys `1`–`9` switch scenes, `t` the theme). `tuimeta --fake` runs the whole app with made-up accounts and no network at all: log in with any text that names the cookies, like `c_user=1; xs=2; datr=3`.
+`tuimeta --demo` shows made-up chats without starting anything (keys `1`–`9` switch scenes, `t` the theme). `tuimeta --fake` runs the whole app with made-up accounts and no network at all: log in with any text that names the cookies, like `c_user=1; xs=2; datr=3`; WhatsApp's made-up code links by itself 3 seconds after it shows.
 
 ## Keys
 
@@ -83,6 +95,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 | | `?` | Shortcuts and settings |
 | | `s` | Find a chat or a person |
 | | `:` | Commands: `login`, `logout` |
+| Linking WhatsApp | `p` | Use your phone number instead of the QR code |
 | | `Ctrl-o` / `Ctrl-i` | Back and forward through chats and replies |
 | | `Ctrl-r` | Resize the chat list |
 | Chat list | `j` / `k`, `gg` / `G` | Move |
@@ -93,7 +106,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 | | `m` | Mute or unmute |
 | | `H` | Highlight the chat |
 | Messages | `j` / `k` | Newer, older |
-| | `Enter` | Open the photo, file or link |
+| | `Enter` | Show the photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app, `y` copies it, `Esc` closes it), or open the file or link |
 | | `r` | Reply |
 | | `e` | Edit your message |
 | | `d` | Unsend your message |
@@ -108,7 +121,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 
 ## Your data
 
-Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). The folder is readable by you alone, but not encrypted: anyone who can read your files can read those messages and act as that device until you remove it from your account. Logging out of a network deletes what's kept for it.
+Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers; disappearing messages are deleted when their time is up. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it.
 
 The log never holds what people wrote, their names, or your cookies.
 

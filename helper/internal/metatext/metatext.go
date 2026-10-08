@@ -103,12 +103,22 @@ func ParseWithMentions(text string, mentions []Mention) (string, []proto.Entity)
 
 	slices.SortStableFunc(spans, func(a, b span) int { return cmp.Compare(a.start, b.start) })
 	var ents []proto.Entity
+	// The spans are in order of where they start, so the UTF-16 offset is
+	// carried from one to the next rather than counted from the text's
+	// start each time.
+	at, units := 0, 0
 	for _, s := range spans {
-		off, n := proto.UTF16Range(plain, s.start, s.end)
+		start := min(max(s.start, 0), len(plain))
+		end := min(max(s.end, start), len(plain))
+		if start > at {
+			units += proto.UTF16Len(plain[at:start])
+			at = start
+		}
+		n := proto.UTF16Len(plain[start:end])
 		if n == 0 {
 			continue
 		}
-		ents = append(ents, proto.Entity{Offset: off, Length: n, Type: s.typ, UserID: s.user})
+		ents = append(ents, proto.Entity{Offset: units, Length: n, Type: s.typ, UserID: s.user})
 	}
 	return plain, ents
 }

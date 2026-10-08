@@ -57,3 +57,5 @@ func (u *Unavailable) OpenDM(context.Context, UserRef) (int64, error) { return 0
 func (u *Unavailable) Fetch(context.Context, ids.FileRef, io.Writer) error {
 	return u.err()
 }
+func (u *Unavailable) Link(context.Context, string, uint64) error { return u.err() }
+func (u *Unavailable) CancelLink(uint64)                          {}

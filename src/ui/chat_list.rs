@@ -1,8 +1,9 @@
 //! The chat list: two rows per chat, its title over its last message (or
 //! "typing…" while someone is), with the chat's photo on the left (a square
 //! of color if it has none), and a blank row between chats unless that's
-//! turned off. With both networks, or an archive, a row of tabs over it says
-//! which one is shown, with a line under them joined to the border.
+//! turned off. With more than one network, or an archive, a row of tabs
+//! over it says which one is shown, with a line under them joined to the
+//! border.
 
 use std::collections::HashMap;
 

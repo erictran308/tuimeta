@@ -172,6 +172,12 @@ func (e *Events) stopTyping(k typingKey) {
 
 func (e *Events) File(f proto.File) { e.out(proto.FileEvent{Event: "file", File: f}) }
 
+// LoginCode is the code to show while login_link attempt waits: qr to draw
+// as a QR code, or pairing to type on the phone; it works until expires.
+func (e *Events) LoginCode(n proto.Network, attempt uint64, qr, pairing string, expires time.Time) {
+	e.out(proto.LoginCodeEvent{Event: "login_code", Network: n, Attempt: attempt, QR: qr, Pairing: pairing, Expires: expires.Unix()})
+}
+
 // Error is something the user should see that no request caused.
 func (e *Events) Error(n proto.Network, msg string) {
 	e.out(proto.ErrorEvent{Event: "error", Network: n, Message: msg})

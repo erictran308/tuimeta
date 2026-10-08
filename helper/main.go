@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Command tuimeta-helper speaks Messenger and Instagram for tuimeta, which
+// Command tuimeta-helper speaks Messenger, Instagram and WhatsApp for tuimeta, which
 // runs it as a child process and talks to it in newline-delimited JSON over
 // stdin and stdout (see PROTOCOL.md).
 //
@@ -28,6 +28,7 @@ import (
 	"github.com/erictran308/tuimeta/helper/internal/messenger"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 	"github.com/erictran308/tuimeta/helper/internal/server"
+	"github.com/erictran308/tuimeta/helper/internal/whatsapp"
 )
 
 // Version is the helper's own version, which hello reports.
@@ -129,6 +130,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, quiet func())
 			srv.Add(messenger.New(srv.Deps(n)))
 		case n == proto.Instagram:
 			srv.Add(instagram.New(srv.Deps(n)))
+		case n == proto.WhatsApp:
+			srv.Add(whatsapp.New(srv.Deps(n)))
 		default:
 			srv.Add(&backend.Unavailable{Net: n, Events: srv.Events})
 		}

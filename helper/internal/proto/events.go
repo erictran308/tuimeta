@@ -88,6 +88,18 @@ type FileEvent struct {
 	File  File   `json:"file"`
 }
 
+// LoginCodeEvent is the code to show while a device is being linked: QR is
+// drawn as a QR code to scan, Pairing typed on the phone. Expires is in unix
+// seconds.
+type LoginCodeEvent struct {
+	Event   string  `json:"event"`
+	Network Network `json:"network"`
+	Attempt uint64  `json:"attempt,omitempty"` // the login_link's attempt
+	QR      string  `json:"qr,omitempty"`
+	Pairing string  `json:"pairing,omitempty"`
+	Expires int64   `json:"expires"`
+}
+
 type ErrorEvent struct {
 	Event   string  `json:"event"`
 	Network Network `json:"network,omitempty"`

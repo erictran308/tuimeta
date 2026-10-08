@@ -145,10 +145,18 @@ type Upload struct {
 
 // Deps is what the server gives a backend.
 type Deps struct {
-	Events   *Events
-	IDs      *ids.Store    // chat and person ids, kept across runs
-	Messages *ids.Messages // message ids for the run
-	Files    *ids.Files    // file ids for the run
-	Outbox   *Outbox       // messages being sent
-	Session  *session.Store
+	Events    *Events
+	IDs       *ids.Store    // chat and person ids, kept across runs
+	Messages  *ids.Messages // message ids for the run
+	Files     *ids.Files    // file ids for the run
+	Outbox    *Outbox       // messages being sent
+	Session   *session.Store
+	Downloads Downloads // what's been downloaded (nil in tests that don't care)
+}
+
+// Downloads is what a backend may do with downloaded files: delete one
+// whose message is gone, or all of the network's.
+type Downloads interface {
+	Remove(ref ids.FileRef)
+	Forget(n proto.Network) error
 }

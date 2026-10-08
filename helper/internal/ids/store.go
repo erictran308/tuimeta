@@ -118,6 +118,37 @@ func (s *Store) Chat(n proto.Network, netID string) int64 { return s.get(key{cha
 // User is the id of the network's person netID, made if it's new.
 func (s *Store) User(n proto.Network, netID string) int64 { return s.get(key{userKind, n, netID}) }
 
+func (s *Store) rename(from, to key) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.byKey[from]
+	if !ok {
+		return false
+	}
+	if _, taken := s.byKey[to]; taken {
+		return false
+	}
+	delete(s.byKey, from)
+	s.byKey[to] = n
+	s.byID[n] = to
+	s.dirty = true
+	return true
+}
+
+// RenameChat gives the id of the network's chat from to the network-side id
+// to, for a network that starts calling a chat by another id (WhatsApp's
+// chats by phone number becoming chats by WhatsApp id), so tuimeta keeps
+// knowing it by the same number. It does nothing, and says so, when from has
+// no id or to already has one.
+func (s *Store) RenameChat(n proto.Network, from, to string) bool {
+	return s.rename(key{chatKind, n, from}, key{chatKind, n, to})
+}
+
+// RenameUser is RenameChat for a person.
+func (s *Store) RenameUser(n proto.Network, from, to string) bool {
+	return s.rename(key{userKind, n, from}, key{userKind, n, to})
+}
+
 func (s *Store) lookup(k kind, id int64) (proto.Network, string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

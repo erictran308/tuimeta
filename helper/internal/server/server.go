@@ -76,12 +76,13 @@ func New(cfg Config, store *ids.Store, stdout io.Writer) *Server {
 // Deps is what a backend for network n is given.
 func (s *Server) Deps(n proto.Network) backend.Deps {
 	return backend.Deps{
-		Events:   s.Events,
-		IDs:      s.IDs,
-		Messages: s.Messages,
-		Files:    s.Files,
-		Outbox:   s.Outbox,
-		Session:  session.New(s.cfg.DataDir, n),
+		Events:    s.Events,
+		IDs:       s.IDs,
+		Messages:  s.Messages,
+		Files:     s.Files,
+		Outbox:    s.Outbox,
+		Session:   session.New(s.cfg.DataDir, n),
+		Downloads: s.Downloads,
 	}
 }
 

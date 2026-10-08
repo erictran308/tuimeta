@@ -1,5 +1,5 @@
 //! The connection to `tuimeta-helper`, the separate program that speaks
-//! Messenger and Instagram (see `helper/PROTOCOL.md`).
+//! Messenger, Instagram and WhatsApp (see `helper/PROTOCOL.md`).
 //!
 //! The helper runs as a child process. Requests go to its stdin as JSON
 //! lines; its answers and events come back on its stdout. Each request runs
@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper. A history page of photos is far
@@ -36,31 +36,43 @@ const MAX_LINE: usize = 16 << 20;
 pub enum Network {
     Messenger,
     Instagram,
+    WhatsApp,
 }
 
 impl Network {
-    pub const ALL: [Network; 2] = [Network::Messenger, Network::Instagram];
+    pub const ALL: [Network; 3] = [Network::Messenger, Network::Instagram, Network::WhatsApp];
 
     pub fn name(self) -> &'static str {
         match self {
             Network::Messenger => "Messenger",
             Network::Instagram => "Instagram",
+            Network::WhatsApp => "WhatsApp",
         }
     }
 
-    /// The cookies login needs, as the login screen asks for them.
+    /// The network logs in by linking tuimeta as a new device of the
+    /// account, with a code the phone scans or takes, instead of cookies.
+    pub fn links(self) -> bool {
+        self == Network::WhatsApp
+    }
+
+    /// The cookies login needs, as the login screen asks for them; none
+    /// for a network that [`links`](Self::links).
     pub fn cookie_names(self) -> &'static [&'static str] {
         match self {
             Network::Messenger => &["c_user", "xs", "datr"],
             Network::Instagram => &["sessionid", "ds_user_id", "csrftoken"],
+            Network::WhatsApp => &[],
         }
     }
 
-    /// The site to copy the cookies from.
+    /// Where the login comes from: the site to copy the cookies from, or
+    /// for WhatsApp the app on the phone that links tuimeta.
     pub fn site(self) -> &'static str {
         match self {
             Network::Messenger => "facebook.com",
             Network::Instagram => "instagram.com",
+            Network::WhatsApp => "WhatsApp on your phone",
         }
     }
 }
@@ -123,12 +135,25 @@ pub struct ChatInfo {
     pub read_inbox: i64,
     #[serde(default)]
     pub read_outbox: i64,
-    #[serde(default)]
+    /// A last message that doesn't read leaves the chat without one,
+    /// rather than the chat unread.
+    #[serde(default, deserialize_with = "lenient")]
     pub last_message: Option<Box<Message>>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// A field that's `None` when it doesn't read, instead of failing what
+/// holds it.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -409,10 +434,23 @@ pub enum MetaEvent {
         request: String,
         found: Result<i64, String>,
     },
-    /// The answer to a login: `Err` says why it didn't work.
+    /// The answer to a login, the `attempt`th the app asked for: `Err` says
+    /// why it didn't work.
     LoggedIn {
         network: Network,
+        attempt: u64,
         result: Result<(), String>,
+    },
+    /// While a link waits (`login_link`): the code to show, which replaces
+    /// the one before. `qr` is drawn as a QR code for the phone to scan,
+    /// `pairing` typed on the phone; `expires` is unix seconds.
+    LoginCode {
+        network: Network,
+        /// The `login_link` it's for (0: the helper didn't say).
+        attempt: u64,
+        qr: Option<String>,
+        pairing: Option<String>,
+        expires: i64,
     },
     /// The helper stopped or broke the protocol; nothing more will come.
     Gone(String),
@@ -590,17 +628,54 @@ impl Meta {
 
     /// Logs in with the cookies the user pasted, as the browser they came
     /// from (`None`: the one the helper's libraries say), answered by
-    /// [`MetaEvent::LoggedIn`].
-    pub fn login_cookies(&self, network: Network, cookies: String, browser: Option<String>) {
+    /// [`MetaEvent::LoggedIn`] for `attempt`.
+    pub fn login_cookies(
+        &self,
+        network: Network,
+        cookies: String,
+        browser: Option<String>,
+        attempt: u64,
+    ) {
         self.then(
             "login_cookies",
             json!({"network": network, "cookies": cookies, "browser": browser}),
             move |answer| {
                 Some(MetaEvent::LoggedIn {
                     network,
+                    attempt,
                     result: answer.map(|_| ()),
                 })
             },
+        );
+    }
+
+    /// Links tuimeta as a new device of the account (WhatsApp): QR codes to
+    /// scan come as [`MetaEvent::LoginCode`]s, or with the account's phone
+    /// number, one code to type on the phone. Answered by
+    /// [`MetaEvent::LoggedIn`] for `attempt` once linked, or not.
+    pub fn login_link(&self, network: Network, phone: Option<String>, attempt: u64) {
+        self.then(
+            "login_link",
+            json!({"network": network, "phone": phone, "attempt": attempt}),
+            move |answer| {
+                Some(MetaEvent::LoggedIn {
+                    network,
+                    attempt,
+                    result: answer.map(|_| ()),
+                })
+            },
+        );
+    }
+
+    /// Stops the link of `attempt` if it still waits, so no code shown for
+    /// it works any more. The link itself then answers that it was
+    /// cancelled, which nobody waits for by then. A newer attempt is never
+    /// stopped by it, whichever request the helper handles first.
+    pub fn cancel_login(&self, network: Network, attempt: u64) {
+        self.then(
+            "cancel_login",
+            json!({"network": network, "attempt": attempt}),
+            |_| None,
         );
     }
 
@@ -643,7 +718,15 @@ impl Meta {
         let tx = self.inner.tx.clone();
         self.then("history", params, move |answer| {
             let messages = match answer {
-                Ok(mut result) => serde_json::from_value(result["messages"].take()).ok(),
+                // One message that doesn't read (a number out of range,
+                // say) costs that message, not the page around it.
+                Ok(mut result) => serde_json::from_value::<Vec<Value>>(result["messages"].take())
+                    .ok()
+                    .map(|list| {
+                        list.into_iter()
+                            .filter_map(|m| serde_json::from_value(m).ok())
+                            .collect()
+                    }),
                 Err(e) => {
                     let _ = tx.send(MetaEvent::Error(e));
                     None
@@ -849,8 +932,8 @@ pub fn helper_path() -> Result<PathBuf> {
         .join(name);
     if !path.is_file() {
         bail!(
-            "{name} isn't next to tuimeta ({}). It speaks Messenger and Instagram for it; \
-             build it with `go build -o ../target/debug/{name} .` in helper/",
+            "{name} isn't next to tuimeta ({}). It speaks Messenger, Instagram and \
+             WhatsApp for it; build it with `go build -o ../target/debug/{name} .` in helper/",
             config::shown(&path)
         );
     }
@@ -1013,6 +1096,13 @@ fn event(mut value: Value, inner: &Inner) -> Option<MetaEvent> {
             }
         }
         "error" => MetaEvent::Error(take(&mut value, "message")?),
+        "login_code" => MetaEvent::LoginCode {
+            network: take(&mut value, "network")?,
+            attempt: take(&mut value, "attempt").unwrap_or_default(),
+            qr: take(&mut value, "qr"),
+            pairing: take(&mut value, "pairing"),
+            expires: take(&mut value, "expires").unwrap_or_default(),
+        },
         _ => return None,
     })
 }
@@ -1078,6 +1168,7 @@ mod tests {
             Network::Messenger,
             "c_user=1; xs=2; datr=3".into(),
             Some("Safari 18.6".into()),
+            1,
         );
         let refused = next(&mut rx, |e| match e {
             MetaEvent::LoggedIn { result, .. } => Some(result),
@@ -1085,7 +1176,7 @@ mod tests {
         })
         .await;
         assert!(refused.is_err(), "only Chrome can be named");
-        meta.login_cookies(Network::Messenger, "c_user=1; xs=2".into(), None);
+        meta.login_cookies(Network::Messenger, "c_user=1; xs=2".into(), None, 2);
         let refused = next(&mut rx, |e| match e {
             MetaEvent::LoggedIn { result, .. } => Some(result),
             _ => None,
@@ -1096,6 +1187,7 @@ mod tests {
             Network::Messenger,
             "c_user=1; xs=2; datr=3".into(),
             Some("Chrome 150.0.7712.45".into()),
+            3,
         );
         let me = next(&mut rx, |e| match e {
             MetaEvent::Account {
@@ -1198,6 +1290,81 @@ mod tests {
             assert_eq!(mode & 0o077, 0, "{mode:o}");
         }
 
+        // WhatsApp links a device instead: a code to type on the phone,
+        // given up, then a QR code, which the fake takes as scanned.
+        meta.login_link(Network::WhatsApp, Some("+1 555 010 0100".into()), 4);
+        let pairing = next(&mut rx, |e| match e {
+            MetaEvent::LoginCode {
+                network: Network::WhatsApp,
+                pairing,
+                ..
+            } => pairing,
+            _ => None,
+        })
+        .await;
+        assert_eq!(pairing, "FAKE-C0DE");
+        meta.cancel_login(Network::WhatsApp, 4);
+        let given_up = next(&mut rx, |e| match e {
+            MetaEvent::LoggedIn {
+                network: Network::WhatsApp,
+                attempt: 4,
+                result,
+            } => Some(result),
+            _ => None,
+        })
+        .await;
+        assert!(given_up.is_err(), "cancelled");
+        meta.login_link(Network::WhatsApp, None, 5);
+        let qr = next(&mut rx, |e| match e {
+            MetaEvent::LoginCode {
+                network: Network::WhatsApp,
+                qr,
+                expires,
+                ..
+            } => qr.filter(|_| expires > 0),
+            _ => None,
+        })
+        .await;
+        assert!(qr.starts_with("2@fake"), "{qr}");
+        // Linked: the account is ready and the link answers, in either
+        // order.
+        let (mut linked, mut ready) = (None, false);
+        next(&mut rx, |e| {
+            match e {
+                MetaEvent::LoggedIn {
+                    network: Network::WhatsApp,
+                    attempt: 5,
+                    result,
+                } => linked = Some(result),
+                MetaEvent::Account {
+                    network: Network::WhatsApp,
+                    state: AccountState::Ready,
+                    ..
+                } => ready = true,
+                _ => {}
+            }
+            (linked.is_some() && ready).then_some(())
+        })
+        .await;
+        assert_eq!(linked, Some(Ok(())));
+        meta.load_chats(Some(Network::WhatsApp), 50);
+        let mut chats = Vec::new();
+        next(&mut rx, |e| match e {
+            MetaEvent::Chat(chat) => {
+                chats.push(*chat);
+                None
+            }
+            MetaEvent::ChatsLoaded { .. } => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(!chats.is_empty());
+        assert!(
+            chats
+                .iter()
+                .all(|c| c.network == Network::WhatsApp && c.encrypted)
+        );
+
         meta.close();
         next(&mut rx, |e| matches!(e, MetaEvent::Gone(_)).then_some(())).await;
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1218,10 +1385,10 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":2,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":3}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":3,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":4}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
-        let older = check_hello(br#"{"event":"hello","version":1}"#).unwrap_err();
+        let older = check_hello(br#"{"event":"hello","version":2}"#).unwrap_err();
         assert!(older.to_string().contains("same release"), "{older}");
         assert!(check_hello(b"not json").is_err());
         assert!(check_hello(br#"{"event":"chat","version":1}"#).is_err());
@@ -1277,6 +1444,72 @@ mod tests {
         assert_eq!(message.reply_to.unwrap().message_id, Some(300));
         assert_eq!(message.reactions[0].emoji, "❤️");
         assert!(message.edited);
+    }
+
+    #[test]
+    fn a_login_code_reads_the_qr_or_the_pairing_code_and_whatsapp_is_a_network() {
+        let (inner, mut rx) = inner();
+        on_line(
+            &inner,
+            br#"{"event":"login_code","network":"whatsapp","qr":"2@abc,def","expires":1700000060}"#,
+        )
+        .unwrap();
+        let Ok(MetaEvent::LoginCode {
+            network,
+            attempt,
+            qr,
+            pairing,
+            expires,
+        }) = rx.try_recv()
+        else {
+            panic!("no code");
+        };
+        assert_eq!(network, Network::WhatsApp);
+        assert_eq!(attempt, 0, "a helper that doesn't say");
+        assert_eq!(qr.as_deref(), Some("2@abc,def"));
+        assert_eq!(pairing, None);
+        assert_eq!(expires, 1700000060);
+
+        on_line(
+            &inner,
+            br#"{"event":"login_code","network":"whatsapp","pairing":"ABCD-EFGH","expires":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(MetaEvent::LoginCode { qr: None, pairing: Some(p), .. }) if p == "ABCD-EFGH"
+        ));
+        on_line(
+            &inner,
+            br#"{"event":"login_code","network":"myspace","qr":"2@x","expires":1}"#,
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "a network this build doesn't know");
+
+        assert_eq!(Network::ALL.len(), 3);
+        assert!(Network::WhatsApp.links() && !Network::Messenger.links());
+        assert!(Network::WhatsApp.cookie_names().is_empty());
+        assert_eq!(serde_json::to_value(Network::WhatsApp).unwrap(), "whatsapp");
+    }
+
+    #[test]
+    fn a_link_asks_by_qr_or_by_number_and_can_be_given_up() {
+        let meta = Meta::detached(unbounded_channel().0);
+        meta.login_link(Network::WhatsApp, None, 1);
+        meta.login_link(Network::WhatsApp, Some("+1 555 010 0100".into()), 2);
+        meta.cancel_login(Network::WhatsApp, 2);
+        let sent = meta.sent();
+        assert_eq!(sent[0].0, "login_link");
+        assert_eq!(sent[0].1["network"], "whatsapp");
+        assert!(sent[0].1["phone"].is_null());
+        assert_eq!(sent[1].1["phone"], "+1 555 010 0100");
+        assert_eq!(
+            sent[2],
+            (
+                "cancel_login".into(),
+                json!({"network": "whatsapp", "attempt": 2})
+            )
+        );
     }
 
     #[test]

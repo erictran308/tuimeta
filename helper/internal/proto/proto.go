@@ -4,24 +4,32 @@
 // are written on the wire (see PROTOCOL.md).
 package proto
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"math"
+)
 
 // Version is the protocol version the hello line announces.
-const Version = 2
+const Version = 3
 
-// Network is "messenger" or "instagram".
+// Network is "messenger", "instagram" or "whatsapp".
 type Network string
 
 const (
 	Messenger Network = "messenger"
 	Instagram Network = "instagram"
+	WhatsApp  Network = "whatsapp"
 )
 
 // Networks lists every network, in the order hello names them.
-var Networks = []Network{Messenger, Instagram}
+var Networks = []Network{Messenger, Instagram, WhatsApp}
 
 // Valid reports whether n is one of Networks.
-func (n Network) Valid() bool { return n == Messenger || n == Instagram }
+func (n Network) Valid() bool { return n == Messenger || n == Instagram || n == WhatsApp }
+
+// Links reports whether n logs in by linking a device (login_link) rather
+// than with cookies.
+func (n Network) Links() bool { return n == WhatsApp }
 
 // ChatKind is "dm" or "group".
 type ChatKind string
@@ -159,6 +167,28 @@ type Media struct {
 	Size      int64     `json:"size,omitempty"`
 	ViewOnce  bool      `json:"view_once"`
 }
+
+// MarshalJSON keeps the numbers a sender chose within what tuimeta reads
+// (an i32 duration, u32 sizes): one out of range would make the whole
+// message, and the chat or history page holding it, unreadable.
+func (m Media) MarshalJSON() ([]byte, error) {
+	type plain Media
+	m.Duration = clampInt(m.Duration, 0, math.MaxInt32)
+	m.Width = clampInt(m.Width, 0, math.MaxUint32)
+	m.Height = clampInt(m.Height, 0, math.MaxUint32)
+	m.Size = max(m.Size, 0)
+	return json.Marshal(plain(m))
+}
+
+// MarshalJSON keeps an image's size within what tuimeta reads.
+func (i Image) MarshalJSON() ([]byte, error) {
+	type plain Image
+	i.Width = clampInt(i.Width, 0, math.MaxUint32)
+	i.Height = clampInt(i.Height, 0, math.MaxUint32)
+	return json.Marshal(plain(i))
+}
+
+func clampInt(v, lo, hi int) int { return min(max(v, lo), hi) }
 
 // LinkPreview is the card a network attached to a link. It only ever comes
 // from the network's own data: the helper never fetches a message's URL.

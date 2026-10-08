@@ -12,7 +12,7 @@ use crate::text;
 const MAX_FOLLOWED: usize = 1000;
 const MAX_LOADED: usize = 2 * MAX_FOLLOWED;
 
-/// Who sent a message. On Messenger and Instagram, always a person.
+/// Who sent a message. On Meta's networks, always a person.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Sender {
     User(i64),

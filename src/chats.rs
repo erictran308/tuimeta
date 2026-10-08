@@ -19,7 +19,8 @@ pub struct Chat {
     pub title: String,
     pub network: Network,
     /// Channel posts all come from the channel, so they show no sender name.
-    /// Messenger and Instagram have none, so it's always false.
+    /// Messenger, Instagram and WhatsApp chats have none, so it's always
+    /// false.
     pub is_channel: bool,
     /// A one-on-one chat, where only the other person can be typing.
     pub is_private: bool,
@@ -41,7 +42,8 @@ pub struct Chat {
     /// The person or group the chat is with.
     pub peer: Option<Peer>,
     muted: bool,
-    /// Messenger's end-to-end encrypted chats, which show a 🔒.
+    /// End-to-end encrypted chats (every WhatsApp chat, Messenger's
+    /// encrypted ones), which show a 🔒.
     pub encrypted: bool,
     /// A message request you haven't accepted.
     pub request: bool,

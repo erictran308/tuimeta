@@ -14,6 +14,8 @@ const (
 	Checkpoint    Code = "checkpoint"
 	NetworkError  Code = "network"
 	Unsupported   Code = "unsupported"
+	Timeout       Code = "timeout"
+	Cancelled     Code = "cancelled"
 	Internal      Code = "internal"
 )
 
@@ -55,6 +57,8 @@ func (n Network) Title() string {
 		return "Messenger"
 	case Instagram:
 		return "Instagram"
+	case WhatsApp:
+		return "WhatsApp"
 	}
 	return "that network"
 }

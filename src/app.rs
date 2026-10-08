@@ -76,7 +76,42 @@ pub enum LoginStep {
     Cookies {
         network: Network,
     },
+    /// Linking tuimeta as a new device of the account (WhatsApp), by a QR
+    /// code or with the phone number.
+    Link {
+        network: Network,
+        how: Linking,
+    },
     LoggingOut,
+}
+
+/// How a link goes, and the code it's at.
+pub enum Linking {
+    /// A QR code for the phone to scan: `None` until the helper gives one.
+    Qr(Option<String>),
+    /// The account's phone number, being typed into the login's input.
+    Phone,
+    /// A code to type on the phone, for the number given: `None` until the
+    /// helper gives one, then with when it stops working (unix seconds).
+    Pairing {
+        phone: String,
+        code: Option<(String, i64)>,
+    },
+}
+
+/// The longest QR text drawn: WhatsApp's are a few hundred characters, and
+/// a QR code of more wouldn't fit any window.
+const MAX_QR: usize = 1024;
+
+/// A pairing code as the helper gave it, if it looks like one: letters,
+/// digits and dashes, as many as a code has. Anything else is never shown.
+fn pairing_code(code: &str) -> Option<String> {
+    let code = text::clean(code);
+    let code = code.trim();
+    (!code.is_empty()
+        && code.len() <= 16
+        && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    .then(|| code.to_ascii_uppercase())
 }
 
 pub struct Login {
@@ -110,7 +145,14 @@ impl Login {
     }
 
     pub fn takes_input(&self) -> bool {
-        matches!(self.step, LoginStep::Cookies { .. })
+        matches!(
+            self.step,
+            LoginStep::Cookies { .. }
+                | LoginStep::Link {
+                    how: Linking::Phone,
+                    ..
+                }
+        )
     }
 }
 
@@ -479,7 +521,7 @@ impl Command {
 
     pub fn about(self) -> &'static str {
         match self {
-            Command::Login => "Log in to Messenger or Instagram, or log in again",
+            Command::Login => "Log in to Messenger, Instagram or WhatsApp, or log in again",
             Command::Logout => "Log out of the network of the chat under the cursor (asks first)",
         }
     }
@@ -596,12 +638,16 @@ pub struct App {
     notified: HashMap<i64, i64>,
     /// Unmuted chats with unread messages, shown in the window title.
     unread_chats: i32,
-    /// The photo the last frame showed in the viewer, by file id.
-    shown_in_viewer: Option<i32>,
+    /// The photo the last frame showed in the viewer, by file id, and the
+    /// size it was zoomed to.
+    shown_in_viewer: Option<(i32, Option<usize>)>,
     /// The browser a login says tuimeta is (`TM_BROWSER`: Chrome and its full
     /// version), so the session looks like the browser its cookies came
     /// from. `None` leaves it to the helper.
     pub browser: Option<String>,
+    /// Counts the logins asked for: an answer to an earlier one (a link
+    /// given up with Esc) is old news.
+    login_attempt: u64,
     exit: bool,
 }
 
@@ -672,6 +718,7 @@ impl App {
             unread_chats: 0,
             shown_in_viewer: None,
             browser: None,
+            login_attempt: 0,
             exit: false,
         };
         app.use_saved_theme();
@@ -720,8 +767,9 @@ impl App {
             }
             // Sixel and iTerm2 pictures stay on screen until every cell of
             // them is drawn over, which tmux may skip for blank ones: the
-            // viewer's photo once it closes.
-            let in_viewer = self.photo_view.as_ref().map(|v| v.photo.file_id);
+            // viewer's photo once it closes, changes size or makes way for
+            // another, and the bubbles' under its blank edges once it opens.
+            let in_viewer = self.photo_view.as_ref().map(|v| (v.photo.file_id, v.zoom));
             if in_viewer != self.shown_in_viewer && self.images.paints_over() {
                 let _ = terminal.clear();
             }
@@ -844,6 +892,11 @@ impl App {
                 }
                 self.on_prompt_edit();
             }
+            // Files attached and Insert mode under the photo, out of sight,
+            // would go out with the next Enter or two.
+            Event::Paste(_) if self.photo_view.is_some() => {
+                self.status = Some("Close the photo to paste".into());
+            }
             Event::Paste(text) if matches!(self.focus, Focus::Input | Focus::Messages) => {
                 self.on_paste(text)
             }
@@ -873,18 +926,51 @@ impl App {
                 name,
                 error,
             } => self.on_account(network, state, user_id, name, error),
-            MetaEvent::LoggedIn { network, result } => {
-                if let Screen::Login(login) = &mut self.screen
-                    && matches!(login.step, LoginStep::Cookies { network: n } if n == network)
-                {
-                    match result {
+            MetaEvent::LoggedIn {
+                network,
+                attempt,
+                result,
+            } => {
+                if attempt != self.login_attempt {
+                    return;
+                }
+                let Screen::Login(login) = &mut self.screen else {
+                    return;
+                };
+                match &mut login.step {
+                    LoginStep::Cookies { network: n } if *n == network => match result {
                         // The account says when it's connected.
                         Ok(()) => login.input = Login::new(LoginStep::Cookies { network }).input,
                         Err(why) => {
                             login.busy = false;
-                            login.error = Some(why);
+                            login.error = Some(text::clean(&why));
+                        }
+                    },
+                    LoginStep::Link { network: n, how } if *n == network => {
+                        if let Err(why) = result {
+                            // The code shown works no more.
+                            match how {
+                                Linking::Qr(code) => *code = None,
+                                Linking::Pairing { code, .. } => *code = None,
+                                Linking::Phone => {}
+                            }
+                            login.busy = false;
+                            login.error = Some(text::clean(&why));
                         }
                     }
+                    _ => {}
+                }
+            }
+            MetaEvent::LoginCode {
+                network,
+                attempt,
+                qr,
+                pairing,
+                expires,
+            } => {
+                // A code for a link given up (Esc, `p`) is old news.
+                if attempt == 0 || attempt == self.login_attempt {
+                    self.on_login_code(network, qr, pairing, expires)
                 }
             }
             MetaEvent::Error(message) => match &mut self.screen {
@@ -1163,7 +1249,7 @@ impl App {
                     choose.error = error;
                     self.screen = Screen::Login(Box::new(choose));
                 }
-                LoginStep::Cookies { network }
+                LoginStep::Cookies { network } | LoginStep::Link { network, .. }
                     if self
                         .accounts
                         .get(&network)
@@ -1172,6 +1258,8 @@ impl App {
                     self.screen = Screen::Main;
                     self.show_toast("Logged in", network.name());
                 }
+                // A link says how it ended in its answer: the account may
+                // still be in trouble from before while it waits.
                 LoginStep::Cookies { network } if login.busy => {
                     if let Some(account) = self.accounts.get(&network)
                         && account.state == AccountState::Error
@@ -1405,6 +1493,10 @@ impl App {
                     KeyCode::Enter | KeyCode::Char('l') => {
                         let network = Network::ALL[selected.min(last)];
                         let from_main = login.from_main;
+                        if network.links() {
+                            self.start_link(network, None, from_main);
+                            return;
+                        }
                         let mut cookies = Login::new(LoginStep::Cookies { network });
                         cookies.from_main = from_main;
                         self.screen = Screen::Login(Box::new(cookies));
@@ -1415,13 +1507,7 @@ impl App {
                 }
             }
             LoginStep::Cookies { network } => match key.code {
-                KeyCode::Esc => {
-                    let selected = Network::ALL.iter().position(|&n| n == network).unwrap_or(0);
-                    let from_main = login.from_main;
-                    let mut choose = Login::new(LoginStep::Choose { selected });
-                    choose.from_main = from_main;
-                    self.screen = Screen::Login(Box::new(choose));
-                }
+                KeyCode::Esc => self.back_to_choose(network),
                 KeyCode::Enter => {
                     let value = login.input.lines().concat().trim().to_string();
                     if value.is_empty() || login.busy {
@@ -1440,13 +1526,145 @@ impl App {
                     }
                     login.busy = true;
                     login.error = None;
-                    self.meta
-                        .login_cookies(network, value, self.browser.clone());
+                    self.login_attempt += 1;
+                    self.meta.login_cookies(
+                        network,
+                        value,
+                        self.browser.clone(),
+                        self.login_attempt,
+                    );
                 }
                 _ => {
                     login.input.input(key);
                 }
             },
+            LoginStep::Link { network, ref how } => {
+                let typing = matches!(how, Linking::Phone);
+                let phone = match how {
+                    Linking::Pairing { phone, .. } => Some(phone.clone()),
+                    _ => None,
+                };
+                self.on_link_key(key, network, typing, phone);
+            }
+        }
+    }
+
+    /// Keys while linking a device: `p` for the phone number instead of a
+    /// QR code, Enter for a fresh code once one ran out, Esc to give up.
+    /// `typing` is the phone number step; `phone` the number a code was
+    /// asked for.
+    fn on_link_key(
+        &mut self,
+        key: KeyEvent,
+        network: Network,
+        typing: bool,
+        phone: Option<String>,
+    ) {
+        let Screen::Login(login) = &mut self.screen else {
+            return;
+        };
+        let from_main = login.from_main;
+        match key.code {
+            KeyCode::Esc => {
+                if login.busy {
+                    self.meta.cancel_login(network, self.login_attempt);
+                }
+                self.back_to_choose(network);
+            }
+            KeyCode::Enter if typing => {
+                let number = login.input.lines().concat().trim().to_string();
+                if number.is_empty() {
+                    return;
+                }
+                self.start_link(network, Some(number), from_main);
+            }
+            _ if typing => {
+                login.input.input(key);
+            }
+            KeyCode::Char('p') => {
+                if login.busy {
+                    // The codes shown so far stop working.
+                    self.meta.cancel_login(network, self.login_attempt);
+                }
+                let mut ask = Login::new(LoginStep::Link {
+                    network,
+                    how: Linking::Phone,
+                });
+                if let Some(number) = phone {
+                    ask.input.insert_str(number);
+                }
+                ask.from_main = from_main;
+                self.screen = Screen::Login(Box::new(ask));
+            }
+            KeyCode::Enter if !login.busy => self.start_link(network, phone, from_main),
+            KeyCode::Char('q') => self.quit(),
+            _ => {}
+        }
+    }
+
+    /// Asks the helper to link `network` as a new device: by QR codes, or
+    /// with the account's phone number by a code to type on the phone. The
+    /// screen waits for the code.
+    fn start_link(&mut self, network: Network, phone: Option<String>, from_main: bool) {
+        let how = match &phone {
+            Some(number) => Linking::Pairing {
+                phone: number.clone(),
+                code: None,
+            },
+            None => Linking::Qr(None),
+        };
+        let mut login = Login::new(LoginStep::Link { network, how });
+        login.from_main = from_main;
+        login.busy = true;
+        self.screen = Screen::Login(Box::new(login));
+        self.login_attempt += 1;
+        self.meta.login_link(network, phone, self.login_attempt);
+    }
+
+    /// Back to picking a network, on the one left.
+    fn back_to_choose(&mut self, network: Network) {
+        let Screen::Login(login) = &self.screen else {
+            return;
+        };
+        let selected = Network::ALL.iter().position(|&n| n == network).unwrap_or(0);
+        let mut choose = Login::new(LoginStep::Choose { selected });
+        choose.from_main = login.from_main;
+        self.screen = Screen::Login(Box::new(choose));
+    }
+
+    /// A code to show while a link waits; one for another network, or once
+    /// nothing waits, is old news.
+    fn on_login_code(
+        &mut self,
+        network: Network,
+        qr: Option<String>,
+        pairing: Option<String>,
+        expires: i64,
+    ) {
+        let Screen::Login(login) = &mut self.screen else {
+            return;
+        };
+        if !login.busy {
+            return;
+        }
+        let LoginStep::Link { network: n, how } = &mut login.step else {
+            return;
+        };
+        if *n != network {
+            return;
+        }
+        match how {
+            Linking::Qr(code) => {
+                if let Some(qr) = qr.filter(|qr| !qr.is_empty() && qr.len() <= MAX_QR) {
+                    *code = Some(qr);
+                }
+            }
+            Linking::Pairing { code, .. } => {
+                if let Some(pairing) = pairing.as_deref().and_then(pairing_code) {
+                    *code = Some((pairing, expires));
+                }
+            }
+            Linking::Phone => {}
         }
     }
 
@@ -1945,6 +2163,10 @@ impl App {
     /// tuimeta's window has focus. Where the terminal never reports focus,
     /// only the chat being read counts.
     fn sees(&self, chat_id: i64) -> bool {
+        // The photo viewer hides every chat.
+        if self.photo_view.is_some() {
+            return false;
+        }
         if self.focus_reported {
             self.terminal_focused
         } else {
@@ -2000,9 +2222,11 @@ impl App {
             return;
         };
         let name = network.name();
-        // Logout is local on both networks: tuimeta drops the connection and
-        // deletes what it keeps, but never ends the web session the cookies
-        // belong to, so the browser you copied them from stays logged in.
+        // Logout is local on Messenger and Instagram: tuimeta drops the
+        // connection and deletes what it keeps, but never ends the web
+        // session the cookies belong to, so the browser you copied them from
+        // stays logged in. On WhatsApp tuimeta is a linked device of its
+        // own, which it unlinks.
         let ends = match network {
             Network::Messenger => vec![
                 "tuimeta disconnects and deletes what it keeps for".to_string(),
@@ -2016,6 +2240,12 @@ impl App {
                 "Instagram on this computer. The session itself ends".into(),
                 "only once you log out in the browser you copied the".into(),
                 "cookies from.".into(),
+            ],
+            Network::WhatsApp => vec![
+                "tuimeta unlinks itself from your WhatsApp account and".to_string(),
+                "deletes what it keeps for WhatsApp on this computer,".into(),
+                "the messages it kept included. Your phone and your".into(),
+                "other linked devices stay logged in.".into(),
             ],
         };
         self.confirm = Some(Confirm::new(
@@ -2590,22 +2820,47 @@ impl App {
     /// Shows message `message_id`'s photo in the viewer; one that's no
     /// longer loaded opens in its app, as `o` in the viewer would.
     fn view_photo(&mut self, message_id: i64, file: MediaFile) {
-        let view = self.open.as_ref().and_then(|open| {
-            let msg = open.messages.get(&message_id)?;
-            PhotoView::of(open.chat_id, message_id, msg)
-        });
-        match view {
-            Some(view) => self.photo_view = Some(view),
-            None => self.open_target(Target::File(file)),
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let view = match open.messages.get(&message_id) {
+            Some(msg) => PhotoView::of(open.chat_id, message_id, msg),
+            None => {
+                self.open_target(Target::File(file));
+                return;
+            }
+        };
+        let Some(view) = view else {
+            self.status = Some("This photo can't be shown here".into());
+            return;
+        };
+        // The cursor stays on it rather than following new messages: what
+        // arrives meanwhile is hidden under the photo, so it isn't marked
+        // read, and an Enter after closing it isn't on something unseen.
+        if open.selected.is_none() {
+            open.selected = Some(message_id);
         }
+        self.photo_view = Some(view);
     }
 
     /// The photo viewer takes all keys while it's up.
     fn on_viewer_key(&mut self, key: KeyEvent) {
-        let Some(view) = &self.photo_view else {
+        let Some(view) = self.photo_view.as_mut() else {
             return;
         };
+        // Ctrl-o, out of habit for going back, isn't `o`, which hands the
+        // photo to another app.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
         match key.code {
+            KeyCode::Char('h') | KeyCode::Left => self.view_next_photo(false),
+            KeyCode::Char('l') | KeyCode::Right => self.view_next_photo(true),
+            KeyCode::Char('j' | '+' | '=') => view.zoom_in(),
+            KeyCode::Char('k' | '-') => view.zoom_out(),
             // It closes first: the app comes up over tuimeta anyway, and a
             // warning about the file mustn't come up under the photo.
             KeyCode::Char('o') => {
@@ -2613,9 +2868,47 @@ impl App {
                 self.photo_view = None;
                 self.open_target(Target::File(file));
             }
-            KeyCode::Char('y') => self.copy_target(Target::File(view.file.clone())),
+            KeyCode::Char('y') => {
+                let file = view.file.clone();
+                self.copy_target(Target::File(file));
+            }
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => self.photo_view = None,
             _ => {}
+        }
+    }
+
+    /// `h` / `l` in the viewer: the photo before or after the one shown,
+    /// among the messages loaded. Past those, more are loaded, for `h` or
+    /// `l` again.
+    fn view_next_photo(&mut self, newer: bool) {
+        let Some(view) = &self.photo_view else {
+            return;
+        };
+        let Some(open) = self.open.as_ref().filter(|o| o.chat_id == view.chat_id) else {
+            return;
+        };
+        let id = view.message_id;
+        let photo =
+            |(&id, msg): (&i64, &crate::messages::Msg)| PhotoView::of(open.chat_id, id, msg);
+        let next = match newer {
+            true => open.messages.range(id + 1..).find_map(photo),
+            false => open.messages.range(..id).rev().find_map(photo),
+        };
+        if next.is_some() {
+            self.photo_view = next;
+            return;
+        }
+        match (newer, open.all_loaded, open.at_newest) {
+            (false, false, _) => {
+                self.status = Some("Loading older messages…".into());
+                self.load_older_messages();
+            }
+            (true, _, false) => {
+                self.status = Some("Loading newer messages…".into());
+                self.load_newer_messages();
+            }
+            (false, true, _) => self.status = Some("No older photos in this chat".into()),
+            (true, _, true) => self.status = Some("No newer photos in this chat".into()),
         }
     }
 
@@ -2886,6 +3179,11 @@ impl App {
         // Enter meant to open one would send it.
         if !matches!(self.focus, Focus::Messages | Focus::Input) {
             self.status = Some("The paste came after you left the messages: p pastes again".into());
+            return;
+        }
+        // Nor under the photo viewer, out of sight.
+        if self.photo_view.is_some() {
+            self.status = Some("The paste came while a photo was open: p pastes again".into());
             return;
         }
         match pasted.content {
@@ -3846,6 +4144,11 @@ mod tests {
         );
         account(&mut app, Network::Instagram, AccountState::LoggedOut);
         assert!(
+            matches!(&app.screen, Screen::Login(l) if matches!(l.step, LoginStep::Connecting)),
+            "waiting to hear about WhatsApp"
+        );
+        account(&mut app, Network::WhatsApp, AccountState::LoggedOut);
+        assert!(
             matches!(&app.screen, Screen::Login(l) if matches!(l.step, LoginStep::Choose { .. }))
         );
 
@@ -3876,6 +4179,16 @@ mod tests {
 
         app.on_meta(MetaEvent::LoggedIn {
             network: Network::Instagram,
+            attempt: app.login_attempt - 1,
+            result: Err("An answer to a login given up.".into()),
+        });
+        let Screen::Login(login) = &app.screen else {
+            panic!("still logging in");
+        };
+        assert!(login.busy, "old news");
+        app.on_meta(MetaEvent::LoggedIn {
+            network: Network::Instagram,
+            attempt: app.login_attempt,
             result: Err("Instagram wants you to confirm it's you.".into()),
         });
         let Screen::Login(login) = &app.screen else {
@@ -3890,6 +4203,233 @@ mod tests {
         account(&mut app, Network::Instagram, AccountState::Ready);
         assert!(matches!(app.screen, Screen::Main));
         assert_eq!(sent_with(&app, "load_chats")[0]["network"], "instagram");
+    }
+
+    /// The login screen picking a network, as when nobody is logged in.
+    fn choosing(app: &mut App, network: Network) {
+        let selected = Network::ALL.iter().position(|&n| n == network).unwrap();
+        app.screen = login_screen(LoginStep::Choose { selected });
+    }
+
+    /// The link step's code, if one shows.
+    fn link_code(app: &App) -> Option<String> {
+        match &app.screen {
+            Screen::Login(l) => match &l.step {
+                LoginStep::Link {
+                    how: Linking::Qr(code),
+                    ..
+                } => code.clone(),
+                LoginStep::Link {
+                    how: Linking::Pairing { code, .. },
+                    ..
+                } => code.as_ref().map(|(code, _)| code.clone()),
+                _ => None,
+            },
+            Screen::Main => None,
+        }
+    }
+
+    fn code_for(network: Network, qr: Option<&str>, pairing: Option<&str>) -> MetaEvent {
+        MetaEvent::LoginCode {
+            network,
+            attempt: 0,
+            qr: qr.map(Into::into),
+            pairing: pairing.map(Into::into),
+            expires: 1_700_000_060,
+        }
+    }
+
+    #[test]
+    fn a_code_for_a_link_given_up_never_shows_on_the_next_one() {
+        let mut app = test_app("link-stale");
+        let none = KeyModifiers::NONE;
+        choosing(&mut app, Network::WhatsApp);
+        press(&mut app, KeyCode::Enter, none);
+        let first = app.login_attempt;
+        press(&mut app, KeyCode::Char('p'), none);
+        for c in "+1 555 010 0100".chars() {
+            press(&mut app, KeyCode::Char(c), none);
+        }
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.login_attempt > first);
+        assert_eq!(
+            sent_with(&app, "cancel_login"),
+            [serde_json::json!({"network": "whatsapp", "attempt": first})],
+            "only the first attempt is given up"
+        );
+        assert_eq!(
+            sent_with(&app, "login_link")[1]["attempt"],
+            app.login_attempt
+        );
+        app.on_meta(MetaEvent::LoginCode {
+            network: Network::WhatsApp,
+            attempt: first,
+            qr: None,
+            pairing: Some("OLDC-ODE1".into()),
+            expires: 1_700_000_060,
+        });
+        assert_eq!(link_code(&app), None, "the old attempt's code showed");
+        app.on_meta(MetaEvent::LoginCode {
+            network: Network::WhatsApp,
+            attempt: app.login_attempt,
+            qr: None,
+            pairing: Some("NEWC-ODE2".into()),
+            expires: 1_700_000_060,
+        });
+        assert_eq!(link_code(&app).as_deref(), Some("NEWC-ODE2"));
+    }
+
+    #[test]
+    fn enter_on_whatsapp_asks_for_a_qr_code_shows_it_and_esc_gives_it_up() {
+        let mut app = test_app("link-qr");
+        let none = KeyModifiers::NONE;
+        choosing(&mut app, Network::WhatsApp);
+        press(&mut app, KeyCode::Enter, none);
+        let link = sent_with(&app, "login_link");
+        assert_eq!(link.len(), 1);
+        assert_eq!(link[0]["network"], "whatsapp");
+        assert!(link[0]["phone"].is_null(), "a QR code first");
+        assert!(sent_with(&app, "login_cookies").is_empty());
+        assert!(matches!(&app.screen,
+            Screen::Login(l) if l.busy && matches!(l.step, LoginStep::Link { how: Linking::Qr(None), .. })));
+        assert!(screen(&mut app).join("\n").contains("Waiting for a code"));
+
+        app.on_meta(code_for(Network::Instagram, Some("2@other"), None));
+        assert_eq!(link_code(&app), None, "another network's code");
+        app.on_meta(code_for(Network::WhatsApp, None, Some("ABCD-EFGH")));
+        assert_eq!(link_code(&app), None, "a pairing code while scanning");
+        app.on_meta(code_for(Network::WhatsApp, Some("2@first"), None));
+        app.on_meta(code_for(Network::WhatsApp, Some("2@second"), None));
+        assert_eq!(link_code(&app).as_deref(), Some("2@second"), "the newest");
+
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(
+            sent_with(&app, "cancel_login"),
+            [serde_json::json!({"network": "whatsapp", "attempt": app.login_attempt})]
+        );
+        assert!(matches!(&app.screen,
+            Screen::Login(l) if matches!(l.step, LoginStep::Choose { selected: 2 })));
+        app.on_meta(code_for(Network::WhatsApp, Some("2@late"), None));
+        assert!(
+            matches!(&app.screen,
+            Screen::Login(l) if matches!(l.step, LoginStep::Choose { .. })),
+            "nothing waits"
+        );
+
+        // Linking again: the first link's late answer is old news.
+        press(&mut app, KeyCode::Enter, none);
+        app.on_meta(MetaEvent::LoggedIn {
+            network: Network::WhatsApp,
+            attempt: app.login_attempt - 1,
+            result: Err("Linking was cancelled.".into()),
+        });
+        let Screen::Login(login) = &app.screen else {
+            panic!("still linking");
+        };
+        assert!(login.busy && login.error.is_none());
+    }
+
+    #[test]
+    fn a_link_that_ran_out_says_why_and_enter_asks_for_a_fresh_code() {
+        let mut app = test_app("link-timeout");
+        let none = KeyModifiers::NONE;
+        app.accounts.remove(&Network::WhatsApp);
+        choosing(&mut app, Network::WhatsApp);
+        press(&mut app, KeyCode::Enter, none);
+        app.on_meta(code_for(Network::WhatsApp, Some("2@code"), None));
+        app.on_meta(MetaEvent::LoggedIn {
+            network: Network::WhatsApp,
+            attempt: app.login_attempt,
+            result: Err("Nothing was scanned in time;\u{1b}[2J try again.".into()),
+        });
+        let Screen::Login(login) = &app.screen else {
+            panic!("still linking");
+        };
+        assert!(!login.busy);
+        assert_eq!(
+            login.error.as_deref(),
+            Some("Nothing was scanned in time;[2J try again.")
+        );
+        assert_eq!(link_code(&app), None, "the old code works no more");
+        let rows = screen(&mut app).join("\n");
+        assert!(rows.contains("Enter new code"), "{rows}");
+        assert!(rows.contains("No code now"), "{rows}");
+
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(sent_with(&app, "login_link").len(), 2);
+        let Screen::Login(login) = &app.screen else {
+            panic!("still linking");
+        };
+        assert!(login.busy && login.error.is_none());
+
+        app.on_meta(MetaEvent::Account {
+            network: Network::WhatsApp,
+            state: AccountState::Ready,
+            user_id: Some(77),
+            name: Some("+1 555 010 0100".into()),
+            error: None,
+        });
+        assert!(matches!(app.screen, Screen::Main));
+        assert_eq!(app.toast.as_ref().unwrap().detail, "WhatsApp");
+        assert!(
+            sent_with(&app, "load_chats")
+                .iter()
+                .any(|p| p["network"] == "whatsapp")
+        );
+    }
+
+    #[test]
+    fn the_phone_number_way_sends_the_number_and_shows_the_code_to_type() {
+        let mut app = test_app("link-phone");
+        let none = KeyModifiers::NONE;
+        choosing(&mut app, Network::WhatsApp);
+        press(&mut app, KeyCode::Enter, none);
+        press(&mut app, KeyCode::Char('p'), none);
+        assert_eq!(
+            sent_with(&app, "cancel_login").len(),
+            1,
+            "the QR codes stop"
+        );
+        let Screen::Login(login) = &app.screen else {
+            panic!("still linking");
+        };
+        assert!(login.takes_input() && !login.busy);
+
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(sent_with(&app, "login_link").len(), 1, "no number yet");
+        app.on_terminal_event(Event::Paste("+1 555\n010 0100".into()));
+        press(&mut app, KeyCode::Char('p'), none);
+        press(&mut app, KeyCode::Backspace, none);
+        assert!(
+            screen(&mut app).join("\n").contains("+1 555 010 0100"),
+            "typed in the open"
+        );
+        press(&mut app, KeyCode::Enter, none);
+        let link = sent_with(&app, "login_link");
+        assert_eq!(link[1]["phone"], "+1 555 010 0100");
+
+        app.on_meta(code_for(Network::WhatsApp, Some("2@qr"), None));
+        assert_eq!(link_code(&app), None, "a QR code while typing a code");
+        app.on_meta(code_for(Network::WhatsApp, None, Some("\u{1b}[31mEVIL")));
+        assert_eq!(link_code(&app), None, "not a code");
+        app.on_meta(code_for(Network::WhatsApp, None, Some("abcd-efgh")));
+        assert_eq!(link_code(&app).as_deref(), Some("ABCD-EFGH"));
+
+        // `p` again takes the number back, to change it.
+        press(&mut app, KeyCode::Char('p'), none);
+        assert_eq!(sent_with(&app, "cancel_login").len(), 2);
+        let Screen::Login(login) = &app.screen else {
+            panic!("still linking");
+        };
+        assert_eq!(login.input.lines().concat(), "+1 555 010 0100");
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(
+            sent_with(&app, "cancel_login").len(),
+            2,
+            "nothing waited while typing"
+        );
+        assert!(matches!(&app.screen,
+            Screen::Login(l) if matches!(l.step, LoginStep::Choose { selected: 2 })));
     }
 
     #[test]
@@ -3947,7 +4487,46 @@ mod tests {
             app.chats
                 .ids()
                 .iter()
-                .all(|&id| app.chats.network(id) == Some(Network::Instagram))
+                .all(|&id| app.chats.network(id) != Some(Network::Messenger))
+        );
+    }
+
+    #[test]
+    fn logging_out_of_whatsapp_says_it_unlinks_tuimeta_and_not_the_phone() {
+        let mut app = test_app("logout-whatsapp");
+        let none = KeyModifiers::NONE;
+        app.accounts.retain(|&n, _| n == Network::WhatsApp);
+        app.open = None;
+        app.selected = None;
+        app.focus = Focus::Chats;
+        app.ask_to_log_out();
+        let confirm = app.confirm.as_ref().expect("asks");
+        assert_eq!(confirm.title, "Log out of WhatsApp?");
+        let said = confirm.lines.join(" ");
+        assert!(
+            said.contains("unlinks itself from your WhatsApp account"),
+            "{said}"
+        );
+        assert!(
+            said.contains("Your phone and your other linked devices stay"),
+            "{said}"
+        );
+        let rows = screen(&mut app).join("\n");
+        assert!(
+            rows.contains("unlinks itself from your WhatsApp account and"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("other linked devices stay logged in."),
+            "{rows}"
+        );
+        app.confirm.as_mut().unwrap().shown = Instant::now().checked_sub(CONFIRM_GRACE).unwrap();
+        press(&mut app, KeyCode::Char('y'), none);
+        assert_eq!(sent_with(&app, "logout")[0]["network"], "whatsapp");
+        assert!(
+            matches!(&app.screen,
+            Screen::Login(l) if matches!(l.step, LoginStep::LoggingOut)),
+            "the only one in"
         );
     }
 
@@ -4082,6 +4661,8 @@ mod tests {
         );
         press(&mut app, KeyCode::Tab, none);
         assert_eq!(app.chats.shown(), List::Network(Network::Instagram));
+        press(&mut app, KeyCode::Tab, none);
+        assert_eq!(app.chats.shown(), List::Network(Network::WhatsApp));
         press(&mut app, KeyCode::Tab, none);
         assert_eq!(app.chats.shown(), List::Archive);
         press(&mut app, KeyCode::Tab, none);
@@ -4395,6 +4976,158 @@ mod tests {
         (open.chat_id, id)
     }
 
+    /// Makes message `id` a photo: file `file_id` in its bubble, the next
+    /// one at its largest.
+    fn make_photo(app: &mut App, id: i64, file_id: i32) {
+        let open = app.open.as_mut().unwrap();
+        let msg = open.messages.get_mut(&id).unwrap();
+        msg.links.clear();
+        let preview = |file_id, width, height| crate::messages::Preview {
+            file_id,
+            width,
+            height,
+            thumbnail: None,
+            sticker: false,
+        };
+        msg.preview = Some(preview(file_id, 800, 600));
+        msg.photo = Some(preview(file_id + 1, 2560, 1920));
+        msg.file = Some(MediaFile {
+            id: file_id + 1,
+            label: "Photo".into(),
+            photo: true,
+        });
+    }
+
+    #[test]
+    fn h_and_l_in_the_viewer_go_to_the_photo_before_and_after_it() {
+        let mut app = test_app("viewer-next");
+        let none = KeyModifiers::NONE;
+        let open = app.open.as_mut().unwrap();
+        // Everything is loaded: nothing is asked of the helper.
+        open.all_loaded = true;
+        open.at_newest = true;
+        for msg in open.messages.values_mut() {
+            msg.photo = None;
+        }
+        let (chat_id, ids) = (
+            open.chat_id,
+            open.messages.keys().copied().collect::<Vec<_>>(),
+        );
+        // Not next to each other, and the newer one the newest.
+        let (older, newer) = (ids[1], ids[ids.len() - 1]);
+        assert!(ids.len() > 3);
+        make_photo(&mut app, older, 50);
+        make_photo(&mut app, newer, 60);
+        let open = app.open.as_ref().unwrap();
+        app.photo_view = PhotoView::of(chat_id, newer, &open.messages[&newer]);
+        let shown = |app: &App| app.photo_view.as_ref().map(|v| v.message_id);
+
+        press(&mut app, KeyCode::Char('k'), none);
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(
+            shown(&app),
+            Some(older),
+            "past the messages that aren't photos"
+        );
+        assert_eq!(app.photo_view.as_ref().unwrap().zoom, None, "unzoomed");
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(shown(&app), Some(older));
+        assert_eq!(app.status.as_deref(), Some("No older photos in this chat"));
+        press(&mut app, KeyCode::Right, none);
+        assert_eq!(shown(&app), Some(newer));
+        press(&mut app, KeyCode::Char('l'), none);
+        assert_eq!(shown(&app), Some(newer));
+        assert_eq!(app.status.as_deref(), Some("No newer photos in this chat"));
+        assert!(sent_with(&app, "history").is_empty());
+
+        // Past the messages loaded, older ones are asked for.
+        app.open.as_mut().unwrap().all_loaded = false;
+        press(&mut app, KeyCode::Char('h'), none);
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(shown(&app), Some(older));
+        assert_eq!(app.status.as_deref(), Some("Loading older messages…"));
+        assert_eq!(sent_with(&app, "history")[0]["before"], ids[0]);
+    }
+
+    #[test]
+    fn j_and_k_in_the_viewer_zoom_out_and_back_in_never_past_filling_the_window() {
+        let mut app = test_app("viewer-zoom");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let (_, id) = photo_message(&mut app);
+        make_photo(&mut app, id, 40);
+        press(&mut app, KeyCode::Enter, none);
+        let zoom = |app: &App| app.photo_view.as_ref().unwrap().zoom;
+        // A big photo opens filling the window: there's no more to zoom in.
+        screen(&mut app);
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(zoom(&app), None);
+        press(&mut app, KeyCode::Char('k'), none);
+        assert_eq!(zoom(&app), Some(crate::viewer::SIZES.len() - 2));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('-'), none);
+        }
+        assert_eq!(zoom(&app), Some(0));
+        let rows = screen(&mut app);
+        assert!(rows[0].contains("Photo · 25% · loading…"), "{rows:#?}");
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('j'), none);
+        }
+        assert_eq!(zoom(&app), Some(crate::viewer::SIZES.len() - 1));
+        assert!(screen(&mut app)[0].contains("Photo · 100%"));
+    }
+
+    #[test]
+    fn what_arrives_while_a_photo_is_open_is_neither_marked_read_nor_kept_quiet() {
+        let mut app = test_app("viewer-unseen");
+        app.focus = Focus::Messages;
+        let open = app.open.as_mut().unwrap();
+        let (chat_id, newest) = (open.chat_id, open.newest_id().unwrap());
+        make_photo(&mut app, newest, 40);
+        // Following new messages, as when a photo just came in.
+        let open = app.open.as_mut().unwrap();
+        open.selected = None;
+        open.at_newest = true;
+        assert!(app.watching(chat_id));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.photo_view.is_some());
+        assert_eq!(
+            app.open.as_ref().unwrap().selected,
+            Some(newest),
+            "the cursor stays on the photo"
+        );
+        assert!(!app.watching(chat_id));
+        app.open.as_mut().unwrap().selected = None;
+        assert!(!app.watching(chat_id), "the photo hides the chat");
+        assert!(!app.sees(chat_id), "so it's notified");
+        app.focus_reported = true;
+        assert!(!app.sees(chat_id), "even in a focused window");
+    }
+
+    #[test]
+    fn pastes_wait_until_the_photo_is_closed() {
+        let mut app = test_app("viewer-paste");
+        app.focus = Focus::Messages;
+        let (chat_id, _) = photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let file = std::env::temp_dir().join("tuimeta-test-viewer-paste.txt");
+        std::fs::write(&file, b"notes").unwrap();
+        app.on_terminal_event(Event::Paste(file.to_string_lossy().into_owned()));
+        assert_eq!(
+            app.status.take().as_deref(),
+            Some("Close the photo to paste")
+        );
+        app.on_pasted(Pasted {
+            chat_id,
+            content: Ok(Paste::Text("the screenshot".into())),
+        });
+        assert!(app.status.take().is_some());
+        assert!(app.focus == Focus::Messages, "not Insert mode under it");
+        assert!(app.composer.is_empty());
+        assert!(app.open.as_ref().unwrap().attachments.is_empty());
+    }
+
     #[test]
     fn enter_on_a_photo_shows_it_in_the_viewer_not_in_another_app() {
         let mut app = test_app("viewer-enter");
@@ -4410,6 +5143,9 @@ mod tests {
         // It takes the keys.
         press(&mut app, KeyCode::Char('k'), none);
         assert_eq!(app.open.as_ref().unwrap().selected, Some(id));
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.photo_view.is_some(), "Ctrl-o isn't o");
+        assert!(app.opening.is_empty());
         for close in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Enter] {
             assert!(app.photo_view.is_some());
             press(&mut app, close, none);
@@ -4476,8 +5212,9 @@ mod tests {
         assert!(screen(&mut app).iter().any(|r| r.contains(&title)));
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         let rows = screen(&mut app);
-        assert!(rows[0].contains("Photo"), "{rows:#?}");
+        assert!(rows[0].contains("Photo · loading…"), "{rows:#?}");
         assert!(!rows.iter().any(|r| r.contains(&title)), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("Loading…")), "{rows:#?}");
         assert!(
             rows[rows.len() - 1].contains("o open in its app · y copy"),
             "{rows:#?}"

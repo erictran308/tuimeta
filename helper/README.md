@@ -1,22 +1,23 @@
 # tuimeta-helper
 
-The part of [tuimeta](..) that speaks Messenger and Instagram. Meta's
-protocols are only implemented well in Go, in
+The part of [tuimeta](..) that speaks Messenger, Instagram and WhatsApp.
+Meta's protocols are only implemented well in Go, in
 [mautrix-meta](https://github.com/mautrix/meta) (`messagix` for Messenger,
-`whatsmeow` for its end-to-end encrypted chats, `instameow` for Instagram),
-so tuimeta runs this program as a child process and talks to it in
-newline-delimited JSON over stdin and stdout. The contract is
-[PROTOCOL.md](PROTOCOL.md): a "tiny TDLib for Meta" that hides each network's
-ids and protocols behind one small model.
+`whatsmeow` for its end-to-end encrypted chats, `instameow` for Instagram)
+and [whatsmeow](https://github.com/tulir/whatsmeow) (WhatsApp, which
+mautrix-whatsapp drives), so tuimeta runs this program as a child process
+and talks to it in newline-delimited JSON over stdin and stdout. The
+contract is [PROTOCOL.md](PROTOCOL.md): a "tiny TDLib for Meta" that hides
+each network's ids and protocols behind one small model.
 
 ```
 tuimeta-helper --data-dir <absolute dir> [--fake]
 ```
 
-`--fake` runs two made-up accounts with no network access at all, for
+`--fake` runs three made-up accounts with no network access at all, for
 tuimeta's tests and for trying the app without an account. Without it, the
-helper speaks the real networks: see Privacy → Instagram and Privacy →
-Messenger for what each sends.
+helper speaks the real networks: see Privacy → Instagram, Privacy →
+Messenger and Privacy → WhatsApp for what each sends.
 
 ## Building
 
@@ -31,13 +32,15 @@ gofmt -l .                                     # prints nothing when formatted
 
 It's pure Go (`CGO_ENABLED=0` works) and builds for Linux, macOS, Windows and
 the BSDs. Besides mautrix-meta and whatsmeow, the encrypted chats' store
-uses `modernc.org/sqlite`, a SQLite written in Go, so no C compiler is needed.
+and WhatsApp's store use `modernc.org/sqlite`, a SQLite written in Go, so no C
+compiler is needed.
 
 ## License
 
 The helper is under the GNU Affero General Public License, version 3 or
 later ([LICENSE](LICENSE)), because the mautrix-meta code it will be built on
-is. Every Go file starts with `// SPDX-License-Identifier: AGPL-3.0-or-later`.
+is (whatsmeow itself is MPL-2.0). Every Go file starts with
+`// SPDX-License-Identifier: AGPL-3.0-or-later`.
 tuimeta itself is MIT: it's a separate program that starts the helper and
 exchanges messages with it over a pipe, so the AGPL covers the helper, not
 tuimeta. Whoever distributes a helper binary must offer its source (this
@@ -63,6 +66,8 @@ tuigram:
 - The browser it says it is: the libraries' own (Chrome 141 on Linux), or
   the Chrome a login named (`login_cookies`' `browser`), saved in the
   network's `session.json` and used for as long as that session lasts.
+  WhatsApp, which has no cookies, links as WhatsApp Web in Chrome on this
+  computer's system (see Privacy → WhatsApp).
   `internal/browser` wraps the libraries' HTTP and websocket clients and puts
   that Chrome's user agent and client hints in place of the libraries' on
   each request that carries them; Messenger's encrypted-chat handshake and
@@ -77,12 +82,13 @@ link or another user's; every file 0600, umask 077 on Unix):
 |---|---|
 | `helper.log` | connection states and error kinds; moved to `helper.log.1` at startup once past 4 MB |
 | `ids.json` | the chat and person ids handed to tuimeta, by network-side id |
-| `<network>/` | the login session (cookies; for Messenger, the encrypted chats' keys and messages) |
+| `<network>/` | the login session (cookies; for Messenger, the encrypted chats' keys and messages; for WhatsApp, the linked device's keys and the chats and messages it has) |
 | `files/<network>/` | downloads, named by a hash and a cleaned-up file name |
 | `fake/<network>/` | downloads in `--fake` mode |
 
 `logout` deletes `<network>/`, the network's downloads and its entries in
-`ids.json` (its ids are never handed out again).
+`ids.json` (its ids are never handed out again); for WhatsApp it also
+unlinks the device first.
 
 Never in the log, an error or a panic report: message text, names, cookies,
 tokens or keys. The log takes fixed words (`hlog.Str`), numbers, and the
@@ -226,29 +232,175 @@ whatsmeow's store log message contents and URLs at debug level, so they get
 loggers that write nothing (and zerolog's global logger is silenced); no
 HTTP client takes a proxy from the environment.
 
+### WhatsApp
+
+WhatsApp goes through `whatsmeow`, as mautrix-whatsapp's connector drives
+it, with no bridge running. There are no cookies: `login_link` links
+tuimeta as a new device of the account, the way WhatsApp Web does, by a QR
+code the phone scans or by a pairing code typed on the phone for the
+account's number (Settings → Linked devices → Link a device). The phone
+lists it as WhatsApp Web in Chrome on this computer's system ("Chrome (Mac
+OS)"); only that list says Chrome: the connection itself is whatsmeow's
+WhatsApp Web, with its version and no browser user agent, as for every
+whatsmeow client. A link that wants a passkey is refused: tuimeta can't do
+passkeys. Neither the codes nor the number are logged. A link cancelled
+before the phone confirms it is refused at that confirmation (whatsmeow's
+pre-pairing check), so it never adds a device; once the phone has confirmed
+it, it completes.
+
+Everything is kept in `whatsapp/wa.db`, a SQLite file created 0600 (its
+`-wal` and `-shm` files get the same mode), deleted rows overwritten in the
+database file (the write-ahead log is reused rather than scrubbed, so a
+deleted row can linger in `wa.db-wal` until it's written over):
+whatsmeow's device (identity and Signal session keys, sender keys, prekeys,
+app state, the contact names and phone-number ↔ WhatsApp-id pairs the phone
+shares) and, since WhatsApp keeps no history on its servers, the chats and
+messages this device has: what the phone sent when it was linked, what came
+since, and older messages asked of the phone, the newest 3000 per chat.
+Messages are kept as read out of WhatsApp's protocol (text, who sent what
+when, replies, reactions, and for attachments what's needed to download and
+decrypt them), never the files themselves, which are downloaded only on
+`download`. A view-once photo, video or voice message keeps nothing that
+could fetch it. whatsmeow also holds each decrypted message in the store
+for the moment between decrypting it and its being kept here (so one that
+arrives as the helper quits isn't lost: it's acknowledged only once kept,
+and comes again if keeping it failed), view-once ones included, then
+deletes it. Disappearing messages are deleted here, from the store and
+from tuimeta, when their time is up, as on the phone; what's sent in a chat
+with a timer disappears too. A chat or message deleted on the phone (for you
+or for everyone) is deleted here, with what was downloaded of it; in a
+group, someone else's deletion of a message counts only from one of its
+admins, which WhatsApp's servers can't check since it comes encrypted. A
+message someone sent to a broadcast list you're on is in your chat with
+them, as on the phone. After deletions, and when the helper stops, the
+write-ahead log is emptied into the scrubbed database file; when the store
+opens, the message keys whatsmeow kept for messages that aren't kept here,
+and any temporary download a stop cut short, are deleted. The folder isn't
+kept out of backups: Time Machine and the like copy `wa.db` (and Messenger's
+`e2ee.db`) as they copy everything else. Someone with a copy of `wa.db` can read
+those messages and, until the device is unlinked, act as it. `logout`
+unlinks the device (as "Log out" in the phone's Linked devices does; the
+phone and other linked devices stay logged in) and wipes `whatsapp/`; if
+WhatsApp can't be reached, it says to remove the device on the phone. A
+device the phone unlinked (or WhatsApp dropped after weeks unused) can't
+reconnect: the account turns `error` until it's linked again, which starts
+afresh. Linking while a device that still works is kept (say, reconnecting)
+is refused: log out first.
+
+What goes to WhatsApp without tuimeta asking, and why it's kept:
+
+- The linking itself: the QR codes' websocket, the pairing-code request for
+  a number, and once linked, whatsmeow's "unified session" note that WhatsApp
+  Web also sends.
+- After taking in each history blob the phone sent, its deletion from
+  WhatsApp's media servers, as WhatsApp Web does.
+- The connection (`web.whatsapp.com`'s websocket) as an active (not
+  passive) device, so messages are delivered to it, with its keepalive pings
+  and prekey uploads when the server runs low.
+- Acknowledgements the protocol needs: an ack of each message, sent after
+  it's stored, and a delivery receipt of the "inactive" kind, which tells the
+  sender a device got it but not that anyone saw it; "sender" receipts to
+  your own devices for what you sent from them; receipts for the history
+  sync blobs the phone sends; a retry request to the sender (and a request
+  to your phone) for a message that couldn't be decrypted.
+- Reads that tell nobody anything: the history sync blobs and the app state
+  (your contact names, which chats are muted, archived or pinned), groups'
+  details when a message comes from a group not known yet or a group's
+  announcement setting changes, your privacy settings (once, before the
+  first read receipt), and on `download` the media servers and, for
+  pictures, where a profile picture is. On `search`, for a query written as
+  a phone number with `+` and its country code, whether that number is on
+  WhatsApp: only once the number has stayed as typed for 1.5 seconds, once
+  a run per number, and at most 10 numbers in 10 minutes, since WhatsApp
+  counts lookups of numbers.
+- What WhatsApp's apps send along to work, which tells nobody anything about
+  you: the privacy tokens of the people you message (asked once a week each,
+  and again when someone's security code changes), carried with what you
+  send them; requests for the app-state keys to your own devices; acks of
+  call notices.
+- Asking the phone for older messages (a peer message to your own phone, as
+  WhatsApp Web's "Get older messages" does) when a `history` page comes up
+  short of what's kept here, opening a chat with few messages kept
+  included; not again for two minutes after the phone didn't answer.
+- With each message you send, WhatsApp's reporting token, as the official
+  apps send.
+
+What it never sends: no presence ("online", "last seen", "unavailable"):
+whatsmeow's `SendPresence`, `SubscribePresence`,
+`SetForceActiveDeliveryReceipts` and `SetPassive` aren't reachable from the
+backend, so delivery receipts stay "inactive" and your last seen isn't moved
+by tuimeta. Read receipts (`MarkRead`) go out only from `mark_read` and
+typing (`SendChatPresence`) only from `typing`: the connection refuses them
+for any other request. A read receipt follows WhatsApp's read-receipts
+setting: with it off, the read is told to your own devices only; when the
+setting can't be fetched, no receipt goes at all (whatsmeow alone would send
+one everyone sees). The only app state it changes is a chat's mute, on
+`mute`. Because it never says it's online, WhatsApp rarely tells it who's
+typing: it sends typing to devices that are online. No push registration.
+
+What other people send is held to bounds: a message's text to 64 KB,
+pictures carried inside a message (thumbnails, link pictures) to 64 KB,
+mentions to 256 (and only those whose "@" is in the text become people),
+reactions to an emoji (no words, numbers or spaces). A message's id sent
+again never replaces it (only the decryption of one that couldn't be
+decrypted does); changes come as edits, which are marked. A group's
+disappearing-messages timer is taken only from WhatsApp's own group notices,
+a chat's only as one of WhatsApp's timers (24 hours, 7 days, 90 days).
+Only phone numbers and WhatsApp ids become people: a status broadcast, a
+channel, a bot or a group a sender names is never a chat you can open, and
+tuimeta sends only to people and groups. A name someone gave WhatsApp (not
+the one in your address book) is shown after a "~", as WhatsApp shows it,
+and a chat with someone not in your address book is titled with their
+number too, so "Mum" or "You" can't pass for the real one.
+
+Media are downloaded only on `download`: attachments by whatsmeow from
+WhatsApp's media servers (decrypted and checked against their hashes,
+through a private temporary file in `whatsapp/` that's never let grow past
+200 MB, whatever size the message claims, and deleted afterwards; photos and
+stickers, which tuimeta draws from the file and so downloads as soon as
+they're on screen, past 16 MB and 2 MB), the
+thumbnails and link-preview pictures the sender's app put in the message
+itself, and profile pictures over https from `whatsapp.net` hosts only
+(every redirect checked), with no cookies. A file WhatsApp no longer has
+says to open it on the phone (it isn't asked of the phone again). Link
+previews come from the sender's app's own card, never fetched. Incoming
+formatting (`*bold*`, `_italic_`, `~strike~`, `` `code` ``, ```` ```code``` ````,
+`> quote`) is read with `internal/metatext`; outgoing text goes as typed.
+Files to send go as photos (JPEG and PNG, with a 72-pixel JPEG thumbnail made
+here), videos (MP4), audio, or documents (everything else, GIFs and WebP
+pictures included). whatsmeow and its store get loggers that write nothing,
+and no proxy is taken from the environment.
+
 ## Fake mode
 
 Each network has six chats of sixty messages over the past week (dms and
-groups of five, an encrypted Messenger dm, a muted chat, an archived one, an
-Instagram message request, unread counts), with replies (one to a message far
-older than the newest page), reactions (some yours), edits, events ("Chloé
-unsent a message"), an album of three photos, a PDF, a sticker, a video with
-its still, voice messages (`audio/mp4`), a view-once photo, a link preview,
-`[Poll]` as unsupported content, formatting (bold, italic, code, strike, pre,
-quote, link, mention, with emoji before them for UTF-16 offsets), long
-messages that wrap, two messages in the same millisecond, and people you have
-no chat with yet (for `search` and `open_dm`). Pictures are PNGs drawn by
+groups of four and five, an encrypted Messenger dm and every WhatsApp chat
+encrypted, a muted chat, an archived one, an Instagram message request,
+unread counts), with replies (one to a message far older than the newest
+page), reactions (some yours), edits, events ("Chloé unsent a message",
+"Mum named the group Family 🏡"), an album of three photos, PDFs, a sticker,
+a video with its still, voice messages (`audio/mp4`), a view-once photo, a
+link preview, `[Poll]` and `[Location]` as unsupported content, formatting
+(bold, italic, code, strike, pre, quote, link, mention, with emoji before
+them for UTF-16 offsets), Arabic text, long messages that wrap, two messages
+in the same millisecond, and people you have no chat with yet (for `search`
+and `open_dm`). WhatsApp's people have phone numbers and no usernames, and
+its `search` finds them by either. Pictures are PNGs drawn by
 `internal/fake/draw.go`; the video and voice files are headers with nothing
 playable after them.
 
 Logging in takes any cookies with the required names (`c_user=1; xs=2;
 datr=3`, or `sessionid`, `ds_user_id` and `csrftoken` for Instagram), parsed
-as real ones are. A message you send is accepted 300 ms later; in a dm the
-other person reads it and starts typing 500 ms after that, and answers
-"echo: …" 1.5 s later. Your text messages can be edited for 15 minutes,
-unsent any time. Message ids come from timestamps measured back from the start
-of the current hour, so a run gives the same ids, names and texts as any other
-run in that hour (chat and person ids, kept in `ids.json`, never change).
+as real ones are. WhatsApp links instead: `login_link` shows a QR code
+starting `2@fake` (or, given a phone number, the pairing code `FAKE-C0DE`)
+and takes it as scanned 3 seconds later; `cancel_login`, `logout` or a newer
+`login_link` stop a waiting one. A message you send is accepted 300 ms later;
+in a dm the other person reads it and starts typing 500 ms after that, and
+answers "echo: …" 1.5 s later. Your text messages can be edited for 15
+minutes, unsent any time. Message ids come from timestamps measured back from
+the start of the current hour, so a run gives the same ids, names and texts
+as any other run in that hour (chat and person ids, kept in `ids.json`, never
+change).
 
 ## For backend authors
 
@@ -285,6 +437,13 @@ type Backend interface {
 }
 ```
 
+A network that logs in by linking a device (WhatsApp) also implements
+`backend.Linker` (`Link(ctx, phone)`, which reports codes with
+`Events.LoginCode` and returns once the account is ready, and
+`CancelLink()`); the server sends it `login_link` and `cancel_login`, and
+refuses `login_cookies` for it. `backend.PhoneDigits` reads a phone number in
+international form.
+
 A backend is given `backend.Deps`:
 
 - **`Events`** writes events. `Account` reports the account's state (send it
@@ -298,7 +457,9 @@ A backend is given `backend.Deps`:
   same reason.
 - **`IDs`** (`ids.Store`): `Chat(network, netID)` and `User(network, netID)`
   give stable ids, kept in `ids.json` before any line carrying a new one is
-  written.
+  written. `RenameChat` and `RenameUser` move an id to a new network-side id
+  (WhatsApp's chats by phone number becoming chats by WhatsApp id), so
+  tuimeta keeps knowing them by the same number.
 - **`Messages`** (`ids.Messages`): `Assign(chat, netID, ms, parts)` gives a
   network message `ms << 8 | slot` ids, consecutive for its parts, the same
   ids every time it's seen in the run; `Lookup` goes back from any part.
@@ -362,5 +523,6 @@ Package layout:
 | `internal/cookies`, `internal/session`, `internal/download` | logins, sessions, downloads |
 | `internal/browser` | the browser the helper says it is: the libraries' own, or the Chrome a login named, put in place of the libraries' on every request |
 | `internal/hlog`, `internal/fsutil` | the log, private folders and atomic files |
+| `internal/messenger`, `internal/instagram`, `internal/whatsapp` | the networks |
 | `internal/fake` | the `--fake` networks |
 | `internal/wiretest` | a protocol client for tests |

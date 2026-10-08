@@ -140,7 +140,7 @@ fn print(text: &str) -> Result<()> {
 fn help() -> Result<String> {
     Ok(format!(
         "tuimeta {version}
-Messenger and Instagram in your terminal, with vim-style keys.
+Messenger, Instagram and WhatsApp in your terminal, with vim-style keys.
 
 Usage: tuimeta [-h | --help] [-V | --version] [--demo | --fake]
 
@@ -148,13 +148,15 @@ Inside the app, the status bar lists the keys for wherever you are;
 press ? for settings and q to quit.
 
 You log in by pasting your browser's cookies for facebook.com or
-instagram.com. tuimeta isn't made or allowed by Meta: using it is against
-Meta's terms, and an account can be locked or banned for it.
+instagram.com, and to WhatsApp by linking tuimeta to your phone as one of
+its linked devices. tuimeta isn't made or allowed by Meta: using it is
+against Meta's terms, and an account can be locked or banned for it.
 
 --demo shows made-up chats without starting anything:
 1-9 or Tab switch scenes, t changes the theme, q quits.
 --fake runs the whole app with made-up accounts and no network: log in
-with any text that names the cookies, e.g. c_user=1; xs=2; datr=3.
+with any text that names the cookies, e.g. c_user=1; xs=2; datr=3;
+WhatsApp links by itself a few seconds after its code shows.
 
 Your login sessions, downloaded files and settings are kept in this
 folder, and your own color themes in its themes folder:

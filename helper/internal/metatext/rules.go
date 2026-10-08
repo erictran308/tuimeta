@@ -7,6 +7,8 @@ package metatext
 // as possible so text reads the same, with the HTML rendering left out.
 
 import (
+	"cmp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -73,9 +75,25 @@ var rules = []func(string) []formatRange{
 
 func parseFormatting(text string) []formatRange {
 	var ranges []formatRange
+	// Quote lines merged into the last range, joined to its text once
+	// rather than added one by one (which would copy it each time).
+	var merged []string
+	flush := func() {
+		if len(merged) > 0 {
+			last := &ranges[len(ranges)-1]
+			last.text += "\n" + strings.Join(merged, "\n")
+			merged = merged[:0]
+		}
+	}
 	for _, rule := range rules {
+		// The stretches earlier rules took, by where they start. They never
+		// overlap one another, and a rule's own matches never overlap each
+		// other, so a match is checked against these only, by binary
+		// search: one look per match, not one per stretch found so far.
+		taken := slices.Clone(ranges)
+		slices.SortFunc(taken, func(a, b formatRange) int { return cmp.Compare(a.start, b.start) })
 		for _, match := range rule(text) {
-			if match.start >= match.end || overlaps(ranges, match) {
+			if match.start >= match.end || overlaps(taken, match) {
 				continue
 			}
 			if len(ranges) > 0 {
@@ -83,27 +101,47 @@ func parseFormatting(text string) []formatRange {
 				last := &ranges[len(ranges)-1]
 				if last.format == match.format && last.end+1 == match.start {
 					last.end = match.end
-					last.text += "\n" + match.text
+					merged = append(merged, match.text)
 					continue
 				}
 			}
+			flush()
 			ranges = append(ranges, match)
 		}
 	}
+	flush()
 	return ranges
 }
 
-func overlaps(ranges []formatRange, match formatRange) bool {
-	for _, existing := range ranges {
-		if match.end > existing.start && match.start < existing.end {
-			return true
-		}
-	}
-	return false
+// overlaps reports whether match overlaps one of taken, which are sorted by
+// start and don't overlap one another (so their ends are in order too).
+func overlaps(taken []formatRange, match formatRange) bool {
+	// The first stretch ending after match starts is the only one that can
+	// overlap it without one before it doing so.
+	i, _ := slices.BinarySearchFunc(taken, match.start+1, func(r formatRange, end int) int { return cmp.Compare(r.end, end) })
+	return i < len(taken) && taken[i].start < match.end
 }
 
 func findInlineDelimited(text string, format textFormat, delimiter byte, prefixChars, suffixChars string, code bool) []formatRange {
 	matches := make([]formatRange, 0)
+	// Whether a marker can close a stretch doesn't depend on the marker that
+	// opened it (the stretch's last character and what follows the marker),
+	// so the closers are found once and walked with one pointer, and each
+	// word's end is found once: the scan stays linear in the text, whatever
+	// a sender puts in it.
+	var closers []int
+	for i := strings.IndexByte(text, delimiter); i >= 0; {
+		if closes(text, i, suffixChars, code) {
+			closers = append(closers, i)
+		}
+		next := strings.IndexByte(text[i+1:], delimiter)
+		if next < 0 {
+			break
+		}
+		i += 1 + next
+	}
+	next := 0
+	wordFrom, wordEnd := -1, -1
 	for offset := 0; offset < len(text); {
 		openRel := strings.IndexByte(text[offset:], delimiter)
 		if openRel < 0 {
@@ -114,28 +152,46 @@ func findInlineDelimited(text string, format textFormat, delimiter byte, prefixC
 			offset = open + 1
 			continue
 		}
-		searchEnd := lineEnd(text, open+1)
-		found := false
-		for closeSearch := open + 1; closeSearch < searchEnd; {
-			closeRel := strings.IndexByte(text[closeSearch:searchEnd], delimiter)
-			if closeRel < 0 {
-				break
-			}
-			end := closeSearch + closeRel
-			content := text[open+1 : end]
-			if validInlineContent(content, code) && hasSuffix(text, end+1, suffixChars) {
-				matches = append(matches, formatRange{format: format, start: open, end: end + 1, text: content})
-				offset = end + 1
-				found = true
-				break
-			}
-			closeSearch = end + 1
+		if open+1 < wordFrom || open+1 > wordEnd {
+			wordFrom, wordEnd = open+1, lineEnd(text, open+1)
 		}
-		if !found {
-			offset = open + 1
+		// The first closer leaving at least one character inside, on the
+		// same word.
+		for next < len(closers) && closers[next] < open+2 {
+			next++
 		}
+		if next < len(closers) && closers[next] < wordEnd && opens(text, open, code) {
+			end := closers[next]
+			matches = append(matches, formatRange{format: format, start: open, end: end + 1, text: text[open+1 : end]})
+			offset = end + 1
+			continue
+		}
+		offset = open + 1
 	}
 	return matches
+}
+
+// opens reports whether the stretch after the marker at open may be
+// formatted: not starting with a space (code may).
+func opens(text string, open int, code bool) bool {
+	if code {
+		return true
+	}
+	first, _ := utf8.DecodeRuneInString(text[open+1:])
+	return !unicode.IsSpace(first)
+}
+
+// closes reports whether the marker at end may close a stretch: one that
+// doesn't end with a space (code may), followed by a space, the end or one
+// of suffixChars.
+func closes(text string, end int, suffixChars string, code bool) bool {
+	if !code {
+		last, _ := utf8.DecodeLastRuneInString(text[:end])
+		if unicode.IsSpace(last) {
+			return false
+		}
+	}
+	return hasSuffix(text, end+1, suffixChars)
 }
 
 func hasPrefix(text string, offset int, prefixChars string) bool {
@@ -161,18 +217,6 @@ func isASCIIWord(c rune) bool {
 	return c == '_' || ('0' <= c && c <= '9') || ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
 }
 
-func validInlineContent(content string, code bool) bool {
-	if content == "" || strings.ContainsRune(content, '\n') || strings.ContainsRune(content, ' ') {
-		return false
-	}
-	if code {
-		return true
-	}
-	first, _ := utf8.DecodeRuneInString(content)
-	last, _ := utf8.DecodeLastRuneInString(content)
-	return !unicode.IsSpace(first) && !unicode.IsSpace(last)
-}
-
 func lineEnd(text string, offset int) int {
 	for offset < len(text) {
 		c, size := utf8.DecodeRuneInString(text[offset:])
@@ -186,6 +230,7 @@ func lineEnd(text string, offset int) int {
 
 func findCodeBlocks(text string) []formatRange {
 	matches := make([]formatRange, 0)
+	scan := &codeScan{text: text, closes: map[string][]fenceAt{}}
 	for offset := 0; offset < len(text); {
 		startRel := strings.Index(text[offset:], "```")
 		if startRel < 0 {
@@ -196,7 +241,7 @@ func findCodeBlocks(text string) []formatRange {
 		for fenceEnd < len(text) && text[fenceEnd] == '`' {
 			fenceEnd++
 		}
-		if match, ok := codeBlockAt(text, start, fenceEnd, text[start:fenceEnd]); ok {
+		if match, ok := scan.codeBlockAt(start, fenceEnd, text[start:fenceEnd]); ok {
 			matches = append(matches, match)
 			offset = match.end
 		} else {
@@ -206,12 +251,25 @@ func findCodeBlocks(text string) []formatRange {
 	return matches
 }
 
-func codeBlockAt(text string, start, fenceEnd int, fence string) (formatRange, bool) {
-	if lineStop, nextLine, ok := nextLineBreak(text, fenceEnd); ok {
-		if closeStart, closeEnd, ok := closingFence(text, nextLine, fence); ok {
-			infoLine := text[fenceEnd:nextLine]
-			language := strings.ToLower(strings.TrimSpace(text[fenceEnd:lineStop]))
-			code := text[nextLine:closeStart]
+// codeScan remembers, for one text, where each fence can close and where
+// the line goes on to, so a fence that never closes doesn't make the rest of
+// the text be searched again for every opening one.
+type codeScan struct {
+	text   string
+	closes map[string][]fenceAt // per fence, every place it closes, in order
+	// The last line break found, and the offsets it's the answer for.
+	breakFrom, breakStop, breakNext int
+	breakOK, breakKnown             bool
+}
+
+type fenceAt struct{ start, end int }
+
+func (s *codeScan) codeBlockAt(start, fenceEnd int, fence string) (formatRange, bool) {
+	if lineStop, nextLine, ok := s.nextLineBreak(fenceEnd); ok {
+		if closeStart, closeEnd, ok := s.closingFence(nextLine, fence); ok {
+			infoLine := s.text[fenceEnd:nextLine]
+			language := strings.ToLower(strings.TrimSpace(s.text[fenceEnd:lineStop]))
+			code := s.text[nextLine:closeStart]
 			if language != "" && !codeBlockLanguages[language] {
 				// Not a language name: the first line is code too.
 				code = infoLine + code
@@ -219,25 +277,53 @@ func codeBlockAt(text string, start, fenceEnd int, fence string) (formatRange, b
 			return formatRange{format: codeBlock, start: start, end: closeEnd, text: code}, true
 		}
 	}
-	closeStart, closeEnd, ok := closingFence(text, fenceEnd, fence)
+	closeStart, closeEnd, ok := s.closingFence(fenceEnd, fence)
 	if !ok || closeStart == fenceEnd {
 		return formatRange{}, false
 	}
-	return formatRange{format: codeBlock, start: start, end: closeEnd, text: text[fenceEnd:closeStart]}, true
+	return formatRange{format: codeBlock, start: start, end: closeEnd, text: s.text[fenceEnd:closeStart]}, true
 }
 
-func closingFence(text string, offset int, fence string) (start, end int, ok bool) {
-	for {
-		rel := strings.Index(text[offset:], fence)
-		if rel < 0 {
-			return 0, 0, false
+// closingFence is the first place from offset on where fence closes a block:
+// the fence, then only spaces to the end of the line.
+func (s *codeScan) closingFence(offset int, fence string) (start, end int, ok bool) {
+	list, known := s.closes[fence]
+	if !known {
+		list = []fenceAt{}
+		for from := 0; ; {
+			rel := strings.Index(s.text[from:], fence)
+			if rel < 0 {
+				break
+			}
+			at := from + rel
+			if end, ok := consumeTail(s.text, at+len(fence)); ok {
+				list = append(list, fenceAt{at, end})
+			}
+			from = at + 1
 		}
-		start = offset + rel
-		if end, ok = consumeTail(text, start+len(fence)); ok {
-			return start, end, true
-		}
-		offset = start + 1
+		s.closes[fence] = list
 	}
+	i, _ := slices.BinarySearchFunc(list, offset, func(f fenceAt, o int) int { return cmp.Compare(f.start, o) })
+	if i == len(list) {
+		return 0, 0, false
+	}
+	return list[i].start, list[i].end, true
+}
+
+// nextLineBreak is nextLineBreak(s.text, offset), found once for every
+// offset before the same break.
+func (s *codeScan) nextLineBreak(offset int) (stop, nextLine int, ok bool) {
+	if !s.breakKnown || offset < s.breakFrom || offset > s.breakStop {
+		s.breakKnown, s.breakFrom = true, offset
+		s.breakStop, s.breakNext, s.breakOK = nextLineBreak(s.text, offset)
+		if !s.breakOK {
+			s.breakStop = len(s.text)
+		}
+	}
+	if !s.breakOK {
+		return 0, 0, false
+	}
+	return s.breakStop, s.breakNext, true
 }
 
 // consumeTail accepts only spaces up to the end of the line, and takes the
@@ -257,6 +343,7 @@ func consumeTail(text string, offset int) (int, bool) {
 
 func findBlockQuotes(text string) []formatRange {
 	matches := make([]formatRange, 0)
+	closers := blockQuoteClosers(text)
 	for offset := 0; offset < len(text); {
 		start := linePrefix(text, offset, ">>>")
 		if start < 0 {
@@ -266,7 +353,7 @@ func findBlockQuotes(text string) []formatRange {
 		if contentStart < len(text) && text[contentStart] == ' ' {
 			contentStart++
 		}
-		closeStart, closeEnd, ok := blockQuoteClose(text, contentStart)
+		closeStart, closeEnd, ok := closers.from(contentStart)
 		if !ok {
 			offset = contentStart
 			continue
@@ -282,18 +369,36 @@ func findBlockQuotes(text string) []formatRange {
 	return matches
 }
 
-func blockQuoteClose(text string, offset int) (int, int, bool) {
-	for {
+// quoteClosers are the places a block quote can close, in order: "<<<" at
+// a line's start with nothing after it on the line. They're found once per
+// text, so quotes that never close don't make it be searched again each.
+type quoteClosers []fenceAt
+
+func blockQuoteClosers(text string) quoteClosers {
+	var out quoteClosers
+	for offset := 0; offset < len(text); {
 		closeStart := linePrefix(text, offset, "<<<")
 		if closeStart < 0 {
-			return 0, 0, false
+			break
 		}
 		stop, nextLine := lineBounds(text, closeStart)
 		if strings.TrimSpace(text[closeStart+3:stop]) == "" {
-			return closeStart, nextLine, true
+			out = append(out, fenceAt{closeStart, nextLine})
 		}
-		offset = nextLine
+		// No closer starts before nextLine: one must follow a space or a
+		// line break, and there's none between closeStart and stop.
+		offset = max(nextLine, closeStart+1)
 	}
+	return out
+}
+
+// from is the first closer at or after offset.
+func (q quoteClosers) from(offset int) (start, end int, ok bool) {
+	i, _ := slices.BinarySearchFunc(q, offset, func(f fenceAt, o int) int { return cmp.Compare(f.start, o) })
+	if i == len(q) {
+		return 0, 0, false
+	}
+	return q[i].start, q[i].end, true
 }
 
 func findInlineQuotes(text string) []formatRange {

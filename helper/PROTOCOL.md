@@ -1,7 +1,7 @@
-# tuimeta helper protocol, version 2
+# tuimeta helper protocol, version 3
 
 `tuimeta-helper` is a separate program (Go, AGPL-3.0-or-later) that speaks
-Messenger and Instagram for tuimeta (Rust, MIT). tuimeta starts it as a child
+Messenger, Instagram and WhatsApp for tuimeta (Rust, MIT). tuimeta starts it as a child
 process and talks to it over stdin/stdout. The helper is "a tiny TDLib for
 Meta": it hides each network's ids and protocols behind one small model, so
 tuimeta's UI code works the way it did with TDLib.
@@ -38,13 +38,15 @@ raw newline (JSON escapes them).
   params are ignored. Fields marked `?` may be absent or `null`.
 - Error `code`s: `bad_request`, `unknown_method`, `not_found`,
   `not_logged_in`, `bad_cookies`, `checkpoint`, `network`, `unsupported`,
-  `internal`. `message` is one sentence a person can act on; tuimeta may show
+  `timeout`, `cancelled`, `internal`. `message` is one sentence a person can act on; tuimeta may show
   it in its status bar.
 - The helper's first line is always:
-  `{"event":"hello","version":2,"helper":"<semver>","networks":["messenger","instagram"]}`.
+  `{"event":"hello","version":3,"helper":"<semver>","networks":["messenger","instagram","whatsapp"]}`.
   tuimeta refuses to go on if `version` isn't one it knows. (Version 2 added
   `login_cookies`' `browser`: a helper that ignored it would log in as
-  another browser than the user asked for.)
+  another browser than the user asked for. Version 3 added WhatsApp, which
+  logs in by linking a device: `login_link`, `cancel_login` and the
+  `login_code` event.)
 - When stdin closes (tuimeta quit or crashed), the helper disconnects every
   account, without marking anything read or setting any presence, and exits
   within two seconds.
@@ -57,11 +59,14 @@ raw newline (JSON escapes them).
 All ids are numbers the helper assigns, so tuimeta never sees a network's own
 ids.
 
-- `network`: `"messenger"` or `"instagram"`. One account per network.
-- `chat_id` (i64 > 0): unique across both networks, stable across runs
+- `network`: `"messenger"`, `"instagram"` or `"whatsapp"`. One account per
+  network.
+- `chat_id` (i64 > 0): unique across all networks, stable across runs
   (the helper persists the mapping).
 - `user_id` (i64 > 0): people, including yourself; unique across networks,
-  stable across runs.
+  stable across runs. On WhatsApp a person known by a phone number and
+  later by their WhatsApp id (or the other way round) keeps one `user_id`,
+  and so does the chat with them.
 - `message_id` (i64 > 0): unique within its chat and **chronological**: a
   message sent later has a larger id. The helper derives it from the server
   timestamp in milliseconds, `ms << 8 | slot`, using the next free slot when
@@ -94,7 +99,7 @@ ids.
   "unread": 2,                  // unread messages (0 if read)
   "muted": false,
   "archived": false,
-  "encrypted": true,            // Messenger end-to-end encrypted chat
+  "encrypted": true,            // end-to-end encrypted: every WhatsApp chat, Messenger's encrypted ones
   "request": false,             // a message request you haven't accepted
   "can_send": true,
   "read_inbox": 1759912000000000,   // you've read up to this message id
@@ -199,17 +204,20 @@ message.
 | `typing` | `chat_id`, `user_id`, `typing` | someone started or stopped typing. The helper sends `typing: false` itself 6 s after the last start if the network doesn't. |
 | `file` | `file` | download progress, and once done |
 | `error` | `network?`, `message` | something the user should see that no request caused |
+| `login_code` | `network`, `attempt?`, `qr?`, `pairing?`, `expires` | while `login_link` waits: the code to show, which replaces the one before. `attempt` is the `login_link`'s, so a code of a link given up is known for one. `qr` is the text to draw as a QR code for the phone to scan; `pairing` is the code to type on the phone (8 letters and digits, written `ABCD-EFGH`). `expires` is when it stops working, in unix seconds. |
 
 ## Requests
 
 | method | params | result |
 |---|---|---|
-| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version), `bad_cookies`, `checkpoint`, `network`. |
-| `logout` | `network` | `{}`: a local logout. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). It never ends the session on Meta's side: the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). |
+| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version; WhatsApp, which logs in with `login_link`), `bad_cookies`, `checkpoint`, `network`. |
+| `login_link` | `network`, `phone?`, `attempt?` | `{}` once linked and connected (account `ready`): WhatsApp, which logs in by linking tuimeta as a new device of the account (on the phone: Settings → Linked devices → Link a device). Without `phone`, `login_code` events with `qr` follow: the first at once and good for a minute, then a fresh one about every 20 seconds, for about 2½ minutes in all. With `phone` (the account's number in international form: digits, with an optional leading `+`, spaces and dashes), one `login_code` with `pairing` follows, to type on the phone under "Link with phone number instead". `attempt` is a number tuimeta picks for this login, given back in its `login_code` events and named by `cancel_login`. A newer `login_link`, `cancel_login` or `logout` for the network ends a waiting one, until the phone has confirmed the link: from then on it completes (only `logout` ends it), rather than leaving a device in the phone's list that nothing here can use. Errors: `bad_request` (not a linking network, `phone` isn't a number, or a device that still works is linked: log out first), `timeout` (nothing was scanned or typed in time), `cancelled`, `network`, `unsupported` (WhatsApp asked for something tuimeta can't do, like a passkey). |
+| `cancel_login` | `network`, `attempt?` | `{}`: ends the waiting `login_link` of that attempt (any, without one), so no code shown for it works any more; it answers `cancelled`. A link of another attempt, or one the phone has already confirmed, goes on. |
+| `logout` | `network` | `{}`. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). For Messenger and Instagram it's local: it never ends the session on Meta's side, and the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). For WhatsApp, where tuimeta is a linked device of its own, it also unlinks that device, as "Log out" in the phone's list of linked devices does; the phone and any other linked devices stay logged in. |
 | `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. |
-| `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). |
+| `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). WhatsApp keeps no history on its servers: a chat has what this device received since it was linked and what the phone sent it then, and older messages are asked of the phone, which must be online (a page may take up to 20 s; without an answer, what's here is the answer). |
 | `get_message` | `chat_id`, `message_id` | `{"message": Message}` (e.g. one a reply answers that isn't loaded) |
-| `send_text` | `chat_id`, `text`, `reply_to?` | `{"message_id": i64}` (temporary). The text goes as typed: Messenger and Instagram read `*bold*`-style formatting themselves. |
+| `send_text` | `chat_id`, `text`, `reply_to?` | `{"message_id": i64}` (temporary). The text goes as typed: all three networks read `*bold*`-style formatting themselves. |
 | `send_files` | `chat_id`, `paths`, `caption?`, `reply_to?` | `{"message_ids": [i64]}` (temporary). Paths are absolute; the helper reads them once, now. |
 | `edit_text` | `chat_id`, `message_id`, `text` | `{}` |
 | `delete` | `chat_id`, `message_id` | `{}`: unsends your message for everyone. |
@@ -217,7 +225,7 @@ message.
 | `mark_read` | `chat_id`, `message_id` | `{}`: marks the chat read up to that message. |
 | `typing` | `chat_id`, `typing` | `{}` |
 | `download` | `file_id`, `priority` (`high`/`low`) | `{}`, then `file` events. |
-| `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. |
+| `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. On WhatsApp: the contacts and groups this device knows, and, for a query that is a phone number written with `+` and its country code, that number if it's on WhatsApp. |
 | `open_dm` | `network`, `user_id` | `{"chat_id": i64}`: the chat with that person, made if needed. |
 | `mute` | `chat_id`, `muted` | `{}` |
 
@@ -257,7 +265,10 @@ when tuimeta asks.
   subscriptions that announce you) is switched off. A delivery acknowledgement
   the protocol needs in order to work is allowed, and documented in the
   helper's README.
-- No downloads except on `download`.
+- No downloads except on `download`. The one exception is what WhatsApp's
+  own syncing needs: the history blobs the phone sends when a device is
+  linked and the encrypted app-state patches, which whatsmeow fetches from
+  WhatsApp's servers to work (the helper's README lists them).
 - No URL from a message is ever fetched.
 - No message text, names, cookies, tokens or keys in logs, errors or panics.
 
@@ -266,15 +277,19 @@ when tuimeta asks.
 For tuimeta's tests and for trying the app without an account. No network
 access at all.
 
-- Both networks start `logged_out`. `login_cookies` succeeds for any string
-  that contains the required cookie names (e.g. `c_user=1; xs=2; datr=3`),
-  and fails with `bad_cookies` otherwise, or with `bad_request` if `browser`
-  is there and isn't Chrome with a full version. Logged-in state lasts for the
-  run.
-- Each network has 6 chats (dms and groups, one Messenger chat `encrypted`,
-  one Instagram chat with a link preview) and 60 messages of history per chat
-  over the last week, including replies, reactions, an edited message, a
-  service message, an album of 3 photos and a file.
+- Every network starts `logged_out`. `login_cookies` succeeds for any
+  string that contains the required cookie names (e.g. `c_user=1; xs=2;
+  datr=3`), and fails with `bad_cookies` otherwise, or with `bad_request` if
+  `browser` is there and isn't Chrome with a full version. WhatsApp's
+  `login_link` sends a `login_code` at once (`qr` starting `2@fake`, or with
+  `phone`, `pairing` `FAKE-C0DE`) and links 3 s later; a `phone` with fewer
+  than 7 or more than 15 digits is a `bad_request`. Logged-in state lasts for
+  the run.
+- Each network has 6 chats (dms and groups, one Messenger chat `encrypted`
+  and every WhatsApp chat, one Instagram chat with a link preview) and 60
+  messages of history per chat over the last week, including replies,
+  reactions, an edited message, a service message, an album of 3 photos and
+  a file.
 - Photos and avatars are small PNGs the helper draws and writes to
   `<data-dir>/fake/` on `download`, with a few `file` progress events.
 - `send_text` / `send_files`: `message_sent` after 300 ms. In a dm, the other

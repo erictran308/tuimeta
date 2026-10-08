@@ -1,6 +1,6 @@
 //! Reactions on messages: what's shown under a bubble, and the `R` popup
-//! that sets or takes back yours. Messenger and Instagram give each person
-//! one reaction per message, of any emoji.
+//! that sets or takes back yours. Meta's networks give each person one
+//! reaction per message, of any emoji.
 
 use unicode_width::UnicodeWidthStr;
 

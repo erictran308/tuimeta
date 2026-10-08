@@ -36,6 +36,18 @@ const (
 	Chunks      = 4
 )
 
+// LinkAfter is how long a linking network takes to see its code scanned or
+// typed (tests shorten it).
+var LinkAfter = 3 * time.Second
+
+// The codes a fake link shows, and how long each says it works.
+const (
+	FakeQR      = "2@fake,dHVpbWV0YS1mYWtlLXFy,ZmFrZS1ub2lzZS1rZXk=,ZmFrZS1pZGVudGl0eQ==,ZmFrZS1hZHY="
+	FakePairing = "FAKE-C0DE"
+	QRLasts     = 60 * time.Second
+	PairLasts   = 180 * time.Second
+)
+
 // Fake is one made-up network.
 type Fake struct {
 	net    proto.Network
@@ -51,9 +63,14 @@ type Fake struct {
 	base     context.Context
 	live     context.Context // ends at logout or quit: stops pending echoes
 	stop     context.CancelFunc
+	linking  context.CancelFunc // ends the link waiting for its code, if any
+	attempt  uint64             // the waiting link's attempt
 }
 
-var _ backend.Backend = (*Fake)(nil)
+var (
+	_ backend.Backend = (*Fake)(nil)
+	_ backend.Linker  = (*Fake)(nil)
+)
 
 // New builds the network's world at once, so its ids are given out in the
 // same order every run. now picks the week the history covers.
@@ -84,7 +101,19 @@ func (f *Fake) Close() {
 }
 
 func (f *Fake) LoginCookies(ctx context.Context, _ cookies.Set, _ browser.Identity) error {
+	if f.net.Links() {
+		return proto.Err(proto.BadRequest, f.net.Title()+" logs in by linking tuimeta to your phone, not with cookies.")
+	}
 	f.mu.Lock()
+	self := f.logIn()
+	f.mu.Unlock()
+	f.ready(self)
+	return nil
+}
+
+// logIn makes the world the logged-in one; f.mu is held. ready reports it
+// once the lock is let go.
+func (f *Fake) logIn() *person {
 	if f.w == nil {
 		f.w = f.build()
 	}
@@ -92,16 +121,72 @@ func (f *Fake) LoginCookies(ctx context.Context, _ cookies.Set, _ browser.Identi
 	f.sent = map[int64]bool{}
 	f.stop()
 	f.live, f.stop = context.WithCancel(f.base)
-	self := f.w.self
-	f.mu.Unlock()
+	return f.w.self
+}
+
+func (f *Fake) ready(self *person) {
 	f.d.Events.Account(f.net, proto.Connecting, 0, "", "")
 	f.d.Events.Account(f.net, proto.Ready, self.id, self.name, "")
 	f.d.Events.User(self.user(f.net))
+}
+
+var errLinkCancelled = proto.Err(proto.Cancelled, "Linking was cancelled.")
+
+// Link shows a made-up code at once (a QR code, or with a phone number a
+// pairing code) and takes it as scanned LinkAfter later, logging in as a
+// cookie login does. A newer Link, CancelLink, Logout or ctx ending stops
+// it first; a CancelLink naming another attempt doesn't.
+func (f *Fake) Link(ctx context.Context, phone string, attempt uint64) error {
+	f.mu.Lock()
+	if f.loggedIn {
+		f.mu.Unlock()
+		return proto.Err(proto.BadRequest, "Already logged in to "+f.net.Title()+"; log out first.")
+	}
+	if f.linking != nil {
+		f.linking()
+	}
+	wait, cancel := context.WithCancel(ctx)
+	defer cancel()
+	f.linking, f.attempt = cancel, attempt
+	f.mu.Unlock()
+
+	now := time.Now()
+	if phone == "" {
+		f.d.Events.LoginCode(f.net, attempt, FakeQR, "", now.Add(QRLasts))
+	} else {
+		f.d.Events.LoginCode(f.net, attempt, "", FakePairing, now.Add(PairLasts))
+	}
+	scanned := sleep(wait, LinkAfter) == nil
+
+	f.mu.Lock()
+	// Stopped as the code was taken: the stop wins, so nothing a newer link
+	// or a logout meant to end gets logged in.
+	if !scanned || wait.Err() != nil {
+		f.mu.Unlock()
+		return errLinkCancelled
+	}
+	f.linking = nil
+	self := f.logIn()
+	f.mu.Unlock()
+	f.ready(self)
 	return nil
+}
+
+func (f *Fake) CancelLink(attempt uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.linking != nil && (attempt == 0 || attempt == f.attempt) {
+		f.linking()
+		f.linking = nil
+	}
 }
 
 func (f *Fake) Logout(ctx context.Context) error {
 	f.mu.Lock()
+	if f.linking != nil {
+		f.linking()
+		f.linking = nil
+	}
 	f.loggedIn = false
 	f.w = nil
 	f.sent = nil
@@ -445,9 +530,22 @@ func (f *Fake) Search(ctx context.Context, query string) ([]proto.SearchResult, 
 		return nil, err
 	}
 	q := strings.ToLower(query)
+	// WhatsApp knows people by their numbers too: a query of three digits
+	// or more (spaces, dashes and a "+" aside) finds the numbers holding them.
+	digits := strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9':
+			return r
+		case r == ' ' || r == '-' || r == '+':
+			return -1
+		}
+		return 'x'
+	}, query)
+	byNumber := f.net == proto.WhatsApp && len(digits) >= 3 && !strings.Contains(digits, "x")
 	results := []proto.SearchResult{}
 	for _, p := range w.people {
-		if !strings.Contains(strings.ToLower(p.name), q) && !strings.Contains(strings.ToLower(p.username), q) {
+		if !strings.Contains(strings.ToLower(p.name), q) && !strings.Contains(strings.ToLower(p.username), q) &&
+			!(byNumber && strings.Contains(p.netID, digits)) {
 			continue
 		}
 		res := proto.SearchResult{UserID: p.id, Title: p.name, Username: p.username, Kind: proto.DM}

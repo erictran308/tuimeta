@@ -43,6 +43,9 @@ const DAD: i64 = 7;
 const JUN: i64 = 8;
 /// You on Instagram, another account.
 const ME_IG: i64 = 9;
+/// You on WhatsApp.
+const ME_WA: i64 = 10;
+const LENA: i64 = 11;
 
 // Chats. On Messenger:
 const HIKE: i64 = 101;
@@ -57,6 +60,8 @@ const BOOK_CLUB: i64 = 107;
 const JUN_CHAT: i64 = 201;
 const CLIMBING: i64 = 202;
 const DESIGN: i64 = 203;
+// On WhatsApp, where every chat is end-to-end encrypted:
+const LENA_CHAT: i64 = 301;
 
 // Photos, by file id.
 const SUNRISE: i32 = 1;
@@ -213,6 +218,7 @@ pub(crate) fn demo_app(meta: Meta, images: Images, dir: &Path) -> App {
     for (network, name) in [
         (Network::Messenger, "Sam Taylor"),
         (Network::Instagram, "sam.climbs"),
+        (Network::WhatsApp, "Sam"),
     ] {
         let account = Account {
             state: AccountState::Ready,
@@ -224,6 +230,8 @@ pub(crate) fn demo_app(meta: Meta, images: Images, dir: &Path) -> App {
     for (id, name) in [
         (ME, "Sam Taylor"),
         (ME_IG, "sam.climbs"),
+        (ME_WA, "Sam"),
+        (LENA, "Lena Novak"),
         (MAYA, "Maya Chen"),
         (LEO, "Leo Park"),
         (PRIYA, "Priya Nair"),
@@ -375,6 +383,7 @@ fn dm(chat: &mut Chat, user_id: i64) {
 fn fill_chats(chats: &mut Chats) {
     chats.set_my_id(Network::Messenger, ME);
     chats.set_my_id(Network::Instagram, ME_IG);
+    chats.set_my_id(Network::WhatsApp, ME_WA);
     // Everyone has read up to the snacks; "On my way!" was just sent.
     let hike = add(
         chats,
@@ -412,6 +421,15 @@ fn fill_chats(chats: &mut Chats) {
     alex.unread = 2;
     let jun = add(chats, JUN_CHAT, "jun.boulders", None, "[View-once photo]");
     dm(jun, JUN);
+    let lena = add(
+        chats,
+        LENA_CHAT,
+        "Lena Novak",
+        None,
+        "See you at the market on Sunday 🍓",
+    );
+    dm(lena, LENA);
+    lena.encrypted = true;
     add(
         chats,
         MOM_CHAT,
@@ -445,6 +463,7 @@ fn fill_chats(chats: &mut Chats) {
     for id in [CLIMBING, JUN_CHAT, DESIGN] {
         chats.place_local(id, Network::Instagram, false);
     }
+    chats.place_local(LENA_CHAT, Network::WhatsApp, false);
     chats.place_local(BOOK_CLUB, Network::Messenger, true);
     chats.set_muted(DESIGN, true);
     chats.set_presence(ALEX, Some(Presence::Online(i32::MAX)));
@@ -901,6 +920,12 @@ mod tests {
         );
         assert!(has(&screen, "All 2"), "the network tabs, with unread chats");
         assert!(has(&screen, "Instagram 1"));
+        let tabs: Vec<String> = app.chats.tabs().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            tabs,
+            ["All", "Messenger", "Instagram", "WhatsApp", "Archive"],
+            "the ones off screen scroll in"
+        );
         assert!(has(&screen, "On my way!"));
 
         show_scene(&mut app, Scene::Replying);
@@ -931,6 +956,7 @@ mod tests {
         let screen = rows(&mut app);
         assert!(has(&screen, "Messenger"), "{screen:#?}");
         assert!(has(&screen, "logged in as sam.climbs"));
+        assert!(has(&screen, "WhatsApp    logged in as Sam"), "{screen:#?}");
         assert!(has(&screen, "against Meta's"));
 
         show_scene(&mut app, Scene::Settings);

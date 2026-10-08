@@ -12,8 +12,8 @@ use unicode_width::UnicodeWidthStr;
 use ratatui_textarea::TextArea;
 
 use crate::app::{
-    Account, App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Jumps, Login, LoginStep,
-    MenuAction, PickMenu, PromptKind, Resizing, Screen, SettingsMenu, Target, Toast,
+    Account, App, Command, Confirm, Confirmed, DeleteMenu, Focus, HelpTab, Jumps, Linking, Login,
+    LoginStep, MenuAction, PickMenu, PromptKind, Resizing, Screen, SettingsMenu, Target, Toast,
 };
 use crate::attach::{self, Attachment, Kind};
 use crate::chats::Chat;
@@ -205,6 +205,58 @@ fn browser_note(browser: Option<&str>) -> String {
     }
 }
 
+/// Modules of light around a QR code; phones want some white to find it.
+const QR_QUIET: usize = 2;
+
+/// A QR code of `data` as rows of half blocks, two rows of modules to a
+/// row of text, in black on white whatever the theme: phones read dark
+/// modules on a light ground. `None` if it can't be made.
+fn qr_lines(data: &str) -> Option<Vec<Line<'static>>> {
+    use qrcode::{Color as Module, EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L).ok()?;
+    let width = code.width();
+    let modules = code.to_colors();
+    let side = width + 2 * QR_QUIET;
+    let dark = |x: usize, y: usize| {
+        let (Some(x), Some(y)) = (x.checked_sub(QR_QUIET), y.checked_sub(QR_QUIET)) else {
+            return false;
+        };
+        x < width && y < width && modules[y * width + x] == Module::Dark
+    };
+    let style = Style::new()
+        .fg(ratatui::style::Color::Black)
+        .bg(ratatui::style::Color::White);
+    let lines = (0..side.div_ceil(2))
+        .map(|row| {
+            let row: String = (0..side)
+                .map(|x| match (dark(x, 2 * row), dark(x, 2 * row + 1)) {
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    (false, false) => ' ',
+                })
+                .collect();
+            Line::from(Span::styled(row, style))
+        })
+        .collect();
+    Some(lines)
+}
+
+/// What the body of a link step shows: a code, or why there's none yet.
+enum LinkBody {
+    Waiting,
+    Qr(Vec<Line<'static>>),
+    /// The QR code doesn't fit: the window's size it needs.
+    TooSmall(u16, u16),
+    Pairing(String, i64),
+    Typing,
+}
+
+/// The login box's inner margin and borders, and the rows around its body:
+/// the prompt, the help, a blank, the error and the hints.
+const LOGIN_FRAME_WIDTH: u16 = 4;
+const LOGIN_ROWS: u16 = 6;
+
 fn draw_login(
     frame: &mut Frame,
     login: &Login,
@@ -212,17 +264,48 @@ fn draw_login(
     browser: Option<&str>,
     colors: &Colors,
 ) {
+    let mut width: u16 = 72;
     let help_rows: u16 = match login.step {
         LoginStep::Choose { .. } => 4,
         LoginStep::Cookies { .. } => 8,
+        LoginStep::Link { .. } => 3,
         _ => 2,
     };
-    let body_rows: u16 = match login.step {
-        LoginStep::Choose { .. } => accounts.len() as u16,
-        LoginStep::Cookies { .. } => 3,
+    let link = match &login.step {
+        LoginStep::Link { how, .. } => Some(match how {
+            Linking::Qr(None) | Linking::Pairing { code: None, .. } => LinkBody::Waiting,
+            Linking::Qr(Some(qr)) => match qr_lines(qr) {
+                Some(lines) => {
+                    let side = lines.first().map_or(0, |l| l.width()) as u16;
+                    let need_width = width.max(side + LOGIN_FRAME_WIDTH);
+                    let need_height = LOGIN_ROWS + help_rows + lines.len() as u16;
+                    let area = frame.area();
+                    if area.width < need_width || area.height < need_height {
+                        LinkBody::TooSmall(need_width, need_height)
+                    } else {
+                        width = need_width;
+                        LinkBody::Qr(lines)
+                    }
+                }
+                None => LinkBody::Waiting,
+            },
+            Linking::Pairing {
+                code: Some((code, expires)),
+                ..
+            } => LinkBody::Pairing(code.clone(), *expires),
+            Linking::Phone => LinkBody::Typing,
+        }),
+        _ => None,
+    };
+    let body_rows: u16 = match (&login.step, &link) {
+        (LoginStep::Choose { .. }, _) => accounts.len() as u16,
+        (LoginStep::Cookies { .. }, _) => 3,
+        (_, Some(LinkBody::Qr(lines))) => lines.len() as u16,
+        (_, Some(LinkBody::TooSmall(..) | LinkBody::Pairing(..) | LinkBody::Typing)) => 3,
+        (_, Some(LinkBody::Waiting)) => 1,
         _ => 0,
     };
-    let area = center(frame.area(), 72, 6 + help_rows + body_rows);
+    let area = center(frame.area(), width, LOGIN_ROWS + help_rows + body_rows);
     let block = Block::bordered()
         .title(" Log in ")
         .title_alignment(Alignment::Center)
@@ -263,6 +346,40 @@ fn draw_login(
                 as_browser = browser_note(browser),
             ),
         ),
+        LoginStep::Link {
+            network,
+            how: Linking::Qr(_),
+        } => (
+            format!("Link {}", network.name()),
+            format!(
+                "On your phone, open {name} → Settings → Linked devices → Link a device, \
+                 and scan this code. tuimeta becomes one of your linked devices, which \
+                 you can log out there any time.",
+                name = network.name(),
+            ),
+        ),
+        LoginStep::Link {
+            network,
+            how: Linking::Phone,
+        } => (
+            format!("Link {} with your phone number", network.name()),
+            format!(
+                "Type the phone number of your {name} account with its country code, \
+                 like +1 555 010 0100. {name} then gives a code to type on your phone.",
+                name = network.name(),
+            ),
+        ),
+        LoginStep::Link {
+            network,
+            how: Linking::Pairing { .. },
+        } => (
+            format!("Link {}", network.name()),
+            format!(
+                "On your phone, open {name} → Settings → Linked devices → Link a device → \
+                 Link with phone number instead, and type this code.",
+                name = network.name(),
+            ),
+        ),
     };
     frame.render_widget(Line::from(title).bold(), prompt);
     frame.render_widget(
@@ -272,13 +389,13 @@ fn draw_login(
         help,
     );
 
-    match login.step {
-        LoginStep::Choose { selected } => {
+    match (&login.step, link) {
+        (LoginStep::Choose { selected }, _) => {
             let lines: Vec<Line> = accounts
                 .iter()
                 .enumerate()
                 .map(|(i, (network, account))| {
-                    let bar = if i == selected {
+                    let bar = if i == *selected {
                         Span::from("▌").fg(colors.accent)
                     } else {
                         Span::from(" ")
@@ -307,7 +424,7 @@ fn draw_login(
                         Span::from(format!(" {:<12}", network.name())).bold(),
                         Span::from(state).fg(colors.muted),
                     ]);
-                    if i == selected {
+                    if i == *selected {
                         row.style(Style::new().bg(colors.selection))
                     } else {
                         row
@@ -316,7 +433,46 @@ fn draw_login(
                 .collect();
             frame.render_widget(Paragraph::new(lines), body);
         }
-        LoginStep::Cookies { .. } => frame.render_widget(&login.input, body),
+        (LoginStep::Cookies { .. }, _) | (_, Some(LinkBody::Typing)) => {
+            frame.render_widget(&login.input, body)
+        }
+        (_, Some(LinkBody::Waiting)) => {
+            let waiting = if login.busy {
+                "Waiting for a code…"
+            } else {
+                "No code now."
+            };
+            frame.render_widget(Line::from(waiting).fg(colors.muted).centered(), body);
+        }
+        (_, Some(LinkBody::Qr(lines))) => {
+            frame.render_widget(Paragraph::new(lines).centered(), body)
+        }
+        (_, Some(LinkBody::TooSmall(w, h))) => frame.render_widget(
+            Paragraph::new(format!(
+                "This window is too small for the QR code: make it at least {w}×{h}, \
+                 or press p to link with your phone number instead."
+            ))
+            .fg(colors.error)
+            .wrap(Wrap { trim: true }),
+            body,
+        ),
+        (_, Some(LinkBody::Pairing(code, expires))) => {
+            let until = chrono::DateTime::from_timestamp(expires, 0)
+                .filter(|_| expires > 0)
+                .map(|at| {
+                    format!(
+                        "It works until {}.",
+                        at.with_timezone(&chrono::Local).format("%H:%M")
+                    )
+                })
+                .unwrap_or_default();
+            let lines = vec![
+                Line::from(""),
+                Line::from(code).bold().fg(colors.accent).centered(),
+                Line::from(until).fg(colors.muted).centered(),
+            ];
+            frame.render_widget(Paragraph::new(lines), body);
+        }
         _ => {}
     }
     if let Some(message) = &login.error {
@@ -327,7 +483,23 @@ fn draw_login(
             error,
         );
     }
-    let hint = match login.step {
+    let hint = match &login.step {
+        LoginStep::Link {
+            how: Linking::Phone,
+            ..
+        } => "`Enter` get a code · `Esc` back · `Ctrl-c` quit",
+        LoginStep::Link {
+            how: Linking::Qr(_),
+            ..
+        } if login.busy => "`p` use your phone number · `Esc` back · `Ctrl-c` quit",
+        LoginStep::Link {
+            how: Linking::Qr(_),
+            ..
+        } => "`Enter` new code · `p` use your phone number · `Esc` back",
+        LoginStep::Link { .. } if login.busy => {
+            "`p` change the number · `Esc` back · `Ctrl-c` quit"
+        }
+        LoginStep::Link { .. } => "`Enter` new code · `p` change the number · `Esc` back",
         _ if login.busy => "Logging in…",
         LoginStep::Choose { .. } if login.from_main => {
             "`j/k` move · `Enter` log in · `Esc` back · `Ctrl-c` quit"
@@ -476,7 +648,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         };
         draw_picker(frame, chat_area, picker, &names, colors);
     }
-    if let Some(view) = &app.photo_view {
+    if let Some(view) = &mut app.photo_view {
         viewer::draw(frame, body, view, &mut app.images, colors);
     }
     if let Some(confirm) = &app.confirm {
@@ -1694,7 +1866,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         _ if app.photo_view.is_some() => (
             normal,
-            "  `o` open in its app · `y` copy · `Enter` or `Esc` close",
+            "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
         ),
         _ if app.picker.is_some() => (
             normal,
@@ -2509,6 +2681,7 @@ mod tests {
         let accounts = [
             (Network::Messenger, Some(ready)),
             (Network::Instagram, None),
+            (Network::WhatsApp, None),
         ];
         let rows = draw_login_rows(&Login::new(LoginStep::Choose { selected: 1 }), &accounts);
         let text = rows.join("\n");
@@ -2517,6 +2690,7 @@ mod tests {
         let instagram = rows.iter().find(|r| r.contains("Instagram")).unwrap();
         assert!(instagram.contains("▌ Instagram"), "the cursor: {instagram}");
         assert!(instagram.contains("not logged in"));
+        assert!(text.contains("  WhatsApp    not logged in"), "{text}");
         assert!(!text.contains("Esc back"), "nowhere to go back to yet");
     }
 
@@ -2561,6 +2735,136 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Chrome[2J150"), "{text}");
+    }
+
+    /// A link step waiting on `how`, as the helper left it.
+    fn linking(how: Linking) -> Login {
+        let mut login = Login::new(LoginStep::Link {
+            network: Network::WhatsApp,
+            how,
+        });
+        login.busy = true;
+        login
+    }
+
+    fn draw_login_buffer(login: &Login, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let colors = Colors::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| draw_login(f, login, &[], None, &colors))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// A QR text as long as WhatsApp's: a reference, then three keys.
+    const WHATSAPP_QR: &str = "2@Yb6XnPq9w3sL0mZr8tUvKc4JdHfGa1NeOiByCx7QzRlTpSjMkWgVhDuEoFnIaAbCdEf2gH5iJ,\
+        2cS5jT/9kq8yN3fPz0xW6rLbUgVhE1mDaKoQwJtCiYeFpZnMsRlAuGvBdHxIy=,\
+        8wF2jK7pLm4nQ9rS1tUvX3yZ0aBcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHi=,\
+        q5R8sT1uV4wX7yZ0aB3cD6eF9gH2iJ5kL8mN1oP4qR7sT0uV3wX6yZ9aB2c=";
+
+    #[test]
+    fn the_qr_code_is_half_blocks_in_black_on_white_and_reads_back_as_the_code() {
+        let login = linking(Linking::Qr(Some(WHATSAPP_QR.into())));
+        let buf = draw_login_buffer(&login, 100, 50);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        assert!(text.contains("Link WhatsApp"), "{text}");
+        assert!(text.contains("Linked devices"), "{text}");
+        assert!(text.contains("p use your phone number"), "{text}");
+
+        // Every cell of the code is black on white, whatever the theme.
+        let code =
+            qrcode::QrCode::with_error_correction_level(WHATSAPP_QR.as_bytes(), qrcode::EcLevel::L)
+                .unwrap();
+        let side = code.width() + 2 * QR_QUIET;
+        let top = (0..buf.area.height)
+            .find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].bg == ratatui::style::Color::White))
+            .expect("the code");
+        let left = (0..buf.area.width)
+            .find(|&x| buf[(x, top)].bg == ratatui::style::Color::White)
+            .unwrap();
+        let mut drawn = vec![false; side * side.div_ceil(2) * 2];
+        for row in 0..side.div_ceil(2) {
+            for x in 0..side {
+                let cell = &buf[(left + x as u16, top + row as u16)];
+                assert_eq!(cell.fg, ratatui::style::Color::Black);
+                assert_eq!(cell.bg, ratatui::style::Color::White);
+                let (upper, lower) = match cell.symbol() {
+                    "█" => (true, true),
+                    "▀" => (true, false),
+                    "▄" => (false, true),
+                    " " => (false, false),
+                    other => panic!("{other:?} in the code"),
+                };
+                drawn[2 * row * side + x] = upper;
+                drawn[(2 * row + 1) * side + x] = lower;
+            }
+        }
+        // Read back module by module, it's the code with its quiet zone.
+        let modules = code.to_colors();
+        for y in 0..side {
+            for x in 0..side {
+                let inner = (x.checked_sub(QR_QUIET), y.checked_sub(QR_QUIET));
+                let dark = match inner {
+                    (Some(x), Some(y)) if x < code.width() && y < code.width() => {
+                        modules[y * code.width() + x] == qrcode::Color::Dark
+                    }
+                    _ => false,
+                };
+                assert_eq!(drawn[y * side + x], dark, "module {x},{y}");
+            }
+        }
+        assert!(
+            !buf[(left + side as u16, top)]
+                .bg
+                .eq(&ratatui::style::Color::White)
+        );
+    }
+
+    #[test]
+    fn a_window_too_small_for_the_qr_code_says_so_and_offers_the_phone_number() {
+        let login = linking(Linking::Qr(Some(WHATSAPP_QR.into())));
+        let buf = draw_login_buffer(&login, 80, 30);
+        let text = buffer_rows(&buf).join("\n");
+        assert!(text.contains("too small for the QR code"), "{text}");
+        assert!(text.contains("phone number instead"), "{text}");
+        assert!(!text.contains('▀') && !text.contains('▄'), "no broken code");
+    }
+
+    #[test]
+    fn the_pairing_code_shows_with_where_to_type_it() {
+        let login = linking(Linking::Pairing {
+            phone: "+1 555 010 0100".into(),
+            code: Some(("ABCD-EFGH".into(), 1_700_000_180)),
+        });
+        let text = buffer_rows(&draw_login_buffer(&login, 90, 30)).join("\n");
+        assert!(text.contains("ABCD-EFGH"), "{text}");
+        assert!(text.contains("Link with phone number instead"), "{text}");
+        assert!(text.contains("It works until"), "{text}");
+        assert!(text.contains("p change the number"), "{text}");
+
+        let waiting = linking(Linking::Pairing {
+            phone: "+1 555 010 0100".into(),
+            code: None,
+        });
+        let text = buffer_rows(&draw_login_buffer(&waiting, 90, 30)).join("\n");
+        assert!(text.contains("Waiting for a code…"), "{text}");
+    }
+
+    #[test]
+    fn the_phone_number_is_typed_in_the_open() {
+        let mut login = Login::new(LoginStep::Link {
+            network: Network::WhatsApp,
+            how: Linking::Phone,
+        });
+        login.input.insert_str("+1 555 010 0100");
+        let text = buffer_rows(&draw_login_buffer(&login, 90, 30)).join("\n");
+        assert!(
+            text.contains("Link WhatsApp with your phone number"),
+            "{text}"
+        );
+        assert!(text.contains("+1 555 010 0100"), "{text}");
+        assert!(text.contains("Enter get a code"), "{text}");
     }
 
     /// The column where `needle` starts in a buffer row; every cell there is
