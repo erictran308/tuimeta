@@ -162,8 +162,8 @@ whatsmeow store (identity and Signal session keys, sender keys, prekeys) is
 `messenger/e2ee.db`, a SQLite file created 0600 (its `-wal` and `-shm` files
 get the same mode), deleted rows overwritten. The encrypted messages
 received or sent since the device was linked are kept there too, the newest
-3000 per chat: a web client gets no encrypted history from Facebook, so
-that's all those chats have. Someone with a copy of `e2ee.db` can read those
+3000 per chat: older encrypted history is only in Messenger's PIN-locked
+backup, which neither library can restore, so that's all those chats have. Someone with a copy of `e2ee.db` can read those
 messages and, until the device is removed from the account, decrypt what's
 sent to it and send as it; with `session.json` too, they have the web
 session. `logout` is local: it disconnects, deletes the device from the

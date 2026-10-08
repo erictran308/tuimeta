@@ -21,7 +21,7 @@ The same app as [tuigram](https://github.com/erictran308/tuigram), for Meta's me
 
 - **Both networks, one list.** Log in to Messenger, Instagram or both. Tabs over the chat list go round All, Messenger, Instagram and the archive, each with its unread chats.
 - **Vim all the way.** Normal mode to move around (`j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u`), `i` to write, `Esc` to stop.
-- **Encrypted chats.** Messenger's end-to-end encrypted chats work, marked with a 🔒 that a name can't fake. tuimeta joins your account as another device, so encrypted history from before you logged in isn't there.
+- **Encrypted chats.** Messenger's end-to-end encrypted chats work, marked with a 🔒 that a name can't fake. tuimeta joins your account as a new device, so it has the encrypted messages sent from the moment you log in on. Older encrypted history isn't there, and there's nowhere to enter the 6-digit PIN Messenger asks for to restore it: that PIN unlocks Messenger's encrypted backup, which the libraries tuimeta builds on can't open. Read older encrypted messages on your phone or at facebook.com.
 - **Photos inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal. `Enter` on a photo shows it as big as the window allows.
 - **Reactions.** `R` offers Messenger's reactions and common emoji, and `/` finds any emoji by name. You have one reaction per message: `Enter` on yours, or `X`, takes it back.
 - **Replies, edits, unsend.** `r` replies, `gd` jumps to what a reply answers, `e` edits your message while the network allows, `d` unsends it.
@@ -108,7 +108,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 
 ## Your data
 
-Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received (Facebook gives a web client no encrypted history, so these are all tuimeta has of them). The folder is readable by you alone, but not encrypted: anyone who can read your files can read those messages and act as that device until you remove it from your account. Logging out of a network deletes what's kept for it.
+Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). The folder is readable by you alone, but not encrypted: anyone who can read your files can read those messages and act as that device until you remove it from your account. Logging out of a network deletes what's kept for it.
 
 The log never holds what people wrote, their names, or your cookies.
 
