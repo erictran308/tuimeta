@@ -46,6 +46,20 @@ pub struct Preview {
     pub sticker: bool,
 }
 
+/// The size a picture that doesn't say its own is drawn at, rather than as
+/// one pixel: stickers are 512px a side, and anything else gets a square
+/// big enough to take a photo's whole room.
+const STICKER_SIZE: (u32, u32) = (512, 512);
+const PICTURE_SIZE: (u32, u32) = (1024, 1024);
+
+/// `size`, unless the helper didn't know a side (it sends 0 then).
+fn known_or(size: (u32, u32), default: (u32, u32)) -> (u32, u32) {
+    match size {
+        (0, _) | (_, 0) => default,
+        size => size,
+    }
+}
+
 impl Preview {
     /// A picture the helper can download, `sized` as the media says when
     /// the picture itself doesn't.
@@ -53,10 +67,7 @@ impl Preview {
         if photo.file_id <= 0 {
             return None;
         }
-        let (width, height) = match (photo.width, photo.height) {
-            (0, _) | (_, 0) => sized,
-            size => size,
-        };
+        let (width, height) = known_or((photo.width, photo.height), sized);
         Some(Self {
             file_id: photo.file_id,
             width: width.max(1),
@@ -290,7 +301,10 @@ impl Card {
         if title.is_empty() && description.is_empty() {
             return None;
         }
-        let image = preview.image.as_ref().and_then(|p| Preview::of(p, (1, 1)));
+        let image = preview
+            .image
+            .as_ref()
+            .and_then(|p| Preview::of(p, PICTURE_SIZE));
         Some(Card {
             host: text::clean(&host),
             title,
@@ -386,7 +400,12 @@ struct Shown {
 }
 
 fn shown_media(media: &meta::Media) -> Shown {
-    let size = (media.width, media.height);
+    // WhatsApp's stickers often don't say their size.
+    let default = match media.kind {
+        MediaKind::Sticker => STICKER_SIZE,
+        _ => PICTURE_SIZE,
+    };
+    let size = known_or((media.width, media.height), default);
     let thumbnail = media.thumbnail.as_ref().and_then(|t| Preview::of(t, size));
     let file = |label: String, photo: bool| {
         (media.file_id > 0).then_some(MediaFile {
@@ -420,7 +439,7 @@ fn shown_media(media: &meta::Media) -> Shown {
                     width: media.width,
                     height: media.height,
                 },
-                (1, 1),
+                size,
             );
             let preview = thumbnail.or_else(|| full.clone());
             match preview {
@@ -460,7 +479,7 @@ fn shown_media(media: &meta::Media) -> Shown {
                     width: media.width,
                     height: media.height,
                 };
-                image.then(|| Preview::of(&whole, (512, 512))).flatten()
+                image.then(|| Preview::of(&whole, size)).flatten()
             });
             match still {
                 Some(mut preview) => {
@@ -1261,6 +1280,43 @@ pub(crate) mod tests {
         );
         assert!(animated.preview.is_none());
         assert_eq!(animated.text, "[Sticker]");
+    }
+
+    #[test]
+    fn a_picture_without_a_size_is_drawn_at_a_usual_one() {
+        let size = |p: &Preview| (p.width, p.height);
+        let sticker = msg(
+            serde_json::json!({"media": {"kind": "sticker", "file_id": 3,
+            "mime": "image/webp", "thumbnail": {"file_id": 3, "width": 0, "height": 0}}}),
+        );
+        let preview = sticker.preview.as_ref().unwrap();
+        assert!(preview.sticker);
+        assert_eq!(size(preview), STICKER_SIZE);
+        let bare = msg(
+            serde_json::json!({"media": {"kind": "sticker", "file_id": 3,
+            "mime": "image/webp"}}),
+        );
+        assert_eq!(size(bare.preview.as_ref().unwrap()), STICKER_SIZE);
+
+        let photo = msg(serde_json::json!({"media": {"kind": "photo", "file_id": 4,
+            "mime": "image/jpeg", "thumbnail": {"file_id": 4, "width": 0, "height": 0}}}));
+        assert_eq!(size(photo.preview.as_ref().unwrap()), PICTURE_SIZE);
+        assert_eq!(size(photo.photo.as_ref().unwrap()), PICTURE_SIZE);
+        let video = msg(serde_json::json!({"media": {"kind": "video", "file_id": 5,
+            "thumbnail": {"file_id": 6}}}));
+        assert_eq!(size(video.preview.as_ref().unwrap()), PICTURE_SIZE);
+        let card = msg(serde_json::json!({"text": "https://example.com",
+            "link_preview": {"url": "https://example.com", "title": "Example",
+            "image": {"file_id": 7}}}));
+        assert_eq!(
+            size(card.card.unwrap().image.as_ref().unwrap()),
+            PICTURE_SIZE
+        );
+
+        // The media's own size still counts when only the still lacks one.
+        let sized = msg(serde_json::json!({"media": {"kind": "photo", "file_id": 4,
+            "width": 1280, "height": 960, "thumbnail": {"file_id": 8}}}));
+        assert_eq!(size(sized.preview.as_ref().unwrap()), (1280, 960));
     }
 
     #[test]
