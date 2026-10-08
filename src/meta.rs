@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper. A history page of photos is far
@@ -588,12 +588,13 @@ impl Meta {
         });
     }
 
-    /// Logs in with the cookies the user pasted, answered by
+    /// Logs in with the cookies the user pasted, as the browser they came
+    /// from (`None`: the one the helper's libraries say), answered by
     /// [`MetaEvent::LoggedIn`].
-    pub fn login_cookies(&self, network: Network, cookies: String) {
+    pub fn login_cookies(&self, network: Network, cookies: String, browser: Option<String>) {
         self.then(
             "login_cookies",
-            json!({"network": network, "cookies": cookies}),
+            json!({"network": network, "cookies": cookies, "browser": browser}),
             move |answer| {
                 Some(MetaEvent::LoggedIn {
                     network,
@@ -1073,14 +1074,29 @@ mod tests {
         .await;
         assert_eq!(state, AccountState::LoggedOut);
 
-        meta.login_cookies(Network::Messenger, "c_user=1; xs=2".into());
+        meta.login_cookies(
+            Network::Messenger,
+            "c_user=1; xs=2; datr=3".into(),
+            Some("Safari 18.6".into()),
+        );
+        let refused = next(&mut rx, |e| match e {
+            MetaEvent::LoggedIn { result, .. } => Some(result),
+            _ => None,
+        })
+        .await;
+        assert!(refused.is_err(), "only Chrome can be named");
+        meta.login_cookies(Network::Messenger, "c_user=1; xs=2".into(), None);
         let refused = next(&mut rx, |e| match e {
             MetaEvent::LoggedIn { result, .. } => Some(result),
             _ => None,
         })
         .await;
         assert!(refused.is_err(), "datr is missing");
-        meta.login_cookies(Network::Messenger, "c_user=1; xs=2; datr=3".into());
+        meta.login_cookies(
+            Network::Messenger,
+            "c_user=1; xs=2; datr=3".into(),
+            Some("Chrome 150.0.7712.45".into()),
+        );
         let me = next(&mut rx, |e| match e {
             MetaEvent::Account {
                 network: Network::Messenger,
@@ -1202,9 +1218,11 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":1,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":2}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":2,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":3}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
+        let older = check_hello(br#"{"event":"hello","version":1}"#).unwrap_err();
+        assert!(older.to_string().contains("same release"), "{older}");
         assert!(check_hello(b"not json").is_err());
         assert!(check_hello(br#"{"event":"chat","version":1}"#).is_err());
     }

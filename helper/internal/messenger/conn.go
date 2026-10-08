@@ -16,6 +16,7 @@ import (
 	armadillo "go.mau.fi/whatsmeow/proto"
 	"go.mau.fi/whatsmeow/proto/waMediaTransport"
 	"go.mau.fi/whatsmeow/proto/waMsgApplication"
+	"go.mau.fi/whatsmeow/proto/waWa6"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix"
@@ -24,6 +25,9 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
+	gproto "google.golang.org/protobuf/proto"
+
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 )
 
 // The libraries log through zerolog, and at debug and trace levels they log
@@ -117,8 +121,9 @@ func (c *metaConn) Disconnect() {
 }
 
 // newMessagix makes a messagix client for the facebook.com site (messenger.com
-// closed in April 2026) with the given cookies, logging nowhere.
-func newMessagix(values map[string]string) *messagix.Client {
+// closed in April 2026) with the given cookies, saying it's the given
+// browser, logging nowhere.
+func newMessagix(values map[string]string, as browser.Identity) *messagix.Client {
 	c := &cookies.Cookies{Platform: types.Facebook}
 	vals := make(map[cookies.MetaCookieName]string, len(values))
 	for k, v := range values {
@@ -128,7 +133,9 @@ func newMessagix(values map[string]string) *messagix.Client {
 		vals[cookies.MetaCookieName(k)] = v
 	}
 	c.UpdateValues(vals)
-	return messagix.NewClient(c, quiet, &messagix.Config{ClientSettings: clientSettings()})
+	cli := messagix.NewClient(c, quiet, &messagix.Config{ClientSettings: clientSettings()})
+	as.Use(cli.GetHTTP())
+	return cli
 }
 
 // dropCookie names cookies that aren't handed to messagix: "presence" is the
@@ -201,6 +208,34 @@ func (c *e2eeConn) Disconnect() { c.cli.Disconnect() }
 // message that arrives as the helper quits is delivered again rather than
 // lost; until then its decrypted form waits in the store's buffer, which
 // whatsmeow empties once the message is handled.
+// presentE2EE makes the encrypted chats' connection describe the browser the
+// rest of the session says it is: the user agent in its handshake and its
+// requests, and the system the handshake names (the libraries put the same
+// name there as in sec-ch-ua-platform).
+func presentE2EE(cli *whatsmeow.Client, as browser.Identity) {
+	if as.IsDefault() {
+		return
+	}
+	if cli.MessengerConfig != nil {
+		cli.MessengerConfig.UserAgent = as.UserAgent
+	}
+	payload := cli.GetClientPayload
+	if payload == nil {
+		return
+	}
+	cli.GetClientPayload = func() *waWa6.ClientPayload {
+		p := payload()
+		if p == nil {
+			return nil
+		}
+		p.FbUserAgent = []byte(as.UserAgent)
+		if p.UserAgent != nil {
+			p.UserAgent.Manufacturer = gproto.String(as.Platform)
+		}
+		return p
+	}
+}
+
 func configureE2EE(cli *whatsmeow.Client) {
 	cli.SetProxy(nil)
 	cli.UseRetryMessageStore = false

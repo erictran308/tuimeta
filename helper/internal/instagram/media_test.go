@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
@@ -126,7 +127,7 @@ func TestTheLogHoldsKindsNotWords(t *testing.T) {
 	h := newHarness(t)
 	h.api.loadErr = fmt.Errorf("%w: redirected to https://www.instagram.com/accounts/login/?next=SECRET-NEXT", httpclient.ErrTokenInvalidated)
 	set, _ := cookies.Parse(proto.Instagram, cookieText)
-	if err := h.b.LoginCookies(t.Context(), set); err == nil {
+	if err := h.b.LoginCookies(t.Context(), set, browser.Default()); err == nil {
 		t.Fatal("login worked")
 	}
 	h.api.loadErr = nil

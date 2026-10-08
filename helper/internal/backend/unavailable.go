@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
@@ -27,8 +28,10 @@ func (u *Unavailable) Network() proto.Network { return u.Net }
 func (u *Unavailable) Start(context.Context) {
 	u.Events.Account(u.Net, proto.LoggedOut, 0, "", "")
 }
-func (u *Unavailable) Close()                                          {}
-func (u *Unavailable) LoginCookies(context.Context, cookies.Set) error { return u.err() }
+func (u *Unavailable) Close() {}
+func (u *Unavailable) LoginCookies(context.Context, cookies.Set, browser.Identity) error {
+	return u.err()
+}
 func (u *Unavailable) Logout(context.Context) error {
 	u.Events.Account(u.Net, proto.LoggedOut, 0, "", "")
 	return nil

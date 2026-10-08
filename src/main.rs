@@ -114,7 +114,8 @@ async fn main() -> Result<()> {
     let images = images::Images::new(picker, image_tx);
     let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
     let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox);
-    let app = app::App::new(meta, images, clipboard, settings, settings_path);
+    let mut app = app::App::new(meta, images, clipboard, settings, settings_path);
+    app.browser = config::var("TM_BROWSER");
     let result = app.run(&mut terminal, rx, image_rx, clipboard_rx).await;
 
     if enhanced {
@@ -164,6 +165,9 @@ program (under the AGPL) that speaks Meta's protocols.
 
 Environment:
   TM_DATA_DIR    keep them somewhere else
+  TM_BROWSER     the Chrome you copy cookies from, as chrome://version names
+                 it (\"Chrome 150.0.7712.45\"): logins then say tuimeta is
+                 that Chrome on this computer, for as long as they last
 ",
         version = env!("CARGO_PKG_VERSION"),
         data = config::shown(&config::data_dir()?),

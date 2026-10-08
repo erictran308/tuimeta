@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/download"
 	"github.com/erictran308/tuimeta/helper/internal/history"
@@ -82,7 +83,7 @@ func (f *Fake) Close() {
 	f.mu.Unlock()
 }
 
-func (f *Fake) LoginCookies(ctx context.Context, _ cookies.Set) error {
+func (f *Fake) LoginCookies(ctx context.Context, _ cookies.Set, _ browser.Identity) error {
 	f.mu.Lock()
 	if f.w == nil {
 		f.w = f.build()

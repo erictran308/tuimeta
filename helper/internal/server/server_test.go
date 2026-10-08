@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
+	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
@@ -50,6 +53,27 @@ func (s *stub) Search(_ context.Context, q string) ([]proto.SearchResult, error)
 	return []proto.SearchResult{{Title: "found", Kind: proto.DM}}, nil
 }
 
+// loginRecorder is a logged-out network that records the browser each
+// login it's handed names.
+type loginRecorder struct {
+	backend.Unavailable
+	mu     sync.Mutex
+	logins []browser.Identity
+}
+
+func (l *loginRecorder) LoginCookies(_ context.Context, _ cookies.Set, as browser.Identity) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logins = append(l.logins, as)
+	return nil
+}
+
+func (l *loginRecorder) named() []browser.Identity {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.logins)
+}
+
 type harness struct {
 	t      *testing.T
 	srv    *Server
@@ -57,6 +81,7 @@ type harness struct {
 	stdin  *io.PipeWriter
 	done   chan struct{}
 	stub   *stub
+	ig     *loginRecorder
 	logBuf *syncBuffer
 }
 
@@ -92,8 +117,9 @@ func start(t *testing.T) *harness {
 	st := &stub{Unavailable: backend.Unavailable{Net: proto.Messenger, Events: srv.Events}, deps: srv.Deps(proto.Messenger)}
 	st.chatID = store.Chat(proto.Messenger, "thread-1")
 	srv.Add(st)
-	srv.Add(&backend.Unavailable{Net: proto.Instagram, Events: srv.Events})
-	h := &harness{t: t, srv: srv, stdin: inW, done: make(chan struct{}), stub: st, logBuf: logBuf}
+	ig := &loginRecorder{Unavailable: backend.Unavailable{Net: proto.Instagram, Events: srv.Events}}
+	srv.Add(ig)
+	h := &harness{t: t, srv: srv, stdin: inW, done: make(chan struct{}), stub: st, ig: ig, logBuf: logBuf}
 	h.c = wiretest.New(t, inW, outR)
 	go func() {
 		srv.Run(context.Background(), inR)
@@ -248,6 +274,28 @@ func TestRequestsToALoggedOutNetworkAreRefused(t *testing.T) {
 	l = h.c.Call("search", map[string]any{"network": "myspace", "query": "x"})
 	if l.Error == nil || l.Error.Code != proto.BadRequest {
 		t.Fatalf("unknown network: %s", l.Raw)
+	}
+}
+
+func TestALoginNamingAnythingButChromeIsRefusedBeforeTheNetworkHearsOfIt(t *testing.T) {
+	h := start(t)
+	const igCookies = "sessionid=1; ds_user_id=2; csrftoken=3"
+	r := h.c.Call("login_cookies", map[string]any{"network": "instagram", "cookies": igCookies, "browser": "Safari 18.6"})
+	if r.Error == nil || r.Error.Code != proto.BadRequest {
+		t.Fatalf("got %s", r.Raw)
+	}
+	if len(h.ig.named()) != 0 {
+		t.Fatal("the network was asked to log in")
+	}
+	if r := h.c.Call("login_cookies", map[string]any{"network": "instagram", "cookies": igCookies, "browser": "Chrome 150.0.7712.45"}); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+	if r := h.c.Call("login_cookies", map[string]any{"network": "instagram", "cookies": igCookies}); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+	got := h.ig.named()
+	if len(got) != 2 || got[0].Name() != "Chrome 150.0.7712.45" || !got[1].IsDefault() {
+		t.Errorf("logins named %v", got)
 	}
 }
 

@@ -7,7 +7,7 @@ package proto
 import "encoding/json"
 
 // Version is the protocol version the hello line announces.
-const Version = 1
+const Version = 2
 
 // Network is "messenger" or "instagram".
 type Network string

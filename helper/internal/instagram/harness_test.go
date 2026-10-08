@@ -21,6 +21,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
@@ -145,6 +146,7 @@ type fakeAPI struct {
 	calls   []call
 	handler instameow.EventHandler
 	cookies *mcookies.Cookies
+	as      browser.Identity // the browser the client was made to say it is
 
 	viewer        *types.PolarisViewer
 	inbox         *slidetypes.Mailbox
@@ -433,9 +435,10 @@ func newHarnessIn(t *testing.T, dir string) *harness {
 		Outbox: backend.NewOutbox(events, messages), Session: session.New(dir, proto.Instagram),
 	}
 	h := &harness{t: t, api: newFakeAPI(t), rec: rec, dir: dir, deps: deps}
-	h.b = newInstagram(deps, func(c *mcookies.Cookies, handler instameow.EventHandler) api {
+	h.b = newInstagram(deps, func(c *mcookies.Cookies, as browser.Identity, handler instameow.EventHandler) api {
 		h.api.handler = handler
 		h.api.cookies = c
+		h.api.as = as
 		return h.api
 	})
 	h.b.media = &http.Client{Transport: noNetwork{t}}
@@ -459,7 +462,7 @@ func (h *harness) login(inbox *slidetypes.Mailbox) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	if err := h.b.LoginCookies(context.Background(), set); err != nil {
+	if err := h.b.LoginCookies(context.Background(), set, browser.Default()); err != nil {
 		h.t.Fatalf("login: %v", err)
 	}
 	h.rec.reset()

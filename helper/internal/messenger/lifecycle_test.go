@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	mtypes "go.mau.fi/mautrix-meta/pkg/messagix/types"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
@@ -89,9 +90,9 @@ func TestAResumedSessionFacebookRefusesBecomesAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tries atomic.Int32
-	h.m.dial = func(_ context.Context, _ context.Context, values map[string]string) error {
-		if values["xs"] != "old" {
-			t.Errorf("resumed with %v", len(values))
+	h.m.dial = func(_ context.Context, _ context.Context, l login) error {
+		if l.cookies["xs"] != "old" {
+			t.Errorf("resumed with %v", len(l.cookies))
 		}
 		if tries.Add(1) == 1 {
 			return errNetwork // the network first: tried again
@@ -111,12 +112,12 @@ func TestAResumedSessionFacebookRefusesBecomesAnError(t *testing.T) {
 
 func TestAFailedLoginSavesNothing(t *testing.T) {
 	h := newHarness(t)
-	h.m.dial = func(context.Context, context.Context, map[string]string) error { return errBadCookies }
+	h.m.dial = func(context.Context, context.Context, login) error { return errBadCookies }
 	set, err := cookies.Parse(proto.Messenger, "c_user=1; xs=2; datr=3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = h.m.LoginCookies(context.Background(), set)
+	err = h.m.LoginCookies(context.Background(), set, browser.Default())
 	if err != errBadCookies {
 		t.Errorf("err %v", err)
 	}

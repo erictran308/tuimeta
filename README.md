@@ -59,6 +59,16 @@ These cookies are your whole session: anyone who has them is logged in as you. t
 
 `:login` adds the other network, or logs in again.
 
+#### Log in as your own Chrome
+
+Left alone, tuimeta tells Facebook and Instagram it's Chrome 141 on Linux, as every client built on mautrix-meta (Beeper's included) does. If you copy the cookies from Chrome on the computer tuimeta runs on, you can have it say it's that Chrome instead, so the session doesn't look like it moved to a second device:
+
+1. Open `chrome://version` in Chrome and note the version on its first line, like `150.0.7712.45`.
+2. Before logging in, set `TM_BROWSER` to `Chrome` and that version: `export TM_BROWSER="Chrome 150.0.7712.45"`.
+3. Log in. The cookie screen says which browser it will log in as.
+
+tuimeta then sends that Chrome's user agent and client hints, for this computer's system, on everything it sends to Meta. Only Chrome works: tuimeta's connections are built the way Chrome's are, so naming Safari or Firefox would make it stand out more, and tuimeta refuses it. The browser is saved with the session, so changing `TM_BROWSER` later does nothing until you `:logout` and log in again. When Chrome updates itself, the session keeps saying the version it logged in with.
+
 ### Try it first
 
 `tuimeta --demo` shows made-up chats without starting anything (keys `1`–`9` switch scenes, `t` the theme). `tuimeta --fake` runs the whole app with made-up accounts and no network at all: log in with any text that names the cookies, like `c_user=1; xs=2; datr=3`.

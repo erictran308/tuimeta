@@ -25,6 +25,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
@@ -54,13 +55,15 @@ var cookieNames = slices.Concat(mcookies.IGRequiredCookies, mcookies.IGOptionalC
 type savedSession struct {
 	Version int               `json:"version"`
 	Cookies map[string]string `json:"cookies"`
+	// Browser is the browser the login named, "" for the libraries' own.
+	Browser string `json:"browser,omitempty"`
 }
 
 // Instagram is the Instagram account.
 type Instagram struct {
 	d backend.Deps
 	// dial makes the library's client (tests put a stand-in here).
-	dial func(*mcookies.Cookies, instameow.EventHandler) api
+	dial func(*mcookies.Cookies, browser.Identity, instameow.EventHandler) api
 	// media fetches files from Instagram's CDN (tests swap its transport).
 	media *http.Client
 
@@ -70,6 +73,9 @@ type Instagram struct {
 	base  context.Context
 	epoch int         // counts logins, logouts and quitting: a stale attempt stops
 	conn  *connection // nil while logged out, broken or reconnecting
+	// as is the browser this session says it is, from the login that
+	// started it; every connection and download says the same.
+	as    browser.Identity
 	state proto.AccountState
 
 	selfFBID int64
@@ -93,6 +99,7 @@ type Instagram struct {
 type connection struct {
 	cli     api
 	cookies *mcookies.Cookies
+	as      browser.Identity
 	ctx     context.Context
 	cancel  context.CancelFunc
 
@@ -119,8 +126,8 @@ func New(deps backend.Deps) backend.Backend {
 	return newInstagram(deps, dialReal)
 }
 
-func newInstagram(deps backend.Deps, dial func(*mcookies.Cookies, instameow.EventHandler) api) *Instagram {
-	b := &Instagram{d: deps, dial: dial, media: newMediaClient(), base: context.Background(), state: proto.LoggedOut}
+func newInstagram(deps backend.Deps, dial func(*mcookies.Cookies, browser.Identity, instameow.EventHandler) api) *Instagram {
+	b := &Instagram{d: deps, dial: dial, media: newMediaClient(), base: context.Background(), state: proto.LoggedOut, as: browser.Default()}
 	b.reset()
 	return b
 }
@@ -155,7 +162,7 @@ func (b *Instagram) account(state proto.AccountState, msg string) {
 
 // Start resumes a saved session in the background.
 func (b *Instagram) Start(ctx context.Context) {
-	c, ok := b.loadSession()
+	c, as, ok := b.loadSession()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.base = ctx
@@ -163,27 +170,36 @@ func (b *Instagram) Start(ctx context.Context) {
 		b.account(proto.LoggedOut, "")
 		return
 	}
+	b.as = as
 	b.account(proto.Connecting, "")
 	epoch := b.epoch
 	hlog.Go("instagram resume", func() { b.keepTrying(c, epoch) })
 }
 
-// loadSession reads the saved cookies; false if there are none to use.
-func (b *Instagram) loadSession() (*mcookies.Cookies, bool) {
+// loadSession reads the saved cookies and browser; false if there are none
+// to use.
+func (b *Instagram) loadSession() (*mcookies.Cookies, browser.Identity, bool) {
 	var s savedSession
 	ok, err := b.d.Session.LoadJSON(sessionFile, &s)
 	if err != nil {
 		hlog.Warn("instagram: saved session unreadable", hlog.Kind(err))
-		return nil, false
+		return nil, browser.Identity{}, false
 	}
 	if !ok || s.Version != 1 {
-		return nil, false
+		return nil, browser.Identity{}, false
+	}
+	// A browser that doesn't parse wasn't written by this helper, and
+	// resuming as some other browser is what a session must never do.
+	as, err := browser.Parse(s.Browser)
+	if err != nil {
+		hlog.Warn("instagram: saved session names an unknown browser")
+		return nil, browser.Identity{}, false
 	}
 	c := libCookies(s.Cookies)
 	if len(c.GetMissingCookieNames()) > 0 {
-		return nil, false
+		return nil, browser.Identity{}, false
 	}
-	return c, true
+	return c, as, true
 }
 
 // libCookies is the cookies instameow is given.
@@ -199,7 +215,8 @@ func libCookies(values map[string]string) *mcookies.Cookies {
 	return c
 }
 
-// saveSession keeps the connection's cookies, which Instagram rotates.
+// saveSession keeps the connection's cookies, which Instagram rotates, and
+// the browser it says it is.
 func (b *Instagram) saveSession(conn *connection) error {
 	values := map[string]string{}
 	for k, v := range conn.cookies.GetAll() {
@@ -207,7 +224,7 @@ func (b *Instagram) saveSession(conn *connection) error {
 			values[string(k)] = v
 		}
 	}
-	return b.d.Session.SaveJSON(sessionFile, savedSession{Version: 1, Cookies: values})
+	return b.d.Session.SaveJSON(sessionFile, savedSession{Version: 1, Cookies: values, Browser: conn.as.Name()})
 }
 
 // loadError is the inbox failing to load, with whether Instagram knew the
@@ -287,11 +304,11 @@ func (b *Instagram) stale(epoch int) bool {
 // as soon as the inbox is in, so the socket's first updates find it.
 func (b *Instagram) open(ctx context.Context, c *mcookies.Cookies, epoch int) (*connection, error) {
 	b.mu.Lock()
-	base := b.base
+	base, as := b.base, b.as
 	b.mu.Unlock()
-	conn := &connection{cookies: c, connected: make(chan struct{}), failed: make(chan error, 1), ready: make(chan struct{})}
+	conn := &connection{cookies: c, as: as, connected: make(chan struct{}), failed: make(chan error, 1), ready: make(chan struct{})}
 	conn.ctx, conn.cancel = context.WithCancel(withQuietLog(base))
-	conn.cli = b.dial(c, func(_ context.Context, evt slidetypes.ClientEvent) error {
+	conn.cli = b.dial(c, as, func(_ context.Context, evt slidetypes.ClientEvent) error {
 		return b.handle(conn, evt)
 	})
 	viewer, mailbox, err := conn.cli.LoadIndex(withQuietLog(ctx))
@@ -451,9 +468,9 @@ func (b *Instagram) disconnect(conn *connection, wait time.Duration) {
 	}
 }
 
-// LoginCookies logs in with pasted cookies, and saves them once Instagram's
-// socket has connected with them.
-func (b *Instagram) LoginCookies(ctx context.Context, set cookies.Set) error {
+// LoginCookies logs in with pasted cookies as the browser named, and saves
+// them (and it) once Instagram's socket has connected with them.
+func (b *Instagram) LoginCookies(ctx context.Context, set cookies.Set, as browser.Identity) error {
 	c := libCookies(set.Values())
 	if len(c.GetMissingCookieNames()) > 0 {
 		return errBadCookies
@@ -464,6 +481,7 @@ func (b *Instagram) LoginCookies(ctx context.Context, set cookies.Set) error {
 	old := b.conn
 	b.conn = nil
 	b.reset()
+	b.as = as
 	b.account(proto.Connecting, "")
 	b.mu.Unlock()
 	b.disconnect(old, 0)
@@ -498,6 +516,7 @@ func (b *Instagram) Logout(ctx context.Context) error {
 	old := b.conn
 	b.conn = nil
 	b.reset()
+	b.as = browser.Default()
 	b.mu.Unlock()
 	b.disconnect(old, closeWait)
 	if err := b.d.Session.Wipe(); err != nil {

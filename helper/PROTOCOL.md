@@ -1,4 +1,4 @@
-# tuimeta helper protocol, version 1
+# tuimeta helper protocol, version 2
 
 `tuimeta-helper` is a separate program (Go, AGPL-3.0-or-later) that speaks
 Messenger and Instagram for tuimeta (Rust, MIT). tuimeta starts it as a child
@@ -41,8 +41,10 @@ raw newline (JSON escapes them).
   `internal`. `message` is one sentence a person can act on; tuimeta may show
   it in its status bar.
 - The helper's first line is always:
-  `{"event":"hello","version":1,"helper":"<semver>","networks":["messenger","instagram"]}`.
-  tuimeta refuses to go on if `version` isn't one it knows.
+  `{"event":"hello","version":2,"helper":"<semver>","networks":["messenger","instagram"]}`.
+  tuimeta refuses to go on if `version` isn't one it knows. (Version 2 added
+  `login_cookies`' `browser`: a helper that ignored it would log in as
+  another browser than the user asked for.)
 - When stdin closes (tuimeta quit or crashed), the helper disconnects every
   account, without marking anything read or setting any presence, and exits
   within two seconds.
@@ -202,7 +204,7 @@ message.
 
 | method | params | result |
 |---|---|---|
-| `login_cookies` | `network`, `cookies` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. Saved only after login worked. Errors: `bad_cookies`, `checkpoint`, `network`. |
+| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version), `bad_cookies`, `checkpoint`, `network`. |
 | `logout` | `network` | `{}`: a local logout. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). It never ends the session on Meta's side: the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). |
 | `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. |
 | `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). |
@@ -229,6 +231,21 @@ serve the local copy). Then they answer with those temporary ids, and
 `download` of a file already on disk still sends a `file` event with
 `done: true` and its `path` at once.
 
+### The browser the helper says it is
+
+With `browser`, every request that would carry the libraries' own browser
+(the website's requests, its websockets, the encrypted chats' connection and
+file downloads) carries the named Chrome instead: its user agent for this
+computer's system (`Macintosh; Intel Mac OS X 10_15_7`, `Windows NT 10.0;
+Win64; x64` or `X11; Linux x86_64`, as Chrome writes them), and the client
+hints a request already had: `sec-ch-ua` and `sec-ch-ua-full-version-list`
+(the brands and order Chrome derives from its version), `sec-ch-ua-platform`
+(`macOS`, `Windows`, `Linux`) and `sec-ch-ua-platform-version` (macOS's
+version, or Linux's kernel release, as three numbers; empty on Windows).
+Requests that pretend to be a phone app are left alone. Nothing else changes:
+the connections still shake hands the way the libraries' Chrome does, which
+is why only Chrome can be named.
+
 ## What the helper must never do on its own
 
 These mirror tuimeta's rules: what other people see about you goes out only
@@ -251,7 +268,9 @@ access at all.
 
 - Both networks start `logged_out`. `login_cookies` succeeds for any string
   that contains the required cookie names (e.g. `c_user=1; xs=2; datr=3`),
-  and fails with `bad_cookies` otherwise. Logged-in state lasts for the run.
+  and fails with `bad_cookies` otherwise, or with `bad_request` if `browser`
+  is there and isn't Chrome with a full version. Logged-in state lasts for the
+  run.
 - Each network has 6 chats (dms and groups, one Messenger chat `encrypted`,
   one Instagram chat with a link preview) and 60 messages of history per chat
   over the last week, including replies, reactions, an edited message, a

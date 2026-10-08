@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
@@ -178,7 +179,7 @@ func TestTheLibrariesLogNowhere(t *testing.T) {
 	if zlog.Logger.GetLevel() != zerolog.Disabled {
 		t.Error("zerolog's global logger is on")
 	}
-	cli := newMessagix(map[string]string{"c_user": "1", "xs": "2", "datr": "3", "presence": "EDvF3EtimeF1"})
+	cli := newMessagix(map[string]string{"c_user": "1", "xs": "2", "datr": "3", "presence": "EDvF3EtimeF1"}, browser.Default())
 	if cli.Logger.GetLevel() != zerolog.Disabled {
 		t.Error("messagix logs")
 	}

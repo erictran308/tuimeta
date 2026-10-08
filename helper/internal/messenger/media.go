@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/download"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
@@ -120,16 +121,19 @@ func (m *Messenger) Fetch(ctx context.Context, ref ids.FileRef, w io.Writer) err
 		_, err = w.Write(data)
 		return err
 	case *fbSource:
+		m.mu.Lock()
+		as := m.as
+		m.mu.Unlock()
 		u := src.URL
 		if src.Expires > 0 && m.now().UnixMilli() > src.Expires-5*60*1000 && src.MessageID != "" {
 			if fresh := m.refreshURL(ctx, ref); fresh != "" {
 				u = fresh
 			}
 		}
-		err := fetchURL(ctx, u, src.Mime, w)
+		err := fetchURL(ctx, as, u, src.Mime, w)
 		if errors.Is(err, errForbidden) && src.MessageID != "" {
 			if fresh := m.refreshURL(ctx, ref); fresh != "" && fresh != u {
-				err = fetchURL(ctx, fresh, src.Mime, w)
+				err = fetchURL(ctx, as, fresh, src.Mime, w)
 			}
 		}
 		if err != nil {
@@ -173,12 +177,12 @@ func (m *Messenger) refreshURL(ctx context.Context, ref ids.FileRef) string {
 }
 
 // fetchURL downloads a file from Meta's servers into w, with the headers a
-// browser sends for it.
-func fetchURL(ctx context.Context, raw, mime string, w io.Writer) error {
+// browser (the one the session says it is) sends for it.
+func fetchURL(ctx context.Context, as browser.Identity, raw, mime string, w io.Writer) error {
 	if !allowedMediaURL(raw) {
 		return errors.New("not a media host")
 	}
-	resp, err := mediaGet(ctx, raw, mime, "")
+	resp, err := mediaGet(ctx, as, raw, mime, "")
 	if err != nil {
 		return err
 	}
@@ -186,7 +190,7 @@ func fetchURL(ctx context.Context, raw, mime string, w io.Writer) error {
 	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently {
 		loc, lerr := resp.Location()
 		if lerr == nil && loc.Hostname() == "video.xx.fbcdn.net" && allowedMediaURL(loc.String()) {
-			return fetchRanges(ctx, loc.String(), mime, w)
+			return fetchRanges(ctx, as, loc.String(), mime, w)
 		}
 	}
 	if resp.StatusCode == http.StatusForbidden {
@@ -201,10 +205,10 @@ func fetchURL(ctx context.Context, raw, mime string, w io.Writer) error {
 }
 
 // fetchRanges downloads a video a range at a time.
-func fetchRanges(ctx context.Context, raw, mime string, w io.Writer) error {
+func fetchRanges(ctx context.Context, as browser.Identity, raw, mime string, w io.Writer) error {
 	var offset, total int64 = 0, -1
 	for total < 0 || offset < total {
-		resp, err := mediaGet(ctx, raw, mime, "bytes="+strconv.FormatInt(offset, 10)+"-"+strconv.FormatInt(offset+chunkSize-1, 10))
+		resp, err := mediaGet(ctx, as, raw, mime, "bytes="+strconv.FormatInt(offset, 10)+"-"+strconv.FormatInt(offset+chunkSize-1, 10))
 		if err != nil {
 			return err
 		}
@@ -257,7 +261,7 @@ func rangeTotal(h string) int64 {
 	return n
 }
 
-func mediaGet(ctx context.Context, raw, mime, byteRange string) (*http.Response, error) {
+func mediaGet(ctx context.Context, as browser.Identity, raw, mime, byteRange string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
 		return nil, err
@@ -280,6 +284,7 @@ func mediaGet(ctx context.Context, raw, mime, byteRange string) (*http.Response,
 	h.Set("User-Agent", useragent.UserAgent)
 	h.Set("sec-ch-ua", useragent.SecCHUserAgent)
 	h.Set("sec-ch-ua-platform", useragent.SecCHPlatform)
+	as.Rewrite(h)
 	if byteRange != "" {
 		h.Set("Range", byteRange)
 	}

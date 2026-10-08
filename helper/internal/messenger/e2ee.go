@@ -139,7 +139,7 @@ func decodeApplication(app *waMsgApplication.MessageApplication) (armadillo.Mess
 // the encrypted chats' socket.
 func (m *Messenger) connectE2EE(gen int) {
 	m.mu.Lock()
-	cli, st, life, self := m.msgx, m.store, m.life, m.self
+	cli, as, st, life, self := m.msgx, m.as, m.store, m.life, m.self
 	device := ""
 	if m.sess != nil {
 		device = m.sess.WADevice
@@ -194,6 +194,7 @@ func (m *Messenger) connectE2EE(gen int) {
 		return
 	}
 	configureE2EE(wa)
+	presentE2EE(wa, as)
 	wa.AddEventHandlerWithSuccessStatus(func(evt any) bool { return m.onE2EE(gen, evt) })
 	m.mu.Lock()
 	if m.gen != gen || m.closed {

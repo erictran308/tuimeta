@@ -23,6 +23,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
@@ -48,22 +49,31 @@ var retryWait = 2 * time.Second
 // sessionFile keeps the login between runs.
 const sessionFile = "session.json"
 
-// savedSession is what's kept: the cookies (as messagix last updated them)
-// and which encrypted-chat device this login registered.
+// savedSession is what's kept: the cookies (as messagix last updated them),
+// the browser the login named, and which encrypted-chat device this login
+// registered.
 type savedSession struct {
 	Version  int               `json:"version"`
 	UserID   int64             `json:"user_id"`
 	Cookies  map[string]string `json:"cookies"`
+	Browser  string            `json:"browser,omitempty"`
 	WADevice string            `json:"wa_device,omitempty"`
+}
+
+// login is what a connection is made with: the cookies, and the browser to
+// say it is.
+type login struct {
+	cookies map[string]string
+	as      browser.Identity
 }
 
 // Messenger is the Messenger account.
 type Messenger struct {
 	d   backend.Deps
 	now func() time.Time
-	// dial connects with cookies (connectWith); tests replace it, so they
+	// dial connects with a login (connectWith); tests replace it, so they
 	// never reach Facebook.
-	dial func(ctx, life context.Context, values map[string]string) error
+	dial func(ctx, life context.Context, l login) error
 
 	mu      sync.Mutex
 	base    context.Context
@@ -73,6 +83,7 @@ type Messenger struct {
 	upGen   int // the connection that finished connecting
 	meta    metaAPI
 	msgx    *messagix.Client
+	as      browser.Identity // the browser msgx says it is
 	e2ee    e2eeAPI
 	wa      *whatsmeow.Client
 	store   *e2eeStore
@@ -136,6 +147,7 @@ func (m *Messenger) reset() {
 	m.ready = false
 	m.e2eeOK = false
 	m.self, m.selfName, m.selfAvatar = 0, "", ""
+	m.as = browser.Default()
 }
 
 func (m *Messenger) Network() proto.Network { return net }
@@ -150,7 +162,14 @@ func (m *Messenger) Start(ctx context.Context) {
 	if err != nil {
 		hlog.Warn("messenger: session unreadable", hlog.Kind(err))
 	}
-	if !ok || err != nil || len(s.Cookies) == 0 {
+	// The session says the browser it was logged in as. One that doesn't
+	// parse wasn't written by this helper, and resuming as some other
+	// browser is what a session must never do.
+	as, berr := browser.Parse(s.Browser)
+	if berr != nil {
+		hlog.Warn("messenger: saved session names an unknown browser")
+	}
+	if !ok || err != nil || berr != nil || len(s.Cookies) == 0 {
 		m.mu.Unlock()
 		m.d.Events.Account(net, proto.LoggedOut, 0, "", "")
 		return
@@ -159,15 +178,15 @@ func (m *Messenger) Start(ctx context.Context) {
 	life := m.life
 	m.mu.Unlock()
 	m.d.Events.Account(net, proto.Connecting, 0, "", "")
-	hlog.Go("messenger resume", func() { m.resume(life, s.Cookies) })
+	hlog.Go("messenger resume", func() { m.resume(life, login{s.Cookies, as}) })
 }
 
 // resume connects with the saved session, trying again with growing pauses
 // while the network is the problem.
-func (m *Messenger) resume(life context.Context, values map[string]string) {
+func (m *Messenger) resume(life context.Context, l login) {
 	wait := retryWait
 	for {
-		err := m.connect(life, values)
+		err := m.connect(life, l)
 		if err == nil || life.Err() != nil {
 			return
 		}
@@ -195,7 +214,7 @@ func sessionDead(pe *proto.Error) string {
 	return pe.Message
 }
 
-func (m *Messenger) LoginCookies(ctx context.Context, c cookies.Set) error {
+func (m *Messenger) LoginCookies(ctx context.Context, c cookies.Set, as browser.Identity) error {
 	m.mu.Lock()
 	// A session being resumed (or retried) gives way to this login, and the
 	// encrypted chats' store is opened afresh for it.
@@ -215,7 +234,7 @@ func (m *Messenger) LoginCookies(ctx context.Context, c cookies.Set) error {
 	defer cancel()
 	stopLife := context.AfterFunc(life, cancel)
 	defer stopLife()
-	err := m.dial(ctx, life, c.Values())
+	err := m.dial(ctx, life, login{c.Values(), as})
 	if err != nil {
 		m.mu.Lock()
 		m.teardownLocked()
@@ -228,17 +247,18 @@ func (m *Messenger) LoginCookies(ctx context.Context, c cookies.Set) error {
 }
 
 // connect is a resumed session's connection.
-func (m *Messenger) connect(life context.Context, values map[string]string) error {
+func (m *Messenger) connect(life context.Context, l login) error {
 	ctx, cancel := context.WithTimeout(life, ConnectTimeout)
 	defer cancel()
-	return m.dial(ctx, life, values)
+	return m.dial(ctx, life, l)
 }
 
 // connectWith loads the Messenger page with the cookies, connects its socket
 // and waits for the first sync. The session is saved only then. ctx bounds
 // the wait; life is the connection's own lifetime.
-func (m *Messenger) connectWith(ctx, life context.Context, values map[string]string) error {
-	cli := newMessagix(values)
+func (m *Messenger) connectWith(ctx, life context.Context, l login) error {
+	values := l.cookies
+	cli := newMessagix(values, l.as)
 	user, initial, err := cli.LoadMessagesPage(ctx)
 	if err != nil {
 		hlog.Info("messenger: page load failed", hlog.Kind(err))
@@ -261,6 +281,7 @@ func (m *Messenger) connectWith(ctx, life context.Context, values map[string]str
 	m.teardownLocked()
 	gen := m.gen
 	m.msgx = cli
+	m.as = l.as
 	m.meta = &metaConn{cli: cli}
 	m.self = fbid
 	m.selfName = user.GetName()
@@ -302,6 +323,7 @@ func (m *Messenger) connectWith(ctx, life context.Context, values map[string]str
 	}
 	m.sess.UserID = fbid
 	m.sess.Cookies = cookieValues(cli)
+	m.sess.Browser = l.as.Name()
 	m.upGen = gen
 	sess := *m.sess
 	m.mu.Unlock()
@@ -399,12 +421,12 @@ func (m *Messenger) fullReconnect(gen int) {
 		return
 	}
 	m.lastFul = m.now()
-	values := m.msgxCookies()
+	l := login{m.msgxCookies(), m.as}
 	life := m.life
 	m.mu.Unlock()
 	hlog.Info("messenger: reconnecting from scratch")
 	m.d.Events.Account(net, proto.Connecting, 0, "", "")
-	hlog.Go("messenger reconnect", func() { m.resume(life, values) })
+	hlog.Go("messenger reconnect", func() { m.resume(life, l) })
 }
 
 // msgxCookies is the current cookies; m.mu is held.

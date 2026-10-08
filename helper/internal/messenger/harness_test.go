@@ -304,7 +304,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	m := newMessenger(deps)
 	m.now = func() time.Time { return base }
-	m.dial = func(context.Context, context.Context, map[string]string) error {
+	m.dial = func(context.Context, context.Context, login) error {
 		t.Error("the test tried to connect to Facebook")
 		return errNetwork
 	}

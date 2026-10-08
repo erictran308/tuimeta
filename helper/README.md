@@ -60,6 +60,15 @@ tuigram:
 - Files to send are read once, when `send_files` arrives: absolute paths of
   plain files only, never `\\server\share` paths (on Windows, looking at one
   hands the server your login hash).
+- The browser it says it is: the libraries' own (Chrome 141 on Linux), or
+  the Chrome a login named (`login_cookies`' `browser`), saved in the
+  network's `session.json` and used for as long as that session lasts.
+  `internal/browser` wraps the libraries' HTTP and websocket clients and puts
+  that Chrome's user agent and client hints in place of the libraries' on
+  each request that carries them; Messenger's encrypted-chat handshake and
+  both networks' downloads get them too. Requests that pretend to be a phone
+  app, and the TLS handshake (always the libraries' Chrome), are left alone.
+  A saved session naming a browser that doesn't parse isn't resumed.
 
 What it keeps, all inside `--data-dir` (made 0700, refused if it's a symbolic
 link or another user's; every file 0600, umask 077 on Unix):
@@ -258,7 +267,7 @@ type Backend interface {
 	Network() proto.Network
 	Start(ctx context.Context)  // account event at once, connect in the background
 	Close()                     // quit quietly: no receipts, no presence
-	LoginCookies(ctx context.Context, c cookies.Set) error
+	LoginCookies(ctx context.Context, c cookies.Set, as browser.Identity) error
 	Logout(ctx context.Context) error
 	LoadChats(ctx context.Context, limit int) (hasMore bool, err error)
 	History(ctx context.Context, chat ChatRef, q history.Query) (history.Page, error)
@@ -351,6 +360,7 @@ Package layout:
 | `internal/ids` | chat/person ids (kept), message ids and file ids (per run) |
 | `internal/history` | a chat's messages and paging |
 | `internal/cookies`, `internal/session`, `internal/download` | logins, sessions, downloads |
+| `internal/browser` | the browser the helper says it is: the libraries' own, or the Chrome a login named, put in place of the libraries' on every request |
 | `internal/hlog`, `internal/fsutil` | the log, private folders and atomic files |
 | `internal/fake` | the `--fake` networks |
 | `internal/wiretest` | a protocol client for tests |

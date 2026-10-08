@@ -16,6 +16,8 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/util/exhttp"
+
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 )
 
 // api is the part of instameow's Client the backend uses. The real one is
@@ -56,16 +58,19 @@ type api interface {
 // realAPI is instameow itself.
 type realAPI struct{ *instameow.Client }
 
-// dialReal makes the library's client. Typing stays enabled: instameow then
-// keeps a socket that receives other people's typing, and sends yours only
-// when SetTyping is called (which only SetTyping here does).
-func dialReal(c *mcookies.Cookies, handler instameow.EventHandler) api {
-	return realAPI{instameow.NewClient(instameow.ClientParams{
+// dialReal makes the library's client, saying it's the given browser.
+// Typing stays enabled: instameow then keeps a socket that receives other
+// people's typing, and sends yours only when SetTyping is called (which only
+// SetTyping here does).
+func dialReal(c *mcookies.Cookies, as browser.Identity, handler instameow.EventHandler) api {
+	cli := instameow.NewClient(instameow.ClientParams{
 		Cookies:      c,
 		Log:          quietLogger(),
 		Settings:     httpSettings(),
 		EventHandler: handler,
-	})}
+	})
+	as.Use(cli.GetHTTP())
+	return realAPI{cli}
 }
 
 // httpSettings are the library's HTTP settings: sensible timeouts, and no

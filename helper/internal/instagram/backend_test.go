@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
@@ -56,7 +57,7 @@ func TestLoginConnectsThenSavesOnlyTheInstagramCookies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.b.LoginCookies(t.Context(), set); err != nil {
+	if err := h.b.LoginCookies(t.Context(), set, browser.Default()); err != nil {
 		t.Fatalf("login: %v", err)
 	}
 	if got := accountStates(h.rec); strings.Join(got, ",") != "connecting,ready" {
@@ -93,7 +94,7 @@ func TestALoginWhoseSocketIsRefusedSavesNothing(t *testing.T) {
 	h := newHarness(t)
 	h.api.onConnect = []slidetypes.ClientEvent{&slidetypes.Disconnected{Error: websocket.CloseError{Code: dgw.CloseStatusUnauthorized}}}
 	set, _ := cookies.Parse(proto.Instagram, cookieText)
-	err := h.b.LoginCookies(t.Context(), set)
+	err := h.b.LoginCookies(t.Context(), set, browser.Default())
 	var pe *proto.Error
 	if !errors.As(err, &pe) || pe.Code != proto.BadCookies {
 		t.Fatalf("login error = %v", err)
@@ -128,7 +129,7 @@ func TestLoginErrorsSayWhatToDoWithoutQuotingInstagram(t *testing.T) {
 		h.api.loadErr = tc.err
 		h.api.authenticated = tc.authenticated
 		set, _ := cookies.Parse(proto.Instagram, cookieText)
-		err := h.b.LoginCookies(t.Context(), set)
+		err := h.b.LoginCookies(t.Context(), set, browser.Default())
 		var pe *proto.Error
 		if !errors.As(err, &pe) || pe.Code != tc.code || !strings.Contains(pe.Message, tc.says) {
 			t.Errorf("%v: got %v", tc.err, err)
@@ -142,7 +143,7 @@ func TestLoginErrorsSayWhatToDoWithoutQuotingInstagram(t *testing.T) {
 	h := newHarness(t)
 	h.api.fbid = 0
 	set, _ := cookies.Parse(proto.Instagram, cookieText)
-	if err := h.b.LoginCookies(t.Context(), set); !errors.Is(err, errNoAccount) {
+	if err := h.b.LoginCookies(t.Context(), set, browser.Default()); !errors.Is(err, errNoAccount) {
 		t.Errorf("no account: %v", err)
 	}
 }

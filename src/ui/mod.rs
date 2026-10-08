@@ -72,7 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .into_iter()
                 .map(|n| (n, app.accounts.get(&n).cloned()))
                 .collect();
-            draw_login(frame, login, &accounts, &colors)
+            draw_login(frame, login, &accounts, app.browser.as_deref(), &colors)
         }
         Screen::Main => draw_main(frame, app, &colors),
     }
@@ -191,15 +191,30 @@ const NOT_META: &str = "tuimeta isn't made or allowed by Meta: using it is again
      and an account can be locked or banned for it. Turn on two-factor \
      authentication first.";
 
+/// Which browser the login will say tuimeta is: the one `TM_BROWSER` names
+/// (the helper checks it's Chrome), or how to name one.
+fn browser_note(browser: Option<&str>) -> String {
+    match browser {
+        Some(name) => format!(
+            "Logging in as {} on this computer (TM_BROWSER).",
+            truncate(&text::clean(name).replace('\n', " "), 40)
+        ),
+        None => "Set TM_BROWSER to the Chrome you copy them from to log in as that browser \
+                 (tuimeta --help)."
+            .into(),
+    }
+}
+
 fn draw_login(
     frame: &mut Frame,
     login: &Login,
     accounts: &[(Network, Option<Account>)],
+    browser: Option<&str>,
     colors: &Colors,
 ) {
     let help_rows: u16 = match login.step {
         LoginStep::Choose { .. } => 4,
-        LoginStep::Cookies { .. } => 6,
+        LoginStep::Cookies { .. } => 8,
         _ => 2,
     };
     let body_rows: u16 = match login.step {
@@ -242,9 +257,10 @@ fn draw_login(
                  (Application or Storage → Cookies → {site}) and copy {names}. Paste them \
                  here as name=value; name=value…, or paste a cookie export (JSON). They're \
                  your whole session: keep them to yourself. tuimeta keeps them only in \
-                 its data folder, readable by you alone.",
+                 its data folder, readable by you alone.\n{as_browser}",
                 site = network.site(),
                 names = network.cookie_names().join(", "),
+                as_browser = browser_note(browser),
             ),
         ),
     };
@@ -2478,7 +2494,7 @@ mod tests {
         let colors = Colors::default();
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal
-            .draw(|f| draw_login(f, login, accounts, &colors))
+            .draw(|f| draw_login(f, login, accounts, None, &colors))
             .unwrap();
         buffer_rows(terminal.backend().buffer())
     }
@@ -2517,6 +2533,34 @@ mod tests {
         assert!(text.contains("sessionid, ds_user_id, csrftoken"), "{text}");
         assert!(!text.contains("SECRET123"), "masked as it's typed");
         assert!(text.contains("•••"));
+    }
+
+    #[test]
+    fn the_cookie_step_names_the_browser_the_login_will_say_it_is() {
+        let login = Login::new(LoginStep::Cookies {
+            network: Network::Messenger,
+        });
+        let draw = |browser: Option<&str>| {
+            let colors = Colors::default();
+            let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+            terminal
+                .draw(|f| draw_login(f, &login, &[], browser, &colors))
+                .unwrap();
+            buffer_rows(terminal.backend().buffer()).join("\n")
+        };
+        let text = draw(Some("Chrome 150.0.7712.45"));
+        assert!(
+            text.contains("Logging in as Chrome 150.0.7712.45 on this computer"),
+            "{text}"
+        );
+        let text = draw(None);
+        assert!(text.contains("Set TM_BROWSER to the Chrome"), "{text}");
+        let text = draw(Some("Chrome\u{1b}[2J\u{202e}150"));
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+            "{text}"
+        );
+        assert!(text.contains("Chrome[2J150"), "{text}");
     }
 
     /// The column where `needle` starts in a buffer row; every cell there is

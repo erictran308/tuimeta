@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
@@ -139,6 +140,7 @@ func (s *Server) loginCookies(c *call) (any, error) {
 	p, err := decode[struct {
 		Network string `json:"network"`
 		Cookies string `json:"cookies"`
+		Browser string `json:"browser"`
 	}](c.params)
 	if err != nil {
 		return nil, err
@@ -155,8 +157,17 @@ func (s *Server) loginCookies(c *call) (any, error) {
 		hlog.Info("login refused", hlog.Str("network", string(n)), hlog.Kind(err))
 		return nil, err
 	}
-	hlog.Info("logging in", hlog.Str("network", string(n)))
-	if err := b.LoginCookies(c.ctx, set); err != nil {
+	as, err := browser.Parse(p.Browser)
+	if err != nil {
+		hlog.Info("login refused: not chrome", hlog.Str("network", string(n)))
+		return nil, err
+	}
+	named := "libraries"
+	if !as.IsDefault() {
+		named = "named"
+	}
+	hlog.Info("logging in", hlog.Str("network", string(n)), hlog.Str("browser", named))
+	if err := b.LoginCookies(c.ctx, set, as); err != nil {
 		hlog.Info("login failed", hlog.Str("network", string(n)), hlog.Kind(err))
 		return nil, err
 	}

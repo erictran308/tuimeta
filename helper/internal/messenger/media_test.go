@@ -16,6 +16,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
@@ -79,7 +80,7 @@ func TestVideosRedirectedToTheVideoHostComeInRanges(t *testing.T) {
 		w.Write([]byte(video[from : to+1]))
 	})
 	var buf writeBuf
-	if err := fetchURL(context.Background(), "https://scontent.xx.fbcdn.net/v.mp4", "video/mp4", &buf); err != nil || string(buf) != video {
+	if err := fetchURL(context.Background(), browser.Default(), "https://scontent.xx.fbcdn.net/v.mp4", "video/mp4", &buf); err != nil || string(buf) != video {
 		t.Fatalf("ranges: %d bytes, %v", len(buf), err)
 	}
 }

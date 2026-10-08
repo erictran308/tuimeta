@@ -227,6 +227,10 @@ func (b *Instagram) get(ctx context.Context, method, raw, mime, byteRange string
 	req.Header.Set("User-Agent", useragent.UserAgent)
 	req.Header.Set("Sec-Ch-Ua", useragent.SecCHUserAgent)
 	req.Header.Set("Sec-Ch-Ua-Platform", useragent.SecCHPlatform)
+	b.mu.Lock()
+	as := b.as
+	b.mu.Unlock()
+	as.Rewrite(req.Header)
 	if byteRange != "" {
 		req.Header.Set("Range", byteRange)
 	}

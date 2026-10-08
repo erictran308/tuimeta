@@ -598,6 +598,10 @@ pub struct App {
     unread_chats: i32,
     /// The photo the last frame showed in the viewer, by file id.
     shown_in_viewer: Option<i32>,
+    /// The browser a login says tuimeta is (`TM_BROWSER`: Chrome and its full
+    /// version), so the session looks like the browser its cookies came
+    /// from. `None` leaves it to the helper.
+    pub browser: Option<String>,
     exit: bool,
 }
 
@@ -667,6 +671,7 @@ impl App {
             notified: HashMap::new(),
             unread_chats: 0,
             shown_in_viewer: None,
+            browser: None,
             exit: false,
         };
         app.use_saved_theme();
@@ -1435,7 +1440,8 @@ impl App {
                     }
                     login.busy = true;
                     login.error = None;
-                    self.meta.login_cookies(network, value);
+                    self.meta
+                        .login_cookies(network, value, self.browser.clone());
                 }
                 _ => {
                     login.input.input(key);
@@ -3884,6 +3890,28 @@ mod tests {
         account(&mut app, Network::Instagram, AccountState::Ready);
         assert!(matches!(app.screen, Screen::Main));
         assert_eq!(sent_with(&app, "load_chats")[0]["network"], "instagram");
+    }
+
+    #[test]
+    fn a_login_names_the_browser_tm_browser_gave() {
+        let mut app = test_app("login-browser");
+        let none = KeyModifiers::NONE;
+        let log_in = |app: &mut App| {
+            app.screen = Screen::Login(Box::new(Login::new(LoginStep::Cookies {
+                network: Network::Messenger,
+            })));
+            app.on_terminal_event(Event::Paste("c_user=1; xs=2; datr=3".into()));
+            press(app, KeyCode::Enter, none);
+        };
+        log_in(&mut app);
+        assert!(sent_with(&app, "login_cookies")[0]["browser"].is_null());
+
+        app.browser = Some("Chrome 150.0.7712.45".into());
+        log_in(&mut app);
+        assert_eq!(
+            sent_with(&app, "login_cookies")[1]["browser"],
+            "Chrome 150.0.7712.45"
+        );
     }
 
     #[test]

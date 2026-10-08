@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
@@ -40,9 +41,11 @@ type Backend interface {
 	Close()
 
 	// LoginCookies logs in with cookies whose required names the server has
-	// checked, returning once connected (account ready). The session is
-	// saved only after that. Errors: bad_cookies, checkpoint, network.
-	LoginCookies(ctx context.Context, c cookies.Set) error
+	// checked, as the browser named (browser.Default() for the libraries'
+	// own), returning once connected (account ready). The session is saved
+	// only after that, browser and all: a resumed session says it's the same
+	// browser. Errors: bad_cookies, checkpoint, network.
+	LoginCookies(ctx context.Context, c cookies.Set, as browser.Identity) error
 
 	// Logout logs out on the network where it can (and removes the
 	// encrypted-chat device), wipes Deps.Session, and reports logged_out.
