@@ -36,6 +36,81 @@ func TestSafeNameKeepsOnlyHarmlessCharacters(t *testing.T) {
 	}
 }
 
+const (
+	pngBytes  = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+	jpegBytes = "\xff\xd8\xff\xe0\x00\x10JFIF\x00"
+	gifBytes  = "GIF89a\x01\x00\x01\x00"
+	webpBytes = "RIFF\x00\x00\x00\x00WEBPVP8 "
+	bmpBytes  = "BM\x00\x00\x00\x00\x00\x00"
+)
+
+func TestAPictureIsNamedForWhatItsBytesSay(t *testing.T) {
+	cases := []struct{ path, head, want string }{
+		{"/d/h-preview.jpg", pngBytes, "/d/h-preview.png"},
+		{"/d/h-a.png", gifBytes, "/d/h-a.gif"},
+		{"/d/h-a.jpeg", webpBytes, "/d/h-a.webp"},
+		{"/d/h-a.webp", jpegBytes, "/d/h-a.jpg"},
+		// Already right, or not a picture at all: the name stays.
+		{"/d/h-preview.jpg", jpegBytes, "/d/h-preview.jpg"},
+		{"/d/h-a.jpeg", jpegBytes, "/d/h-a.jpeg"},
+		{"/d/h-a.png", "not a picture", "/d/h-a.png"},
+		{"/d/h-a.jpg", bmpBytes, "/d/h-a.jpg"},
+		{"/d/h-a.jpg", "", "/d/h-a.jpg"},
+		// Only a picture's name changes, and only to a picture's.
+		{"/d/h-report.pdf", pngBytes, "/d/h-report.pdf"},
+		{"/d/h-a.bin", pngBytes, "/d/h-a.bin"},
+		{"/d/h-a.mp4", pngBytes, "/d/h-a.mp4"},
+	}
+	for _, c := range cases {
+		if got := pictureName(c.path, []byte(c.head)); got != c.want {
+			t.Errorf("pictureName(%q, %q) = %q, want %q", c.path, c.head, got, c.want)
+		}
+	}
+}
+
+func TestAPNGSentAsJPEGIsSavedAsPNGAndFoundAgain(t *testing.T) {
+	dir := t.TempDir()
+	files := ids.NewFiles()
+	id := files.Register(ids.FileRef{Network: proto.Messenger, Key: "fb-preview:1", Name: "preview", Mime: "image/jpeg"})
+	var fetches atomic.Int32
+	fetch := func(ctx context.Context, ref ids.FileRef, w io.Writer) error {
+		fetches.Add(1)
+		// Written in small pieces, as a network read would.
+		for _, b := range []byte(pngBytes + strings.Repeat("x", 600)) {
+			if _, err := w.Write([]byte{b}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	rec := &recorder{}
+	m := New(dir, files, func(proto.Network) Fetch { return fetch }, rec.emit)
+	defer m.Close(time.Second)
+
+	if err := m.Download(id, proto.High); err != nil {
+		t.Fatal(err)
+	}
+	done := rec.wait(t, id, func(f proto.File) bool { return f.Done })
+	if done.Path == nil || !strings.HasSuffix(*done.Path, "-preview.png") {
+		t.Fatalf("done = %+v", done)
+	}
+
+	rec.events = nil
+	if err := m.Download(id, proto.Low); err != nil {
+		t.Fatal(err)
+	}
+	again := rec.wait(t, id, func(f proto.File) bool { return f.Done })
+	if *again.Path != *done.Path || fetches.Load() != 1 {
+		t.Errorf("fetched again: %d fetches, %+v", fetches.Load(), again)
+	}
+
+	ref, _ := files.Get(id)
+	m.Remove(ref)
+	if _, err := os.Stat(*done.Path); !os.IsNotExist(err) {
+		t.Errorf("not removed: %v", err)
+	}
+}
+
 type recorder struct {
 	mu     sync.Mutex
 	events []proto.File

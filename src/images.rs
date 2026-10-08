@@ -64,13 +64,16 @@ fn sized(side: u32) -> image::Limits {
 /// Stickers are 512px a side; this leaves room to spare.
 const STICKER_SIDE: u32 = 1024;
 
-/// Like `image::open` (the format comes from the extension), within [`limits`].
+/// Like `image::open`, within [`limits`].
 pub fn open_image(path: &str) -> image::ImageResult<image::DynamicImage> {
     open_within(path, limits())
 }
 
+/// The format comes from the file's first bytes, and only failing that from
+/// its extension: Messenger names some PNG screenshots' previews JPEG, so
+/// they're saved as `.jpg`.
 fn open_within(path: &str, limits: image::Limits) -> image::ImageResult<image::DynamicImage> {
-    let mut reader = image::ImageReader::open(path)?;
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
     reader.limits(limits);
     reader.decode()
 }
@@ -704,6 +707,17 @@ mod tests {
         images.fetch(&Meta::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
         assert!(images.get(&photo, 4, 2).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_png_saved_with_a_jpeg_name_still_opens() {
+        let dir = std::env::temp_dir().join(format!("tuimeta-misnamed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preview.jpg");
+        std::fs::write(&path, png(80, 60)).unwrap();
+        let image = open_image(path.to_str().unwrap()).unwrap();
+        assert_eq!((image.width(), image.height()), (80, 60));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

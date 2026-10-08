@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -97,8 +98,10 @@ func (m *Manager) removeLeftovers() {
 // Remove deletes a downloaded file, once what it came with is gone (a
 // message deleted, or disappeared). Nothing happens if it isn't on disk.
 func (m *Manager) Remove(ref ids.FileRef) {
-	if err := os.Remove(m.Path(ref)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		hlog.Warn("can't delete a download", hlog.Kind(err))
+	for _, path := range m.places(ref) {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			hlog.Warn("can't delete a download", hlog.Kind(err))
+		}
 	}
 }
 
@@ -107,6 +110,24 @@ func (m *Manager) Remove(ref ids.FileRef) {
 func (m *Manager) Path(ref ids.FileRef) string {
 	sum := sha256.Sum256([]byte(string(ref.Network) + "\x00" + ref.Key))
 	return filepath.Join(m.dir, string(ref.Network), hex.EncodeToString(sum[:10])+"-"+SafeName(ref.Name, ref.Mime))
+}
+
+// places are where the file may be on disk: at Path, or for a picture, at
+// Path with another picture type's extension (see pictureName).
+func (m *Manager) places(ref ids.FileRef) []string {
+	path := m.Path(ref)
+	ext := strings.TrimPrefix(filepath.Ext(path), ".")
+	places := []string{path}
+	if !isPicture(ext) {
+		return places
+	}
+	stem := strings.TrimSuffix(path, ext)
+	for _, e := range pictureExts {
+		if !sameType(ext, e) {
+			places = append(places, stem+e)
+		}
+	}
+	return places
 }
 
 // Download starts fetching file id (or raises its priority). A file already
@@ -119,11 +140,12 @@ func (m *Manager) Download(id int32, prio proto.Priority) error {
 	if prio != proto.High {
 		prio = proto.Low
 	}
-	path := m.Path(ref)
-	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
-		size := info.Size()
-		m.emit(proto.File{ID: id, Size: size, Downloaded: size, Done: true, Path: &path})
-		return nil
+	for _, path := range m.places(ref) {
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+			size := info.Size()
+			m.emit(proto.File{ID: id, Size: size, Downloaded: size, Done: true, Path: &path})
+			return nil
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -236,7 +258,7 @@ func (m *Manager) save(ctx context.Context, ref ids.FileRef) (string, int64, err
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		return "", 0, err
 	}
-	path := m.Path(ref)
+	path := pictureName(m.Path(ref), pw.head)
 	if err := os.Rename(tmp, path); err != nil {
 		return "", 0, err
 	}
@@ -249,7 +271,11 @@ type progress struct {
 	n, max, size int64
 	last         time.Time
 	report       func(int64)
+	head         []byte // the first sniffLen bytes, to tell a picture's type
 }
+
+// sniffLen is as much of a file as http.DetectContentType looks at.
+const sniffLen = 512
 
 // SetSize tells the download its full size once the backend learns it (a
 // Content-Length), for progress events; w is the writer Fetch was given.
@@ -265,6 +291,9 @@ func (p *progress) Write(b []byte) (int, error) {
 	}
 	n, err := p.w.Write(b)
 	p.n += int64(n)
+	if len(p.head) < sniffLen {
+		p.head = append(p.head, b[:min(n, sniffLen-len(p.head))]...)
+	}
 	if now := time.Now(); now.Sub(p.last) >= ProgressEvery {
 		p.last = now
 		p.report(p.n)
@@ -359,6 +388,28 @@ func SafeName(name, mime string) string {
 		stem = "file"
 	}
 	return stem + "." + strings.ToLower(ext)
+}
+
+// pictureExts are the picture types a download is named after by its
+// content.
+var pictureExts = []string{"jpg", "png", "gif", "webp"}
+
+func isPicture(ext string) bool {
+	return slices.ContainsFunc(pictureExts, func(e string) bool { return sameType(ext, e) })
+}
+
+// pictureName is path with the extension the file's first bytes say, when
+// it's named as one picture type and is another: Messenger sends some PNG
+// screenshots' previews as image/jpeg. A file not named as a picture, or
+// whose bytes aren't one, keeps its name, so a download only ever goes from
+// one picture extension to another.
+func pictureName(path string, head []byte) string {
+	ext := strings.TrimPrefix(filepath.Ext(path), ".")
+	content := extensions[http.DetectContentType(head)]
+	if !isPicture(ext) || !slices.Contains(pictureExts, content) || sameType(ext, content) {
+		return path
+	}
+	return strings.TrimSuffix(path, ext) + content
 }
 
 func sameType(ext, mimeExt string) bool {
