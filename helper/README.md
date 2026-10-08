@@ -157,11 +157,13 @@ received or sent since the device was linked are kept there too, the newest
 that's all those chats have. Someone with a copy of `e2ee.db` can read those
 messages and, until the device is removed from the account, decrypt what's
 sent to it and send as it; with `session.json` too, they have the web
-session. `logout` sends facebook.com's own log-out (which ends that web
-session everywhere, a browser tab using the same cookies included), deletes
-the device from the store and wipes `messenger/`. Facebook offers web
-clients no call to remove an encrypted-chat device from the account; remove
-it in Messenger's settings if you want it gone there.
+session. `logout` is local: it disconnects, deletes the device from the
+store and wipes `messenger/`, but never calls facebook.com's own log-out, so
+the web session the cookies belong to stays valid (the browser tab that holds
+them included) until the user ends it themselves. tuimeta's encrypted-chat
+device is also never removed from the account server-side (Facebook offers
+web clients no call for it); remove it in Messenger's settings if you want it
+gone there.
 
 What goes to Facebook without tuimeta asking, and why it's kept:
 

@@ -55,7 +55,7 @@ tuimeta logs in with your browser's session cookies, so it never sees your passw
 3. Copy the cookies tuimeta asks for: `c_user`, `xs` and `datr` for Messenger; `sessionid`, `ds_user_id` and `csrftoken` for Instagram.
 4. Paste them into tuimeta as `name=value; name=value; …`, or paste a cookie export (the JSON that cookie-export extensions make).
 
-These cookies are your whole session: anyone who has them is logged in as you. tuimeta keeps them only in its data folder, readable by you alone. It's the same session as the browser's: logging out there ends tuimeta's too. `:logout` in tuimeta deletes everything it kept; for Messenger it also logs that Facebook session out (so the browser you copied the cookies from is logged out too), while for Instagram the session lives on until you log out in the browser or end it in Instagram's list of logged-in devices.
+These cookies are your whole session: anyone who has them is logged in as you. tuimeta keeps them only in its data folder, readable by you alone. It's the same session as the browser's: logging out there ends tuimeta's too. `:logout` in tuimeta is local — it disconnects and deletes everything tuimeta kept for that network (for Messenger, its encrypted-chat device store too), but it does **not** end the session on Meta's side. Your Facebook or Instagram session stays logged in until you end it yourself, in the browser you copied the cookies from or in the site's list of logged-in devices.
 
 `:login` adds the other network, or logs in again.
 

@@ -146,7 +146,6 @@ type fakeMeta struct {
 	answer    func(tasks []socket.Task) (*table.LSTable, error)
 	pages     []*table.LSTable // FetchMoreThreads answers, in order
 	posted    int
-	loggedOut bool
 	cookies   map[string]string
 	closed    bool
 }
@@ -191,12 +190,6 @@ func (f *fakeMeta) Upload(_ context.Context, _ int64, media *httpclient.MercuryU
 func (f *fakeMeta) Cursor(int64) string                                   { return "cursor" }
 func (f *fakeMeta) WaitUntilCanSend(context.Context, time.Duration) error { return nil }
 func (f *fakeMeta) PostHandle(*table.LSTable)                             { f.mu.Lock(); f.posted++; f.mu.Unlock() }
-func (f *fakeMeta) Logout(context.Context) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.loggedOut = true
-	return nil
-}
 func (f *fakeMeta) Cookies() map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

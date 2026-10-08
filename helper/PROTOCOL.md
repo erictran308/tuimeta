@@ -203,7 +203,7 @@ message.
 | method | params | result |
 |---|---|---|
 | `login_cookies` | `network`, `cookies` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. Saved only after login worked. Errors: `bad_cookies`, `checkpoint`, `network`. |
-| `logout` | `network` | `{}`: logs out on the server where the network allows (and removes the encrypted-chat device), then deletes everything stored for that network. |
+| `logout` | `network` | `{}`: a local logout. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). It never ends the session on Meta's side: the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). |
 | `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. |
 | `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). |
 | `get_message` | `chat_id`, `message_id` | `{"message": Message}` (e.g. one a reply answers that isn't loaded) |

@@ -4,9 +4,7 @@ package messenger
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"time"
@@ -61,7 +59,6 @@ type metaAPI interface {
 	Cursor(db int64) string
 	WaitUntilCanSend(ctx context.Context, timeout time.Duration) error
 	PostHandle(tbl *table.LSTable)
-	Logout(ctx context.Context) error
 	Cookies() map[string]string
 	Disconnect()
 }
@@ -117,30 +114,6 @@ func (c *metaConn) Cookies() map[string]string {
 func (c *metaConn) Disconnect() {
 	c.cli.SetEventHandler(nil)
 	c.cli.Disconnect()
-}
-
-// Logout ends the facebook.com web session the cookies belong to, as the
-// website's own "Log out" does, so they stop working everywhere.
-func (c *metaConn) Logout(ctx context.Context) error {
-	token := logoutToken(c.cli)
-	if token == "" {
-		return errors.New("no logout token")
-	}
-	h := c.cli.GetHTTP()
-	q := h.NewHTTPQuery()
-	form := url.Values{"fb_dtsg": {q.FbDtsg}, "jazoest": {q.Jazoest}, "ref": {"mb"}, "h": {token}}
-	headers := h.BuildHeaders(true, false)
-	headers.Set("origin", c.cli.GetEndpoint("base_url"))
-	headers.Set("referer", c.cli.GetEndpoint("base_url")+"/")
-	headers.Set("sec-fetch-site", "same-origin")
-	resp, _, err := h.MakeRequestOnceNoRedirect(ctx, c.cli.GetEndpoint("base_url")+"/logout.php", http.MethodPost, headers, []byte(form.Encode()), types.FORM)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("logout status %d", resp.StatusCode)
-	}
-	return nil
 }
 
 // newMessagix makes a messagix client for the facebook.com site (messenger.com
@@ -238,26 +211,4 @@ func configureE2EE(cli *whatsmeow.Client) {
 	cli.InitialAutoReconnect = true
 	cli.SynchronousAck = true
 	cli.EnableDecryptedEventBuffer = true
-}
-
-// logoutToken digs the web page's logout token out of messagix's saved
-// state, the only place it's exposed.
-func logoutToken(cli *messagix.Client) string {
-	state, err := cli.DumpState()
-	if err != nil || state == nil {
-		return ""
-	}
-	var dumped struct {
-		Configs struct {
-			BrowserConfigTable struct {
-				MessengerWebInitData struct {
-					LogoutToken string `json:"logoutToken"`
-				}
-			}
-		}
-	}
-	if json.Unmarshal(state, &dumped) != nil {
-		return ""
-	}
-	return dumped.Configs.BrowserConfigTable.MessengerWebInitData.LogoutToken
 }

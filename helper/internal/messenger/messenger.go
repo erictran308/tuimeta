@@ -493,13 +493,10 @@ func (m *Messenger) Logout(ctx context.Context) error {
 	m.mu.Unlock()
 
 	if meta != nil {
-		// Ends the web session the cookies came from; that's the "log out"
-		// Facebook allows a web client.
-		lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := meta.Logout(lctx); err != nil {
-			hlog.Info("messenger: web logout didn't go through", hlog.Kind(err))
-		}
-		cancel()
+		// A local logout only: disconnect, but never call facebook.com's own
+		// "Log out", so the browser the cookies came from stays logged in.
+		// The web session lives on until the user ends it themselves, in the
+		// browser or in Facebook's list of logged-in devices.
 		meta.Disconnect()
 	}
 	if wa != nil {

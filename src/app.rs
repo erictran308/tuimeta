@@ -1989,15 +1989,16 @@ impl App {
             return;
         };
         let name = network.name();
-        // What each network lets a client end differs: Facebook's log-out
-        // ends the session the cookies are, browser and all; Instagram has
-        // nothing for a web session, so it lives on in the browser.
+        // Logout is local on both networks: tuimeta drops the connection and
+        // deletes what it keeps, but never ends the web session the cookies
+        // belong to, so the browser you copied them from stays logged in.
         let ends = match network {
             Network::Messenger => vec![
-                "It logs out of Facebook with the cookies you gave,".to_string(),
-                "which also logs out the browser you copied them from,".into(),
-                "removes tuimeta's encrypted-chat device and deletes".into(),
-                "what tuimeta keeps for Messenger on this computer.".into(),
+                "tuimeta disconnects and deletes what it keeps for".to_string(),
+                "Messenger on this computer, its encrypted-chat".into(),
+                "device included. Your Facebook session stays logged".into(),
+                "in: end it yourself in the browser, or in Facebook's".into(),
+                "list of logged-in devices.".into(),
             ],
             Network::Instagram => vec![
                 "tuimeta disconnects and deletes what it keeps for".to_string(),

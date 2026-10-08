@@ -129,7 +129,7 @@ func TestAFailedLoginSavesNothing(t *testing.T) {
 	}
 }
 
-func TestLogoutEndsTheWebSessionAndForgetsEverything(t *testing.T) {
+func TestLogoutDisconnectsLocallyAndForgetsEverythingButKeepsTheWebSession(t *testing.T) {
 	h := newHarness(t)
 	if err := h.deps.Session.SaveJSON(sessionFile, savedSession{Version: 1, Cookies: map[string]string{"xs": "1"}}); err != nil {
 		t.Fatal(err)
@@ -139,8 +139,10 @@ func TestLogoutEndsTheWebSessionAndForgetsEverything(t *testing.T) {
 	if err := h.m.Logout(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !h.meta.loggedOut || !h.meta.closed {
-		t.Error("the web session wasn't logged out")
+	// A local logout: the connection is dropped, but facebook.com's own
+	// "Log out" is never called, so the browser's session stays valid.
+	if !h.meta.closed {
+		t.Error("the connection wasn't dropped")
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("the session folder is still there: %v", err)
