@@ -1,0 +1,18 @@
+/target
+
+# Secrets: your login sessions and downloaded files.
+.env
+.tuimeta/
+
+# The helper's build output and vendored modules (vendor/ is checked in on
+# release branches only, after review).
+/helper/tuimeta-helper
+/helper/tuimeta-helper.exe
+
+# Local AI tool folders: never committed or published.
+/.agents/
+/.claude/
+/skills-lock.json
+
+# Python tools (tools/pty_smoke.py)
+/.venv/
