@@ -89,6 +89,10 @@ func (s *e2eeStore) upgrade(ctx context.Context) error {
 			PRIMARY KEY (chat, sender, id)
 		);
 		CREATE INDEX IF NOT EXISTS tuimeta_e2ee_message_ts ON tuimeta_e2ee_message (chat, ts);
+		CREATE TABLE IF NOT EXISTS tuimeta_e2ee_read (
+			chat       TEXT    NOT NULL PRIMARY KEY,
+			read_up_to INTEGER NOT NULL
+		);
 	`); err != nil {
 		return err
 	}
@@ -134,9 +138,10 @@ func (s *e2eeStore) upgrade(ctx context.Context) error {
 
 func (s *e2eeStore) Close() error { return s.db.Close() }
 
-// clear forgets every kept message (another account's, or none's).
+// clear forgets every kept message and read point (another account's, or
+// none's).
 func (s *e2eeStore) clear(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM tuimeta_e2ee_message`)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM tuimeta_e2ee_message; DELETE FROM tuimeta_e2ee_read`)
 	return err
 }
 
@@ -300,8 +305,41 @@ func (s *e2eeStore) forgetChat(ctx context.Context, user string) error {
 		user+"@"+waTypes.MessengerServer, user+"@"+waTypes.DefaultUserServer, user+"@"+waTypes.GroupServer); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM tuimeta_e2ee_read WHERE chat=?`, user); err != nil {
+		return err
+	}
 	s.checkpoint(ctx)
 	return nil
+}
+
+// setRead records that the chat whose JID's user is user has been read up to
+// ms (unix ms). Messenger's own thread rows never learn of encrypted read
+// receipts, so this is what the next start knows of them; it only moves
+// forward.
+func (s *e2eeStore) setRead(ctx context.Context, user string, ms int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO tuimeta_e2ee_read (chat, read_up_to) VALUES (?, ?)
+		ON CONFLICT (chat) DO UPDATE SET read_up_to=max(read_up_to, excluded.read_up_to)`, user, ms)
+	return err
+}
+
+// reads is how far each chat has been read, by its JID's user.
+func (s *e2eeStore) reads(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT chat, read_up_to FROM tuimeta_e2ee_read`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var user string
+		var ms int64
+		if err := rows.Scan(&user, &ms); err != nil {
+			return nil, err
+		}
+		out[user] = ms
+	}
+	return out, rows.Err()
 }
 
 // checkpoint writes the write-ahead log into the database and empties it,

@@ -183,7 +183,10 @@ or sent since the device was linked are kept there too, the newest 3000 per
 chat: older encrypted history is only in Messenger's PIN-locked backup,
 which neither library can restore, so that's all those chats have. Edits and
 reactions are kept with their message only when they changed it (its newest
-edit, each person's reaction), and don't count toward the 3000. A message
+edit, each person's reaction), and don't count toward the 3000. So is how
+far each encrypted chat has been read, a time per chat: Messenger's own
+thread rows never learn of encrypted read receipts, so without it a chat
+read here would count as unread again at the next start. A message
 unsent goes with its edit, its reactions and what was downloaded of it, and
 the write-ahead log is emptied into the database file; a chat that leaves
 the list (deleted, a message request deleted, a group left) has what's kept

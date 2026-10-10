@@ -161,6 +161,94 @@ func TestAMergedFacebookThreadKeepsItsEncryptedMessages(t *testing.T) {
 	}
 }
 
+func TestAnEncryptedChatReadHereIsStillReadAtTheNextStart(t *testing.T) {
+	h := newHarness(t)
+	gen := h.openKept()
+	h.load()
+	// Messenger's own row for the chat never learns of encrypted receipts:
+	// it goes on saying the chat was read before Alice wrote, and that two
+	// messages are unread.
+	thread := &table.LSDeleteThenInsertThread{
+		ThreadKey: aliceID, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: "inbox",
+		LastActivityTimestampMs: ms(-1), LastReadWatermarkTimestampMs: ms(-10), UnreadMessageCount: 2,
+	}
+	h.apply(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{thread}})
+	h.m.receiveWA(waMsg(jid(aliceID), jid(aliceID), "R1", -3, waText("one"), nil))
+	h.m.receiveWA(waMsg(jid(aliceID), jid(aliceID), "R2", -2, waText("two"), nil))
+	msgs := h.rec.messages()
+	h.m.receiveWA(waMsg(jid(aliceID), jid(selfID), "R3", -1, waText("my answer"), nil))
+	if err := h.m.MarkRead(context.Background(), h.ref(h.chat(aliceID), msgs[len(msgs)-1].ID)); err != nil {
+		t.Fatal(err)
+	}
+	if unread, _, _ := h.readState(aliceID); unread != 0 {
+		t.Fatalf("unread %d after reading", unread)
+	}
+
+	// The store is read back before Messenger's stale row comes again, and
+	// after it.
+	for _, rowFirst := range []bool{false, true} {
+		h.m.mu.Lock()
+		st := h.m.store
+		h.m.store = nil
+		h.m.reset()
+		h.m.self = selfID
+		h.m.ready = true
+		h.m.mu.Unlock()
+		st.Close()
+		h.rec.reset()
+		if rowFirst {
+			h.apply(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{thread}})
+			h.m.openStore(gen)
+		} else {
+			h.m.openStore(gen)
+			h.apply(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{thread}})
+		}
+		h.load()
+		unread, readUpTo, receipted := h.readState(aliceID)
+		if unread != 0 || readUpTo != ms(-2) || receipted != ms(-2) {
+			t.Errorf("row first %v: unread %d, read up to %d, receipted %d; want 0, %d, %d", rowFirst, unread, readUpTo, receipted, ms(-2), ms(-2))
+		}
+		chats := h.rec.chats()
+		if len(chats) == 0 || chats[len(chats)-1].Unread != 0 {
+			t.Errorf("row first %v: tuimeta was told %+v", rowFirst, chats)
+		}
+	}
+	// What's read isn't told again.
+	h.e2ee.reads = nil
+	msgs = h.rec.messages()
+	for _, msg := range msgs {
+		if err := h.m.MarkRead(context.Background(), h.ref(h.chat(aliceID), msg.ID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(h.e2ee.reads) != 0 {
+		t.Errorf("read again: %+v", h.e2ee.reads)
+	}
+}
+
+func TestAnEncryptedChatsReadPointGoesWithTheChat(t *testing.T) {
+	h := newHarness(t)
+	gen := h.openKept()
+	h.load()
+	h.m.receiveWA(waMsg(jid(aliceID), jid(aliceID), "F1", -2, waText("one"), nil))
+	msgs := h.rec.messages()
+	if err := h.m.MarkRead(context.Background(), h.ref(h.chat(aliceID), msgs[0].ID)); err != nil {
+		t.Fatal(err)
+	}
+	h.apply(&table.LSTable{LSDeleteThread: []*table.LSDeleteThread{{ThreadKey: aliceID}}})
+	reads, err := h.kept().reads(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 0 {
+		t.Errorf("the deleted chat's read point is still kept: %v", reads)
+	}
+	h.restart(gen)
+	if c := h.chat(aliceID); c != nil && c.readUpTo != 0 {
+		t.Errorf("the deleted chat came back read up to %d", c.readUpTo)
+	}
+}
+
 func TestAPanicWhileApplyingAnEncryptedMessageLeavesTheBackendUsable(t *testing.T) {
 	h := newHarness(t)
 	gen := h.openKept()

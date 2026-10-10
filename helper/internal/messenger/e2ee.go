@@ -76,6 +76,10 @@ func (m *Messenger) openStore(gen int) {
 	if err != nil {
 		hlog.Error("messenger: can't read the encrypted chats' store", hlog.Kind(err))
 	}
+	reads, err := st.reads(ctx)
+	if err != nil {
+		hlog.Error("messenger: can't read how far encrypted chats were read", hlog.Kind(err))
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.gen != gen || m.store != nil {
@@ -97,6 +101,20 @@ func (m *Messenger) openStore(gen int) {
 	}
 	if rewritten {
 		st.checkpoint(ctx)
+	}
+	// Messenger's thread rows say the chat was read only as far as it was
+	// before any encrypted receipt: how far it was read here, or on another
+	// device that told this one, was kept.
+	for user, ms := range reads {
+		key, err := strconv.ParseInt(user, 10, 64)
+		if err != nil {
+			continue
+		}
+		if c := m.lookupChat(key); c != nil && ms > c.readUpTo {
+			c.readUpTo = ms
+			m.recount(c)
+			m.touch(c)
+		}
 	}
 	for _, c := range m.chats {
 		// Receipts went out for what was read before this run.

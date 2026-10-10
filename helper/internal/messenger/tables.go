@@ -4,8 +4,10 @@ package messenger
 
 import (
 	"cmp"
+	"context"
 	"slices"
 	"strings"
+	"time"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
@@ -544,6 +546,15 @@ func (m *Messenger) readElsewhere(threadKey, ms int64) {
 	}
 	c.readUpTo = ms
 	c.receipted = max(c.receipted, ms)
+	if c.encrypted && m.store != nil {
+		// Messenger won't remember this for an encrypted chat: the next
+		// start reads it back from the store.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := m.store.setRead(ctx, c.netID(), ms); err != nil {
+			hlog.Error("messenger: can't keep how far a chat was read", hlog.Kind(err))
+		}
+		cancel()
+	}
 	m.startTimers(c)
 	m.recount(c)
 	unread := c.unread
