@@ -32,7 +32,7 @@ import (
 )
 
 // Version is the helper's own version, which hello reports.
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, quietStderr))
