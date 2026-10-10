@@ -14,6 +14,7 @@ mod reactions;
 mod search;
 mod service;
 mod settings;
+mod term;
 mod text;
 mod theme;
 mod tmux;
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
     let helper_dir = std::path::absolute(&helper_dir)?;
     let meta = meta::Meta::start(&meta::helper_path()?, &helper_dir, fake, tx).await?;
 
-    let mut terminal = ratatui::init();
+    let mut terminal = term::init();
     // The title shows unread chats while tuimeta runs, then goes back.
     notify::send(notify::SAVE_TITLE);
     notify::send(&notify::title(0));

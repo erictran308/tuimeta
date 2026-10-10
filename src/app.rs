@@ -5,7 +5,6 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use ratatui::DefaultTerminal;
 use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -25,6 +24,7 @@ use crate::notify::{self, Note, Notifications, Notifier};
 use crate::picker::{ChatPicker, Choice};
 use crate::reactions::{self, ReactMenu};
 use crate::settings::{self, Settings, Side};
+use crate::term::Terminal;
 use crate::text;
 use crate::theme::{Colors, Corners, Themes};
 use crate::ui;
@@ -813,7 +813,7 @@ impl App {
 
     pub async fn run(
         mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut Terminal,
         mut events: UnboundedReceiver<MetaEvent>,
         mut image_events: UnboundedReceiver<ImageEvent>,
         mut clipboard: UnboundedReceiver<ClipboardEvent>,
