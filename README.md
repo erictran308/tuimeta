@@ -129,6 +129,10 @@ The log never holds what people wrote, their names, or your cookies.
 
 `?` → Settings picks one of the built-in themes. Your own go in the `themes` folder of the data folder, as TOML: see [tuigram's README](https://github.com/erictran308/tuigram#themes) for the format, which is the same.
 
+Panes and popups have round corners. In terminals whose font can't draw them (the Linux console, the old Windows console), they're square instead. If they look broken in yours, turn off **Round corners** in `?` → Settings, or set `corners` in `settings.toml` to `"square"` (or `"rounded"`; the default `"auto"` picks for your terminal).
+
+If your terminal uses a [Nerd Font](https://www.nerdfonts.com), turn on **Round pills** there too (`nerd_font = true`): unread counts, reactions, the tab you're on and the mode in the status bar get round ends. Other fonts show a box for them, so it's off at first.
+
 ## Development
 
 ```sh

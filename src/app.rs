@@ -8,7 +8,6 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use ratatui::style::Style;
-use ratatui::widgets::Block;
 use ratatui_textarea::{DataCursor, TextArea};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, sleep_until};
@@ -28,7 +27,7 @@ use crate::picker::{ChatPicker, Choice};
 use crate::reactions::{self, ReactMenu};
 use crate::settings::{self, Settings, Side};
 use crate::text;
-use crate::theme::{Colors, Themes};
+use crate::theme::{Colors, Corners, Themes};
 use crate::ui;
 use crate::viewer::PhotoView;
 
@@ -128,7 +127,6 @@ pub struct Login {
 impl Login {
     pub fn new(step: LoginStep) -> Self {
         let mut input = TextArea::default();
-        input.set_block(Block::bordered());
         input.set_cursor_line_style(Style::default());
         // Cookies are the whole account: they never show, even while
         // they're pasted.
@@ -337,8 +335,12 @@ impl SettingsMenu {
     pub const LIST_RIGHT: usize = Self::CHAT_GAPS + 1;
     /// The "gap between messages" row.
     pub const BLOCK_GAPS: usize = Self::LIST_RIGHT + 1;
+    /// The "round corners" row.
+    pub const CORNERS: usize = Self::BLOCK_GAPS + 1;
+    /// The "round pills, with a Nerd Font" row.
+    pub const PILLS: usize = Self::CORNERS + 1;
     /// The "Normal mode after sending" row.
-    pub const AFTER_SEND: usize = Self::BLOCK_GAPS + 1;
+    pub const AFTER_SEND: usize = Self::PILLS + 1;
     /// The first theme's row. The themes come last, since the user's own
     /// can make a long list.
     pub const THEMES: usize = Self::AFTER_SEND + 1;
@@ -592,6 +594,8 @@ pub struct App {
     pub themes: Themes,
     /// The colors of the theme in use.
     pub colors: Colors,
+    /// Corners are drawn round (`Settings.corners`, `Auto` decided).
+    pub rounded: bool,
     pub settings_menu: Option<SettingsMenu>,
     /// Shown in the status bar while typing a `/` search or a `:` command.
     pub prompt: Option<Prompt>,
@@ -664,6 +668,7 @@ impl App {
         let notify_with = settings
             .notifications
             .resolve(|name| std::env::var(name).ok());
+        let rounded = settings.corners.rounded(|name| std::env::var(name).ok());
         let mut app = Self {
             meta,
             screen: login_screen(LoginStep::Connecting),
@@ -693,6 +698,7 @@ impl App {
             themes: Themes::load(&settings_path.with_file_name("themes")),
             settings_path,
             colors: Colors::default(),
+            rounded,
             settings_menu: None,
             prompt: None,
             loading_chats: HashSet::new(),
@@ -3375,6 +3381,16 @@ impl App {
                 };
             }
             SettingsMenu::BLOCK_GAPS => settings.block_gaps = !settings.block_gaps,
+            SettingsMenu::CORNERS => {
+                // Picked for good either way: a terminal the guess got
+                // wrong stays as the user set it.
+                self.rounded = !self.rounded;
+                settings.corners = match self.rounded {
+                    true => Corners::Rounded,
+                    false => Corners::Square,
+                };
+            }
+            SettingsMenu::PILLS => settings.nerd_font = !settings.nerd_font,
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
             _ => return,
         }
@@ -3706,6 +3722,45 @@ mod tests {
     }
 
     #[test]
+    fn the_look_rows_change_only_their_own_settings() {
+        let dir = std::env::temp_dir().join(format!("tuimeta-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let meta = Meta::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(meta, images, &dir);
+        let none = KeyModifiers::NONE;
+        let saved = || Settings::load(&settings::path(&dir)).unwrap();
+        press(&mut app, KeyCode::Char('?'), none);
+        press(&mut app, KeyCode::Tab, none);
+        // In the order drawn, between the gaps and the composer's rows.
+        let selected = |app: &App| app.settings_menu.as_ref().unwrap().selected;
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::BLOCK_GAPS;
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(selected(&app), SettingsMenu::CORNERS);
+        let rounded = app.rounded;
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(app.rounded, !rounded, "at once");
+        let expected = if rounded {
+            Corners::Square
+        } else {
+            Corners::Rounded
+        };
+        assert_eq!(saved().corners, expected, "kept, whatever the terminal");
+
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(selected(&app), SettingsMenu::PILLS);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(saved().nerd_font);
+        let status = screen(&mut app).pop().unwrap();
+        assert!(status.starts_with("\u{e0b6}NORMAL\u{e0b4}"), "{status}");
+
+        let after = saved();
+        assert!(!after.normal_after_send, "{after:?}");
+        assert!(after.block_gaps, "{after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_chat_list_can_go_on_the_right_where_h_and_l_follow_it() {
         let dir = std::env::temp_dir().join(format!("tuimeta-side-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3715,10 +3770,11 @@ mod tests {
         app.focus = Focus::Chats;
         let none = KeyModifiers::NONE;
         let saved = || Settings::load(&settings::path(&dir)).unwrap();
-        // The text left and right of the first pane's top right corner.
+        // The text left and right of the first pane's top right corner,
+        // round or square as the terminal running the tests has them.
         let halves = |app: &mut App| {
             let top = screen(app).remove(0);
-            let (left, right) = top.split_once('┐').unwrap();
+            let (left, right) = top.split_once(['╮', '┐']).unwrap();
             (left.to_string(), right.to_string())
         };
 
@@ -3735,7 +3791,7 @@ mod tests {
         let (left, right) = halves(&mut app);
         assert!(
             left.contains("Weekend Hike") && right.contains("Chats ("),
-            "{left}┐{right}"
+            "{left}╮{right}"
         );
 
         press(&mut app, KeyCode::Char('l'), none);
@@ -4731,7 +4787,12 @@ mod tests {
         let mut app = crate::demo::demo_app(meta, images, &dir);
         app.focus = Focus::Messages;
         // Where the chat list's top right corner is.
-        let edge = |rows: &[String]| rows[0].chars().position(|c| c == '┐').unwrap();
+        let edge = |rows: &[String]| {
+            rows[0]
+                .chars()
+                .position(|c| matches!(c, '╮' | '┐'))
+                .unwrap()
+        };
         let none = KeyModifiers::NONE;
         assert_eq!(edge(&screen(&mut app)), 34, "35% of 100 columns");
 

@@ -66,7 +66,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
     if list.loading {
         title.push_str("loading… ");
     }
-    let block = Block::bordered()
+    let block = super::bordered(colors)
         .title(title)
         .border_style(border(list.focused, colors));
     let inner = block.inner(area);
@@ -150,7 +150,8 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
                 first.push(Span::from(MUTED).fg(colors.muted));
             }
             first.push(Span::from(" ".repeat(pad)));
-            first.push(badge);
+            // Its round ends, if any, take the columns its padding did.
+            first.extend(super::pill(badge, Style::new(), colors));
             // Highlighted by hand too, so the blank row below stays blank.
             let row_style = if is_selected {
                 Style::new().bg(colors.selection)
@@ -250,7 +251,11 @@ fn tab_line(tabs: &[Tab], shown: chats::List, width: usize, colors: &Colors) -> 
         } else {
             Style::new().fg(colors.subtle)
         };
-        spans.push(Span::styled(label, style));
+        spans.extend(super::pill(
+            Span::styled(label, style),
+            Style::new(),
+            colors,
+        ));
     }
     if last + 1 < tabs.len() {
         spans.push(Span::from("›").fg(colors.muted));

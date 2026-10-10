@@ -59,7 +59,11 @@ mod messages;
 mod viewer;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let colors = app.colors;
+    let colors = Colors {
+        rounded: app.rounded,
+        pills: app.settings.nerd_font,
+        ..app.colors
+    };
     // The theme's background and text color everywhere; widgets drawn on top
     // only change what they style themselves.
     frame.render_widget(
@@ -175,6 +179,41 @@ impl Widget for Cover {
 /// other way round) can barely be read on.
 fn popup_style(colors: &Colors) -> Style {
     Style::new().fg(colors.fg).bg(colors.popup_bg)
+}
+
+/// A box with a border all round: round corners where the terminal can
+/// draw them (`Colors.rounded`), else square ones.
+pub(crate) fn bordered<'a>(colors: &Colors) -> Block<'a> {
+    Block::bordered().border_type(if colors.rounded {
+        BorderType::Rounded
+    } else {
+        BorderType::Plain
+    })
+}
+
+/// Powerline's half circles, in Nerd Fonts' Private Use Area: the round
+/// left and right ends of a pill.
+const PILL_ENDS: [&str; 2] = ["\u{e0b6}", "\u{e0b4}"];
+
+/// A label on a background of its own, ` like this `, with round ends
+/// where the font has them (`Colors.pills`): the spaces at its ends become
+/// half circles in its background color, so it takes the same columns
+/// either way. `around` is the style of what it sits on, whose background
+/// shows around the ends.
+pub(crate) fn pill(span: Span<'static>, around: Style, colors: &Colors) -> Vec<Span<'static>> {
+    let Some(bg) = span.style.bg.filter(|_| colors.pills) else {
+        return vec![span];
+    };
+    let Some(inner) = span
+        .content
+        .strip_prefix(' ')
+        .and_then(|rest| rest.strip_suffix(' '))
+    else {
+        return vec![span];
+    };
+    let end = |glyph| Span::styled(glyph, around.fg(bg));
+    let inner = Span::styled(inner.to_string(), span.style);
+    vec![end(PILL_ENDS[0]), inner, end(PILL_ENDS[1])]
 }
 
 /// Focused pane gets a bright border.
@@ -306,7 +345,7 @@ fn draw_login(
         _ => 0,
     };
     let area = center(frame.area(), width, LOGIN_ROWS + help_rows + body_rows);
-    let block = Block::bordered()
+    let block = bordered(colors)
         .title(" Log in ")
         .title_alignment(Alignment::Center)
         .border_style(Style::new().fg(colors.accent));
@@ -434,7 +473,11 @@ fn draw_login(
             frame.render_widget(Paragraph::new(lines), body);
         }
         (LoginStep::Cookies { .. }, _) | (_, Some(LinkBody::Typing)) => {
-            frame.render_widget(&login.input, body)
+            // The box is drawn here, not kept in the text area, so its
+            // corners follow the setting.
+            let field = bordered(colors);
+            frame.render_widget(&login.input, field.inner(body));
+            frame.render_widget(field, body);
         }
         (_, Some(LinkBody::Waiting)) => {
             let waiting = if login.busy {
@@ -607,7 +650,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             Paragraph::new("Press Enter to open a chat")
                 .fg(colors.muted)
                 .centered()
-                .block(Block::bordered().border_style(border(false, colors))),
+                .block(bordered(colors).border_style(border(false, colors))),
             chat_area,
         ),
     }
@@ -675,8 +718,7 @@ fn draw_toast(frame: &mut Frame, toast: &Toast, colors: &Colors) {
         width,
         height,
     };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
+    let block = bordered(colors)
         .border_style(Style::new().fg(colors.success))
         .style(popup_style(colors));
     let inner_width = (block.inner(rect).width as usize).saturating_sub(3);
@@ -749,8 +791,7 @@ fn draw_suggestions(frame: &mut Frame, composer: Rect, completion: &Completion, 
         width,
         height,
     };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
+    let block = bordered(colors)
         .title_bottom(
             Line::from(hint_spans(
                 " `Tab` insert ",
@@ -1116,18 +1157,21 @@ fn draw_settings(
     let popup = center(area, width, height);
     let tab = |label: &'static str, active: bool| {
         if active {
-            Span::from(label).fg(colors.bg).bg(colors.accent).bold()
+            pill(
+                Span::from(label).fg(colors.bg).bg(colors.accent).bold(),
+                Style::new(),
+                colors,
+            )
         } else {
-            Span::from(label).fg(colors.muted)
+            vec![Span::from(label).fg(colors.muted)]
         }
     };
-    let tabs = Line::from(vec![
-        Span::from(" "),
-        tab(" Shortcuts ", menu.tab == HelpTab::Shortcuts),
-        Span::from(" "),
-        tab(" Settings ", menu.tab == HelpTab::Settings),
-        Span::from(" "),
-    ]);
+    let mut tabs = vec![Span::from(" ")];
+    tabs.extend(tab(" Shortcuts ", menu.tab == HelpTab::Shortcuts));
+    tabs.push(Span::from(" "));
+    tabs.extend(tab(" Settings ", menu.tab == HelpTab::Settings));
+    tabs.push(Span::from(" "));
+    let tabs = Line::from(tabs);
     let keys = match menu.tab {
         HelpTab::Shortcuts => " `j/k` scroll · `Tab` settings · `Esc` close ",
         HelpTab::Settings if menu.selected >= SettingsMenu::THEMES => {
@@ -1199,6 +1243,20 @@ fn draw_settings(
         SettingsMenu::BLOCK_GAPS,
         check(settings.block_gaps),
         "A gap between messages in a row from one person",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Look"));
+    add(
+        &mut lines,
+        SettingsMenu::CORNERS,
+        check(colors.rounded),
+        "Round corners (turn off if they look broken)",
+    );
+    add(
+        &mut lines,
+        SettingsMenu::PILLS,
+        check(colors.pills),
+        "Round pills (needs a Nerd Font)",
     );
     lines.push(Line::default());
     lines.push(heading(" Composer"));
@@ -1313,7 +1371,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, colors: &Color
 }
 
 fn popup_block<'a>(title: impl Into<Line<'a>>, keys: &'a str, colors: &Colors) -> Block<'a> {
-    Block::bordered()
+    bordered(colors)
         .title(title)
         .title_bottom(
             Line::from(hint_spans(keys, Style::new().fg(colors.muted), colors)).right_aligned(),
@@ -1414,7 +1472,7 @@ fn draw_composer(
     colors: &Colors,
 ) {
     // Text starts a column in, in line with the message bubbles above.
-    let mut block = Block::bordered()
+    let mut block = bordered(colors)
         .border_style(border(insert, colors))
         .padding(Padding::horizontal(1));
     // Where it matters most what kind of chat it is: what you write is
@@ -1680,7 +1738,8 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         Constraint::Length(hints.width() as u16),
     ])
     .areas(area);
-    frame.render_widget(Span::from(label).fg(colors.bg).bg(color).bold(), mode);
+    let label = Span::from(label).fg(colors.bg).bg(color).bold();
+    frame.render_widget(Line::from(pill(label, Style::new(), colors)), mode);
     frame.render_widget(Span::from(prefix), slash);
     frame.render_widget(&prompt.input, input);
     frame.render_widget(hints.right_aligned(), keys);
@@ -1744,7 +1803,7 @@ fn draw_commands(
         width,
         height,
     };
-    let block = Block::bordered()
+    let block = bordered(colors)
         .title(title)
         .border_style(Style::new().fg(colors.accent))
         .style(popup_style(colors));
@@ -1788,7 +1847,7 @@ fn draw_completions(frame: &mut Frame, area: Rect, names: &[String], colors: &Co
         width,
         height,
     };
-    let block = Block::bordered()
+    let block = bordered(colors)
         .title(title)
         .border_style(Style::new().fg(colors.accent))
         .style(popup_style(colors));
@@ -1941,7 +2000,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         Some(open) if app.focus == Focus::Messages && !popup => jump_hints(open, &app.jumps),
         _ => Vec::new(),
     };
-    let mut spans = vec![mode.bold()];
+    let mut spans = pill(mode.bold(), Style::new(), colors);
     let muted = Style::new().fg(colors.muted);
     if context.is_empty() {
         spans.extend(hint_spans(&hints, muted, colors));
@@ -2060,6 +2119,31 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn pills_get_round_ends_only_with_a_nerd_font_and_keep_their_width() {
+        let off = Colors::default();
+        let on = Colors { pills: true, ..off };
+        let count = || Span::from(" 12 ").fg(off.bg).bg(off.primary);
+        assert_eq!(pill(count(), Style::new(), &off), vec![count()]);
+
+        let around = Style::new().bg(off.other_bubble);
+        let ends = pill(count(), around, &on);
+        let text: String = ends.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "\u{e0b6}12\u{e0b4}");
+        assert_eq!(text.width(), " 12 ".width(), "the same columns");
+        assert_eq!(ends[1].style, count().style);
+        for end in [&ends[0], &ends[2]] {
+            assert_eq!(end.style.fg, Some(off.primary));
+            assert_eq!(end.style.bg, Some(off.other_bubble), "on what's around");
+        }
+
+        // Only a padded label on a background of its own.
+        let plain = Span::from(" 12 ").fg(off.fg);
+        assert_eq!(pill(plain.clone(), Style::new(), &on), vec![plain]);
+        let tight = Span::from("12").bg(off.primary);
+        assert_eq!(pill(tight.clone(), Style::new(), &on), vec![tight]);
     }
 
     #[test]

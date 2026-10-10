@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
@@ -169,7 +169,7 @@ pub fn draw(
         title.push(Span::from("· loading… "));
     }
     let border = super::border(focused, colors);
-    let block = Block::bordered()
+    let block = super::bordered(colors)
         .title(Line::from(title))
         .border_style(border);
     let inner = block.inner(area);
@@ -1247,10 +1247,9 @@ impl<'a> Bubble<'a> {
                 if j > 0 {
                     spans.push(Span::styled(" ".repeat(CHIP_GAP), style));
                 }
-                spans.push(Span::styled(
-                    format!(" {} ", chip.label),
-                    chip_style(chip.chosen),
-                ));
+                // On the bubble: its background shows around round ends.
+                let chip = Span::styled(format!(" {} ", chip.label), chip_style(chip.chosen));
+                spans.extend(super::pill(chip, style, colors));
             }
             if i + 1 == count
                 && meta_at == MetaAt::Reactions
@@ -1480,6 +1479,16 @@ mod tests {
         focused: bool,
         images: &mut Images,
     ) -> ratatui::buffer::Buffer {
+        render_colored(open, chats, focused, images, &Colors::default())
+    }
+
+    fn render_colored(
+        open: &mut OpenChat,
+        chats: &Chats,
+        focused: bool,
+        images: &mut Images,
+        colors: &Colors,
+    ) -> ratatui::buffer::Buffer {
         let users = HashMap::new();
         let names = Names {
             users: &users,
@@ -1496,7 +1505,7 @@ mod tests {
                     images,
                     focused,
                     false,
-                    &Colors::default(),
+                    colors,
                     Settings::default().block_gaps,
                 )
             })
@@ -2472,6 +2481,44 @@ mod tests {
             count,
             chosen,
         }
+    }
+
+    #[test]
+    fn reactions_get_round_ends_with_a_nerd_font_in_the_same_columns() {
+        let mut open = sample();
+        open.messages.get_mut(&1).unwrap().reactions = vec![reaction("👍", 3, true)];
+        let draw = |open: &mut OpenChat, pills| {
+            let colors = Colors {
+                pills,
+                ..Colors::default()
+            };
+            render_colored(open, &Chats::default(), false, &mut images(), &colors)
+        };
+        let text = |buf: &ratatui::buffer::Buffer| -> Vec<String> {
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect()
+        };
+        let (plain, round) = (draw(&mut open, false), draw(&mut open, true));
+        let y = text(&plain).iter().position(|r| r.contains('👍')).unwrap() as u16;
+        let thumbs = (0..plain.area.width)
+            .find(|&x| plain[(x, y)].symbol() == "👍")
+            .unwrap();
+        // Where the padding was: the left end, then after "👍 3" the right.
+        let colors = Colors::default();
+        let (left, right) = (&round[(thumbs - 1, y)], &round[(thumbs + 4, y)]);
+        assert_eq!(plain[(thumbs - 1, y)].symbol(), " ");
+        assert_eq!(left.symbol(), "\u{e0b6}");
+        assert_eq!(right.symbol(), "\u{e0b4}");
+        for end in [left, right] {
+            assert_eq!(end.fg, colors.your_reaction, "in the pill's color");
+            assert_eq!(end.bg, colors.other_bubble, "on the bubble");
+        }
+        // Nothing else moves.
+        let (a, b) = (text(&plain), text(&round));
+        let y = usize::from(y);
+        assert_eq!(a[y].width(), b[y].width());
+        assert_eq!(a[..y], b[..y]);
     }
 
     #[test]
