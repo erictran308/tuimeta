@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/erictran308/tuimeta/helper/internal/fsutil"
 )
 
 // MaxSize is how big helper.log grows before it's moved to helper.log.1.
@@ -29,16 +31,16 @@ var (
 )
 
 // Open sends the log to path (0600, appended), starting a new file when the
-// old one is over MaxSize.
+// old one is over MaxSize. A link in its place is refused, not written
+// through.
 func Open(path string) (io.Closer, error) {
-	if info, err := os.Stat(path); err == nil && info.Size() > MaxSize {
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Size() > MaxSize {
 		_ = os.Rename(path, path+".1")
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	f, err := fsutil.OpenPrivate(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE)
 	if err != nil {
 		return nil, err
 	}
-	_ = f.Chmod(0o600)
 	SetOutput(f)
 	return f, nil
 }

@@ -54,8 +54,17 @@ func (b *Instagram) onDelta(conn *connection, d *slidetypes.Delta) {
 	case *slidetypes.AdminMessageEvent:
 		b.onMessage(c, e.Message, !e.SkipBumpThread)
 	case *slidetypes.EditMessageEvent:
+		n := c.msgs[e.MessageID]
+		at := millis(e.SlideEditHistoryEntry.TimestampMS)
+		if n == nil || (at > 0 && at < n.editedMS) {
+			// An edit older than the text shown came late: the newer text
+			// stays, as the connector orders edits by their time. One
+			// without a time can only be taken as it comes.
+			return
+		}
+		n.editedMS = max(n.editedMS, at)
 		// The same text is your own edit coming back, already applied.
-		if n := c.msgs[e.MessageID]; n != nil && n.text != e.TextBody {
+		if n.text != e.TextBody {
 			n.text = e.TextBody
 			n.mentions = nil // their ranges were of the old text
 			n.editCount++
@@ -191,9 +200,11 @@ func (b *Instagram) onMessage(c *chat, m *slidetypes.Message, bump bool) {
 		// which comes as its own update.
 		return
 	}
-	if st := b.sending[n.otid]; n.otid != "" && st != nil && st.chat == c {
+	if st := b.sending[n.otid]; n.otid != "" && st != nil && st.chat == c && n.mine {
 		// The socket confirmed a message being sent before its request
-		// answered: Send reports it, once, as sent.
+		// answered: Send reports it, once, as sent. Only your own message
+		// can be that: someone else's naming the same offline threading id
+		// is an ordinary message.
 		n = b.keep(c, n)
 		b.putLog(c, n)
 		st.got[n.otid] = n

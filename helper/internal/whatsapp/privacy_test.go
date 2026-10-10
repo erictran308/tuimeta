@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,33 @@ func TestReceiptsAndTypingRefuseAnyOtherRequest(t *testing.T) {
 		if err := conn.SendChatPresence(context.Background(), purpose, alicePN, waTypes.ChatPresenceComposing); err != errUnasked {
 			t.Errorf("typing for %q: %v", purpose, err)
 		}
+	}
+}
+
+func TestAReadIsToldToEveryoneOnlyWhenTheSettingSaysSo(t *testing.T) {
+	for setting, want := range map[waTypes.PrivacySetting]waTypes.ReceiptType{
+		waTypes.PrivacySettingAll: waTypes.ReceiptTypeRead, waTypes.PrivacySettingNone: waTypes.ReceiptTypeReadSelf,
+		waTypes.PrivacySettingContacts: waTypes.ReceiptTypeReadSelf, "": waTypes.ReceiptTypeReadSelf,
+	} {
+		if got := receiptKind(&waTypes.PrivacySettings{ReadReceipts: setting}); got != want {
+			t.Errorf("%q: %q", setting, got)
+		}
+	}
+	if receiptKind(nil) != waTypes.ReceiptTypeReadSelf {
+		t.Error("no setting told everyone")
+	}
+	// Each connection asks WhatsApp afresh: whatsmeow's copy may be from
+	// before a change made while this device was offline.
+	h := newHarness(t)
+	conn := newConn(h.wa.real)
+	conn.settled.Store(true)
+	conn.reconnected()
+	if conn.settled.Load() {
+		t.Error("a new connection trusts the setting it had")
+	}
+	// Without the setting, nothing goes.
+	if err := conn.MarkRead(context.Background(), "mark_read", []waTypes.MessageID{"x"}, time.Now(), alicePN, waTypes.EmptyJID); err == nil {
+		t.Error("a read receipt went without the setting")
 	}
 }
 
@@ -113,8 +141,12 @@ func TestTheStoreIsPrivateAndKeepsAtMostThatManyMessagesAChat(t *testing.T) {
 	for i := range MaxStoredPerChat + 5 {
 		many = append(many, &message{ID: "M" + string(rune('a'+i%26)) + strings.Repeat("x", i/26), Sender: "s", MS: int64(i)})
 	}
-	if err := st.putMessages(context.Background(), "chat", many...); err != nil {
+	trimmed, err := st.putMessages(context.Background(), "chat", many...)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(trimmed) != 5 || trimmed[0].MS >= 5 {
+		t.Errorf("the trim says it took %d", len(trimmed))
 	}
 	kept, err := st.messages(context.Background(), "chat")
 	if err != nil || len(kept) != MaxStoredPerChat || kept[0].MS != 5 {
@@ -124,6 +156,44 @@ func TestTheStoreIsPrivateAndKeepsAtMostThatManyMessagesAChat(t *testing.T) {
 		if info, err := os.Stat(path + suffix); err == nil && info.Mode().Perm() != 0o600 {
 			t.Errorf("%s mode %v", suffix, info.Mode())
 		}
+	}
+}
+
+func TestALinkInTheStoresPlaceIsRefusedNotFollowed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("links aren't refused on Windows")
+	}
+	dir := t.TempDir()
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere.db")
+	if err := os.WriteFile(elsewhere, []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(dir, storeFile)
+	if err := os.Symlink(elsewhere, planted); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := openStore(context.Background(), planted); err == nil {
+		st.Close()
+		t.Error("the store was opened through a link")
+	}
+	if data, _ := os.ReadFile(elsewhere); string(data) != "theirs" {
+		t.Errorf("written through: %q", data)
+	}
+	if info, _ := os.Stat(elsewhere); info.Mode().Perm() != 0o644 {
+		t.Errorf("the link's target was chmodded: %v", info.Mode())
+	}
+	// Nor one pointing at nothing yet: nothing is made where it points.
+	dangling := filepath.Join(t.TempDir(), storeFile)
+	nowhere := filepath.Join(dir, "nothing-yet")
+	if err := os.Symlink(nowhere, dangling); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := openStore(context.Background(), dangling); err == nil {
+		st.Close()
+		t.Error("the store was opened through a dangling link")
+	}
+	if _, err := os.Lstat(nowhere); !os.IsNotExist(err) {
+		t.Error("a file was made where the dangling link pointed")
 	}
 }
 

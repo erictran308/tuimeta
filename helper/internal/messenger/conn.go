@@ -28,6 +28,7 @@ import (
 	gproto "google.golang.org/protobuf/proto"
 
 	"github.com/erictran308/tuimeta/helper/internal/browser"
+	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
 // The libraries log through zerolog, and at debug and trace levels they log
@@ -146,12 +147,17 @@ func dropCookie(name string) bool { return name == "presence" }
 // e2eeAPI is what the backend uses of the encrypted chats' connection. There
 // is deliberately no way to set a presence through it: whatsmeow's
 // SendPresence, SubscribePresence and SetForceActiveDeliveryReceipts aren't
-// reachable. SendChatPresence is typing, sent only from SetTyping.
+// reachable. MarkRead and MarkReadSelf are read receipts, the second of the
+// kind only your own devices act on, and SendChatPresence is typing: each
+// takes the request it's for and refuses any but "mark_read" or "typing",
+// which only MarkRead and SetTyping pass. Attachments are downloaded into a
+// file the caller caps, never whole into memory.
 type e2eeAPI interface {
 	SendFBMessage(ctx context.Context, to waTypes.JID, msg armadillo.RealMessageApplicationSub, meta *waMsgApplication.MessageApplication_Metadata, extra whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
-	MarkRead(ctx context.Context, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error
-	SendChatPresence(ctx context.Context, chat waTypes.JID, state waTypes.ChatPresence, media waTypes.ChatPresenceMedia) error
-	DownloadFB(ctx context.Context, transport *waMediaTransport.WAMediaTransport_Integral, mediaType whatsmeow.MediaType) ([]byte, error)
+	MarkRead(ctx context.Context, purpose string, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error
+	MarkReadSelf(ctx context.Context, purpose string, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error
+	SendChatPresence(ctx context.Context, purpose string, chat waTypes.JID, state waTypes.ChatPresence, media waTypes.ChatPresenceMedia) error
+	DownloadFBToFile(ctx context.Context, transport *waMediaTransport.WAMediaTransport_Integral, mediaType whatsmeow.MediaType, file whatsmeow.File) error
 	Upload(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	GetGroupInfo(ctx context.Context, jid waTypes.JID) (*waTypes.GroupInfo, error)
 	OwnJID() waTypes.JID
@@ -165,16 +171,32 @@ func (c *e2eeConn) SendFBMessage(ctx context.Context, to waTypes.JID, msg armadi
 	return c.cli.SendFBMessage(ctx, to, msg, meta, extra)
 }
 
-func (c *e2eeConn) MarkRead(ctx context.Context, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error {
+// errUnasked stops a read receipt or a typing notice no request asked for.
+var errUnasked = proto.Err(proto.Internal, "Something was about to tell people about you unasked; it was stopped.")
+
+func (c *e2eeConn) MarkRead(ctx context.Context, purpose string, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error {
+	if purpose != "mark_read" {
+		return errUnasked
+	}
 	return c.cli.MarkRead(ctx, ids, at, chat, sender)
 }
 
-func (c *e2eeConn) SendChatPresence(ctx context.Context, chat waTypes.JID, state waTypes.ChatPresence, media waTypes.ChatPresenceMedia) error {
+func (c *e2eeConn) MarkReadSelf(ctx context.Context, purpose string, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error {
+	if purpose != "mark_read" {
+		return errUnasked
+	}
+	return c.cli.MarkRead(ctx, ids, at, chat, sender, waTypes.ReceiptTypeReadSelf)
+}
+
+func (c *e2eeConn) SendChatPresence(ctx context.Context, purpose string, chat waTypes.JID, state waTypes.ChatPresence, media waTypes.ChatPresenceMedia) error {
+	if purpose != "typing" {
+		return errUnasked
+	}
 	return c.cli.SendChatPresence(ctx, chat, state, media)
 }
 
-func (c *e2eeConn) DownloadFB(ctx context.Context, transport *waMediaTransport.WAMediaTransport_Integral, mediaType whatsmeow.MediaType) ([]byte, error) {
-	return c.cli.DownloadFB(ctx, transport, mediaType)
+func (c *e2eeConn) DownloadFBToFile(ctx context.Context, transport *waMediaTransport.WAMediaTransport_Integral, mediaType whatsmeow.MediaType, file whatsmeow.File) error {
+	return c.cli.DownloadFBToFile(ctx, transport, mediaType, file)
 }
 
 func (c *e2eeConn) Upload(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {

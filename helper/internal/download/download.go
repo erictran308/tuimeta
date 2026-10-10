@@ -95,9 +95,16 @@ func (m *Manager) removeLeftovers() {
 	}
 }
 
-// Remove deletes a downloaded file, once what it came with is gone (a
-// message deleted, or disappeared). Nothing happens if it isn't on disk.
+// Remove deletes a downloaded file once what it came with is gone (a
+// message deleted, or disappeared), and ends its downloads: its id is
+// forgotten, so it can't be asked for again, a queued download is dropped
+// and a running one stopped before it saves anything.
 func (m *Manager) Remove(ref ids.FileRef) {
+	m.mu.Lock()
+	if id, ok := m.files.Forget(ref.Network, ref.Key); ok {
+		m.drop(id)
+	}
+	m.mu.Unlock()
 	for _, path := range m.places(ref) {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			hlog.Warn("can't delete a download", hlog.Kind(err))
@@ -133,12 +140,19 @@ func (m *Manager) places(ref ids.FileRef) []string {
 // Download starts fetching file id (or raises its priority). A file already
 // on disk is reported done at once.
 func (m *Manager) Download(id int32, prio proto.Priority) error {
+	if prio != proto.High {
+		prio = proto.Low
+	}
+	// All under m.mu, which Remove forgets ids under: a file whose message
+	// was deleted is either no_file here, or deleted after this answer.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return proto.Err(proto.Internal, "The helper is quitting.")
+	}
 	ref, ok := m.files.Get(id)
 	if !ok {
 		return proto.ErrNoFile
-	}
-	if prio != proto.High {
-		prio = proto.Low
 	}
 	for _, path := range m.places(ref) {
 		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
@@ -146,11 +160,6 @@ func (m *Manager) Download(id int32, prio proto.Priority) error {
 			m.emit(proto.File{ID: id, Size: size, Downloaded: size, Done: true, Path: &path})
 			return nil
 		}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.closed {
-		return proto.Err(proto.Internal, "The helper is quitting.")
 	}
 	if j := m.jobs[id]; j != nil {
 		if prio == proto.High && j.prio == proto.Low && !j.running {
@@ -262,6 +271,12 @@ func (m *Manager) save(ctx context.Context, ref ids.FileRef) (string, int64, err
 	if err := os.Rename(tmp, path); err != nil {
 		return "", 0, err
 	}
+	// Removed (or the helper quitting) between the check above and the
+	// rename: what was saved goes, rather than outliving its message.
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(path)
+		return "", 0, err
+	}
 	return path, pw.n, nil
 }
 
@@ -301,24 +316,34 @@ func (p *progress) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Forget cancels the network's downloads and deletes its saved files
-// (logout).
+// Forget cancels the network's downloads, forgets its file ids and deletes
+// its saved files (logout).
 func (m *Manager) Forget(n proto.Network) error {
 	m.mu.Lock()
 	for id, j := range m.jobs {
-		if j.ref.Network != n {
-			continue
-		}
-		if j.running {
-			j.cancel()
-		} else {
-			delete(m.jobs, id)
-			m.high = slices.DeleteFunc(m.high, func(x int32) bool { return x == id })
-			m.low = slices.DeleteFunc(m.low, func(x int32) bool { return x == id })
+		if j.ref.Network == n {
+			m.drop(id)
 		}
 	}
+	m.files.ForgetNetwork(n)
 	m.mu.Unlock()
 	return os.RemoveAll(filepath.Join(m.dir, string(n)))
+}
+
+// drop ends file id's download: a queued one is taken off the queue, a
+// running one cancelled (its worker then deletes the job); m.mu is held.
+func (m *Manager) drop(id int32) {
+	j := m.jobs[id]
+	if j == nil {
+		return
+	}
+	if j.running {
+		j.cancel()
+		return
+	}
+	delete(m.jobs, id)
+	m.high = slices.DeleteFunc(m.high, func(x int32) bool { return x == id })
+	m.low = slices.DeleteFunc(m.low, func(x int32) bool { return x == id })
 }
 
 // Close stops every download, waiting at most wait for them to end.
@@ -338,15 +363,34 @@ func (m *Manager) Close(wait time.Duration) {
 
 var extensions = map[string]string{
 	"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp",
-	"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
-	"audio/mp4": "m4a", "audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/aac": "aac",
+	"image/heic": "heic", "image/heif": "heif", "image/avif": "avif", "image/bmp": "bmp", "image/tiff": "tiff",
+	"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/3gpp": "3gp", "video/x-matroska": "mkv",
+	"audio/mp4": "m4a", "audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/aac": "aac", "audio/amr": "amr",
+	"audio/wav": "wav", "audio/x-wav": "wav", "audio/flac": "flac",
 	"application/pdf": "pdf", "text/plain": "txt", "application/zip": "zip",
+}
+
+// isMedia reports whether mime is a picture's, a video's or a recording's.
+func isMedia(mime string) bool {
+	return strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "video/") || strings.HasPrefix(mime, "audio/")
+}
+
+// mediaExtension reports whether ext is one a picture, video or recording
+// is saved under.
+func mediaExtension(ext string) bool {
+	for mime, e := range extensions {
+		if isMedia(mime) && sameType(ext, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // SafeName makes a name a sender chose fit for a file name: its last path
 // element only, letters, digits, '.', '-' and '_' (others become '_'), not
 // starting with a dot, at most 60 bytes, with an extension from mime when it
-// has none.
+// has none. A picture, video or recording is always saved under a media
+// extension: its type's, or "bin" for a type without one.
 func SafeName(name, mime string) string {
 	name = name[strings.LastIndexAny(name, `/\`)+1:]
 	var b strings.Builder
@@ -371,11 +415,13 @@ func SafeName(name, mime string) string {
 	switch {
 	case ext == "" || len(ext) > 8:
 		stem, ext = name, mimeExt
-	case mimeExt != "" && !sameType(strings.ToLower(ext), mimeExt) &&
-		(strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "video/") || strings.HasPrefix(mime, "audio/")):
+	case mimeExt != "" && !sameType(strings.ToLower(ext), mimeExt) && isMedia(mime):
 		// A picture, video or recording keeps its type's extension, so one
 		// named "x.command" can't open as something else.
 		stem, ext = name, mimeExt
+	case mimeExt == "" && isMedia(mime) && !mediaExtension(strings.ToLower(ext)):
+		// Nor can one of a type without an extension here.
+		stem, ext = name, ""
 	}
 	if ext == "" {
 		ext = "bin"

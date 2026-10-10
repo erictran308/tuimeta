@@ -3,6 +3,9 @@
 package metatext
 
 import (
+	"cmp"
+	"math"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"testing"
@@ -164,5 +167,118 @@ func TestAMentionCuttingAnEmojiInHalfTakesTheWholeEmoji(t *testing.T) {
 	text, ents = ParseWithMentions("*😀x* y", []Mention{{Offset: 2, Length: 1, UserID: 3}})
 	if text != "😀x y" || !utf8.ValidString(text) || len(ents) != 2 {
 		t.Errorf("with formatting: %q %+v", text, ents)
+	}
+}
+
+func TestAMentionLongerThanAnyTextStopsAtItsEnd(t *testing.T) {
+	// "hi @Bob" is 7 units long. A length so long that offset plus length
+	// passes the largest int must neither wrap round nor be read past the
+	// text: the mention runs to the end.
+	for _, m := range []Mention{
+		{Offset: 1, Length: math.MaxInt, UserID: 1},
+		{Offset: 2, Length: math.MaxInt - 1, UserID: 1},
+		{Offset: 3, Length: math.MaxInt, UserID: 1},
+		{Offset: 6, Length: math.MaxInt - 5, UserID: 1},
+	} {
+		text, ents := ParseWithMentions("hi @Bob", []Mention{m})
+		want := proto.Entity{Offset: m.Offset, Length: 7 - m.Offset, Type: proto.Mention, UserID: 1}
+		if text != "hi @Bob" || len(ents) != 1 || ents[0] != want {
+			t.Errorf("%+v: %q %+v, want %+v", m, text, ents, want)
+		}
+	}
+}
+
+// slowParseWithMentions puts the mentions back as the parser first did, one
+// at a time with a search of the whole text each, kept to check the one-pass
+// way gives the same text and entities.
+func slowParseWithMentions(text string, mentions []Mention) (string, []proto.Entity) {
+	marked, held := hold(text, mentions)
+	marked = strings.ReplaceAll(marked, "\r", "")
+	ranges := parseFormatting(marked)
+	slices.SortStableFunc(ranges, func(a, b formatRange) int { return cmp.Compare(a.start, b.start) })
+	var out strings.Builder
+	var spans []span
+	prevEnd := 0
+	for _, r := range ranges {
+		if r.start < prevEnd {
+			continue
+		}
+		out.WriteString(marked[prevEnd:r.start])
+		body := r.text
+		block := r.format == codeBlock || r.format == blockQuote
+		if block && r.end == len(marked) {
+			body = strings.TrimSuffix(body, "\n")
+		}
+		start := out.Len()
+		out.WriteString(body)
+		end := out.Len()
+		if block {
+			end = start + len(strings.TrimRight(body, "\n"))
+		}
+		if end > start {
+			spans = append(spans, span{start, end, r.format.entity(), 0})
+		}
+		prevEnd = r.end
+	}
+	out.WriteString(marked[prevEnd:])
+	plain := out.String()
+	for _, h := range held {
+		at := strings.Index(plain, h.placeholder)
+		if at < 0 {
+			continue
+		}
+		delta := len(h.text) - len(h.placeholder)
+		phEnd := at + len(h.placeholder)
+		plain = plain[:at] + h.text + plain[phEnd:]
+		for i := range spans {
+			if spans[i].start >= phEnd {
+				spans[i].start += delta
+			}
+			if spans[i].end >= phEnd {
+				spans[i].end += delta
+			}
+		}
+		if h.userID > 0 && h.text != "" {
+			spans = append(spans, span{at, at + len(h.text), proto.Mention, h.userID})
+		}
+	}
+	slices.SortStableFunc(spans, func(a, b span) int { return cmp.Compare(a.start, b.start) })
+	var ents []proto.Entity
+	at, units := 0, 0
+	for _, s := range spans {
+		start := min(max(s.start, 0), len(plain))
+		end := min(max(s.end, start), len(plain))
+		if start > at {
+			units += proto.UTF16Len(plain[at:start])
+			at = start
+		}
+		n := proto.UTF16Len(plain[start:end])
+		if n == 0 {
+			continue
+		}
+		ents = append(ents, proto.Entity{Offset: units, Length: n, Type: s.typ, UserID: s.user})
+	}
+	return plain, ents
+}
+
+func TestMentionsArePutBackAsTheyFirstWere(t *testing.T) {
+	alphabet := []string{"*", "_", "~", "`", "```", ">>>", "<<<", "> ", "a", "Bob", " ", "\n", "\r", "go", "😀", "é", "(", ".", "@"}
+	rng := rand.New(rand.NewPCG(9, 10))
+	for range 20000 {
+		var b strings.Builder
+		for range rng.IntN(30) {
+			b.WriteString(alphabet[rng.IntN(len(alphabet))])
+		}
+		text := b.String()
+		units := proto.UTF16Len(text)
+		var ms []Mention
+		for range rng.IntN(6) {
+			ms = append(ms, Mention{Offset: rng.IntN(units+2) - 1, Length: rng.IntN(8) - 1, UserID: int64(rng.IntN(3))})
+		}
+		gotText, got := ParseWithMentions(text, ms)
+		wantText, want := slowParseWithMentions(text, ms)
+		if gotText != wantText || !slices.Equal(got, want) {
+			t.Fatalf("%q with %+v: got %q %+v, want %q %+v", text, ms, gotText, got, wantText, want)
+		}
 	}
 }

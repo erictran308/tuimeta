@@ -7,15 +7,25 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
+	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
 // MaxLine is the longest request line read; a longer one is skipped and
 // answered bad_request.
 const MaxLine = 16 << 20
+
+// MaxOutLine is the longest line the helper writes (PROTOCOL.md): tuimeta
+// reads lines of up to 16 MiB, and a longer one costs it the request it
+// answers. An answer that would be longer is sent as an internal error for
+// its id instead, and an event is dropped.
+const MaxOutLine = 8 << 20
+
+var errTooLong = proto.Err(proto.Internal, "That answer was too big to send to tuimeta.")
 
 // writer is the one goroutine that writes stdout, so lines never mix. It
 // writes in batches, calling before (which keeps new ids on disk) once per
@@ -60,6 +70,15 @@ func encode(v any) ([]byte, error) {
 // and drops the line once the writer has stopped.
 func (wr *writer) send(v any) {
 	line, err := encode(v)
+	if err == nil && len(line) > MaxOutLine {
+		r, answer := v.(response)
+		if !answer {
+			hlog.Warn("dropped an event too long for tuimeta", hlog.Str("type", fmt.Sprintf("%T", v)), hlog.Int("bytes", int64(len(line))))
+			return
+		}
+		hlog.Warn("an answer too long for tuimeta became an error", hlog.Int("bytes", int64(len(line))))
+		line, err = encode(response{ID: r.ID, Error: errTooLong})
+	}
 	if err != nil {
 		hlog.Error("can't encode a line", hlog.Kind(err))
 		return

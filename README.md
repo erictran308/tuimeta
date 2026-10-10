@@ -28,9 +28,9 @@ The same app as [tuigram](https://github.com/erictran308/tuigram), for Meta's me
 - **Replies, edits, unsend.** `r` replies, `gd` jumps to what a reply answers, `e` edits your message while the network allows, `d` unsends it.
 - **Send files.** `a` attaches a file by path, `p` or `Ctrl-v` pastes copied files or an image, and dropping files on the window attaches them.
 - **Find anyone.** `s` searches your chats, and the networks for people to start a chat with (on WhatsApp, your contacts, or any number on WhatsApp typed with `+` and its country code).
-- **Privacy first.** Read receipts go out only when you're actually looking at the newest message, typing only while you type, and tuimeta never sets an "active now" or "online" status (so on WhatsApp it never moves your last seen, and you'll rarely see others typing: WhatsApp tells only devices that say they're online). (Instagram works out "Active now" on its own servers and may count tuimeta's connection: turn off Activity Status in Instagram's settings to be sure.) Links that hide where they go, and files that could run code, ask before opening.
+- **Privacy first.** Read receipts go out only when you're actually looking at the newest message, and never for a message request you haven't accepted; typing only while you type, and tuimeta never sets an "active now" or "online" status (so on WhatsApp it never moves your last seen, and you'll rarely see others typing: WhatsApp tells only devices that say they're online). (Instagram works out "Active now" on its own servers and may count tuimeta's connection: turn off Activity Status in Instagram's settings to be sure.) Links that hide where they go or whose address can pass for another site's, and files that could run code, ask before opening. A file you attach goes only if it's still the file the composer listed.
 
-**What tuigram has that tuimeta doesn't**, because Meta's messengers don't have it, or tuimeta can't reach it yet: secret chats with timers (Messenger's encryption is per chat instead, and WhatsApp's disappearing-messages timer is set on the phone), forum topics, bots' buttons, polls and locations (shown as `[Poll]` and `[Location]`), stickers to send, calls, pinned messages, voice messages played in the terminal (they open in your player), searching a chat's history, forwarding, and folders.
+**What tuigram has that tuimeta doesn't**, because Meta's messengers don't have it, or tuimeta can't reach it yet: secret chats with timers (Messenger's encryption is per chat instead, and the disappearing-messages timer of WhatsApp chats and Messenger's encrypted ones is set on the phone, though messages still disappear here when it says), forum topics, bots' buttons, polls and locations (shown as `[Poll]` and `[Location]`), stickers to send, calls, pinned messages, voice messages played in the terminal (they open in your player), searching a chat's history, forwarding, and folders.
 
 ## Get started
 
@@ -121,7 +121,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 
 ## Your data
 
-Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers; disappearing messages are deleted when their time is up. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it.
+Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it, to a folder only you can change: on Windows, one inside your user folder): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received, the newest 3000 per chat (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers. In both, disappearing messages are deleted when their time is up. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it, and `helper/ids.json.bad`, a list of ids the helper set aside as unreadable, which may hold any network's.
 
 The log never holds what people wrote, their names, or your cookies.
 
@@ -142,7 +142,7 @@ cargo clippy --all-targets
 cargo run -- --fake         # needs target/debug/tuimeta-helper (see helper/README.md)
 ```
 
-Never point a development build at your real account to try a change: `--fake` and `--demo` exist for that. `helper/PROTOCOL.md` is the contract between the two programs.
+Never point a development build at your real account to try a change: `--fake` and `--demo` exist for that. Development builds also read `TM_*` settings from a `.env` in the repository's root (see `.env.example`; `TM_HELPER` must be an absolute path), never from the folder they're run in; release builds read no `.env`. `helper/PROTOCOL.md` is the contract between the two programs.
 
 ## Disclaimer
 

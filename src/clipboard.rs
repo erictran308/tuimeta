@@ -192,7 +192,25 @@ fn private_folder(path: &Path) -> std::io::Result<()> {
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(path)
+    builder.create(path)?;
+    // One that was there already keeps its own mode and owner: it must be a
+    // folder of yours, not a link, and only you may read it, as the data
+    // folder is checked on every start.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::symlink_metadata(path)?;
+        // SAFETY: geteuid can't fail and touches no memory.
+        let me = unsafe { libc::geteuid() };
+        if !meta.is_dir() || meta.uid() != me {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the outbox isn't a folder of yours",
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// A new file only you can read. Never one that's there already, or a link.
@@ -267,6 +285,38 @@ mod tests {
         clean_outbox(&outbox);
         assert!(path.exists(), "new ones are kept");
         let _ = std::fs::remove_dir_all(&outbox);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_outbox_already_there_is_made_private_and_only_if_it_is_yours() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("tuimeta-test-outbox-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outbox = dir.join("outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::set_permissions(&outbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_folder(&outbox).unwrap();
+        let mode = std::fs::metadata(&outbox).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "readable by you alone");
+
+        // A link in its place, even to a folder of yours, isn't used.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let linked = dir.join("linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        assert!(private_folder(&linked).is_err());
+        assert!(save_image(RgbaImage::new(3, 2), &linked).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        // Nor someone else's folder (checked before anything is changed;
+        // as root, every folder is yours, so there's nothing to check).
+        // SAFETY: geteuid can't fail and touches no memory.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(private_folder(Path::new("/")).is_err());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

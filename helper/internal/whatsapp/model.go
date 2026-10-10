@@ -10,6 +10,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/erictran308/tuimeta/helper/internal/history"
+	"github.com/erictran308/tuimeta/helper/internal/metatext"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
@@ -53,9 +54,10 @@ type chatRow struct {
 	TheirRead    int64          `json:"their_read,omitempty"` // ms: the other side read yours up to here
 	Unread       int            `json:"unread,omitempty"`
 	MarkedUnread bool           `json:"marked_unread,omitempty"`
-	ReadOnly     bool           `json:"read_only,omitempty"` // you can't send (announcements only, or you left)
-	Complete     bool           `json:"complete,omitempty"`  // the phone has nothing older
-	Ephemeral    uint32         `json:"ephemeral,omitempty"` // the disappearing-messages timer, seconds
+	ReadOnly     bool           `json:"read_only,omitempty"`    // you can't send (announcements only, or you left)
+	Complete     bool           `json:"complete,omitempty"`     // the phone has nothing older
+	Ephemeral    uint32         `json:"ephemeral,omitempty"`    // the disappearing-messages timer, seconds
+	EphemeralAt  int64          `json:"ephemeral_at,omitempty"` // ms: when it was set, as far as is known
 	PictureID    string         `json:"picture,omitempty"`
 	Synced       bool           `json:"synced,omitempty"` // the phone's state of it at linking was taken in
 }
@@ -116,7 +118,20 @@ type message struct {
 	// kind another delivery of the same id may replace.
 	Placeholder bool `json:"placeholder,omitempty"`
 
-	ids []int64 // its protocol ids this run
+	ids    []int64 // its protocol ids this run
+	parsed *parse  // its text as last read (textOf)
+}
+
+// parse is a message's text as read for tuimeta: what was read (its sum:
+// the text with names in place of mentions, and the mentions) and what came
+// of it. A message is shown again after each reaction, and an unopened
+// chat's newest at each load_chats: its text is read again only if it
+// changed.
+type parse struct {
+	sum      [32]byte
+	mentions []metatext.Mention
+	text     string
+	ents     []proto.Entity
 }
 
 // media is a message's attachment, with what whatsmeow needs to download

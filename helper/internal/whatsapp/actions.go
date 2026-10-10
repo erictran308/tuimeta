@@ -66,7 +66,7 @@ func (w *WhatsApp) Send(ctx context.Context, out *backend.Outgoing) error {
 	w.mu.Lock()
 	c, err := w.chatOf(out.Chat.ID)
 	if err == nil && (c.ReadOnly || !sendable(c.jid())) {
-		err = proto.Err(proto.Unsupported, "You can't send messages in this chat.")
+		err = errCantSend
 	}
 	if err != nil {
 		w.mu.Unlock()
@@ -123,6 +123,10 @@ func (w *WhatsApp) Send(ctx context.Context, out *backend.Outgoing) error {
 	w.mu.Unlock()
 	return nil
 }
+
+// errCantSend refuses what would go to a chat tuimeta doesn't send to: one
+// that isn't a person's or a group's (a bot's, say), or one you can't post in.
+var errCantSend = proto.Err(proto.Unsupported, "You can't send messages in this chat.")
 
 // stillHere reports whether c is still the chat by its key: not logged out
 // of, deleted on the phone or merged into another while a request was out;
@@ -189,6 +193,8 @@ func (w *WhatsApp) EditText(ctx context.Context, ref backend.MessageRef, text st
 	c, msg, err := w.messageOf(ref)
 	if err == nil {
 		switch {
+		case !sendable(c.jid()):
+			err = errCantSend
 		case !w.isSelf(msg.Sender):
 			err = proto.Err(proto.BadRequest, "You can only edit your own messages.")
 		case msg.Media != nil || msg.Service != nil || msg.Unsupported != "":
@@ -232,6 +238,8 @@ func (w *WhatsApp) Delete(ctx context.Context, ref backend.MessageRef) error {
 	c, msg, err := w.messageOf(ref)
 	if err == nil {
 		switch {
+		case !sendable(c.jid()):
+			err = errCantSend
 		case !w.isSelf(msg.Sender) || msg.Service != nil:
 			err = proto.Err(proto.BadRequest, "You can only delete your own messages.")
 		case w.now().Unix() > msg.MS/1000+RevokeWindow:
@@ -266,7 +274,11 @@ func (w *WhatsApp) React(ctx context.Context, ref backend.MessageRef, emoji stri
 	}
 	w.mu.Lock()
 	c, msg, err := w.messageOf(ref)
-	if err == nil && msg.Service != nil {
+	switch {
+	case err != nil:
+	case !sendable(c.jid()):
+		err = errCantSend
+	case msg.Service != nil:
 		err = proto.Err(proto.BadRequest, "Events can't be reacted to.")
 	}
 	var jid, sender waTypes.JID
@@ -314,7 +326,12 @@ func (w *WhatsApp) MarkRead(ctx context.Context, ref backend.MessageRef) error {
 	jid := c.jid()
 	group := c.kind == proto.Group
 	bySender := map[waTypes.JID][]waTypes.MessageID{}
-	for _, m := range c.msgs {
+	// A chat tuimeta doesn't send to is read here, and nothing goes to it.
+	unread := c.msgs
+	if !sendable(jid) {
+		unread = nil
+	}
+	for _, m := range unread {
 		if m.MS > upTo || m.MS <= c.ReadUpTo || w.isSelf(m.Sender) || m.Service != nil || strings.HasPrefix(m.ID, "event:") {
 			continue
 		}
@@ -357,6 +374,9 @@ func (w *WhatsApp) SetTyping(ctx context.Context, ref backend.ChatRef, typing bo
 	var jid waTypes.JID
 	if err == nil {
 		jid = c.jid()
+		if !sendable(jid) {
+			err = errCantSend
+		}
 	}
 	w.mu.Unlock()
 	if err != nil {
@@ -381,6 +401,9 @@ func (w *WhatsApp) Mute(ctx context.Context, ref backend.ChatRef, muted bool) er
 	var jid waTypes.JID
 	if err == nil {
 		jid = c.jid()
+		if !sendable(jid) {
+			err = errCantSend
+		}
 	}
 	w.mu.Unlock()
 	if err != nil {

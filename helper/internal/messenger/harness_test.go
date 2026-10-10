@@ -3,8 +3,10 @@
 package messenger
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -208,8 +210,10 @@ type fakeE2EE struct {
 	mu        sync.Mutex
 	sent      []sentFB
 	reads     []readCall
+	selfReads []readCall // read receipts only your own devices act on
 	presences []waTypes.ChatPresence
 	files     map[string][]byte
+	served    int64 // bytes DownloadFBToFile handed over
 	group     *waTypes.GroupInfo
 	failSend  error
 }
@@ -239,28 +243,63 @@ func (f *fakeE2EE) SendFBMessage(_ context.Context, to waTypes.JID, msg armadill
 	return whatsmeow.SendResponse{ID: extra.ID, Timestamp: base.Add(time.Minute)}, nil
 }
 
-func (f *fakeE2EE) MarkRead(_ context.Context, ids []waTypes.MessageID, _ time.Time, chat, sender waTypes.JID) error {
+func (f *fakeE2EE) MarkRead(_ context.Context, purpose string, ids []waTypes.MessageID, _ time.Time, chat, sender waTypes.JID) error {
+	if purpose != "mark_read" {
+		return errUnasked
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads = append(f.reads, readCall{ids, chat, sender})
 	return nil
 }
 
-func (f *fakeE2EE) SendChatPresence(_ context.Context, _ waTypes.JID, state waTypes.ChatPresence, _ waTypes.ChatPresenceMedia) error {
+func (f *fakeE2EE) MarkReadSelf(_ context.Context, purpose string, ids []waTypes.MessageID, _ time.Time, chat, sender waTypes.JID) error {
+	if purpose != "mark_read" {
+		return errUnasked
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.selfReads = append(f.selfReads, readCall{ids, chat, sender})
+	return nil
+}
+
+func (f *fakeE2EE) SendChatPresence(_ context.Context, purpose string, _ waTypes.JID, state waTypes.ChatPresence, _ waTypes.ChatPresenceMedia) error {
+	if purpose != "typing" {
+		return errUnasked
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.presences = append(f.presences, state)
 	return nil
 }
 
-func (f *fakeE2EE) DownloadFB(_ context.Context, t *waMediaTransport.WAMediaTransport_Integral, _ whatsmeow.MediaType) ([]byte, error) {
+// DownloadFBToFile writes the file into file as whatsmeow does, copying
+// what the server sends, and counts what it served.
+func (f *fakeE2EE) DownloadFBToFile(_ context.Context, t *waMediaTransport.WAMediaTransport_Integral, _ whatsmeow.MediaType, file whatsmeow.File) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	data, ok := f.files[t.GetDirectPath()]
+	f.mu.Unlock()
 	if !ok {
-		return nil, errors.New("no such file")
+		return errors.New("no such file")
 	}
-	return data, nil
+	served := &countingReader{r: bytes.NewReader(data)}
+	_, err := io.Copy(file, served)
+	f.mu.Lock()
+	f.served += served.n
+	f.mu.Unlock()
+	return err
+}
+
+// countingReader counts what's read from r.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func (f *fakeE2EE) Upload(_ context.Context, data []byte, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
@@ -308,6 +347,13 @@ func newHarness(t *testing.T) *harness {
 		t.Error("the test tried to connect to Facebook")
 		return errNetwork
 	}
+	// What the backend started in the background (contact lookups waiting
+	// for their budget) ends with the test.
+	t.Cleanup(func() {
+		m.mu.Lock()
+		m.stop()
+		m.mu.Unlock()
+	})
 	h := &harness{t: t, m: m, rec: rec, meta: &fakeMeta{cookies: map[string]string{"c_user": "100001", "xs": "x", "datr": "d"}}, e2ee: &fakeE2EE{files: map[string][]byte{}}, deps: deps, dir: dir}
 	m.mu.Lock()
 	m.meta = h.meta

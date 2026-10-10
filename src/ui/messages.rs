@@ -13,7 +13,7 @@ use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
-use super::truncate;
+use super::{truncate, truncate_start};
 use crate::chats::{Chats, Presence, Seen};
 use crate::images::Images;
 use crate::messages::{
@@ -923,7 +923,9 @@ pub(super) fn thumbnail_cells(photo: &Preview, font: FontSize) -> (u16, u16) {
 /// many rows as the picture is tall.
 fn card_rows(card: &Card, width: usize, image: Option<(u16, u16)>) -> Vec<(String, CardRow)> {
     let width = width.saturating_sub(image.map_or(0, |(cols, _)| usize::from(cols) + 1));
-    let mut rows = vec![(truncate(&card.host, width), CardRow::Host)];
+    // Like a link's Confirm, a long host keeps its end, the domain it
+    // really goes to: only the part a sender made up can be cut.
+    let mut rows = vec![(truncate_start(&card.host, width), CardRow::Host)];
     if !card.title.is_empty() {
         rows.push((truncate(&card.title, width), CardRow::Title));
     }
@@ -943,6 +945,24 @@ fn card_rows(card: &Card, width: usize, image: Option<(u16, u16)>) -> Vec<(Strin
         rows.push((String::new(), CardRow::Description));
     }
     rows
+}
+
+/// A link in at most `max` columns. One too long shows the host it really
+/// goes to, then as much of its path as fits: like a link preview's host,
+/// a long one keeps its end, the domain, and loses only what a sender made
+/// up.
+pub(super) fn link_label(url: &str, max: usize) -> String {
+    if url.width() <= max {
+        return url.to_string();
+    }
+    let Some((host, after)) = crate::messages::link_parts(url) else {
+        return truncate(url, max);
+    };
+    let host = truncate_start(&host, max);
+    match max.saturating_sub(host.width()) {
+        room if room < 2 || after.is_empty() => host,
+        room => format!("{host}{}", truncate(after, room)),
+    }
 }
 
 /// Where a bubble's time goes.
@@ -1371,6 +1391,9 @@ fn line_spans(line: &str, start: usize, paint: &Paint) -> Vec<Span<'static>> {
     }
     cuts.sort_unstable();
     cuts.dedup();
+    // Ranges come from the message's own text, so they fall between its
+    // characters; one that doesn't is no reason to crash.
+    cuts.retain(|&at| line.is_char_boundary(at));
     let inside = |ranges: &[Range<usize>], at: usize| ranges.iter().any(|r| r.contains(&at));
     let mut spans: Vec<Span<'static>> = cuts
         .windows(2)
@@ -2031,6 +2054,23 @@ mod tests {
     }
 
     #[test]
+    fn a_range_that_cuts_a_character_in_two_is_drawn_without_crashing() {
+        let line = "añb🎉";
+        // 2 is inside the ñ, 6 inside the 🎉.
+        let links = std::slice::from_ref(&(2..6)).to_vec();
+        let bold = [Styled {
+            range: 0..2,
+            format: Format {
+                bold: true,
+                ..Format::default()
+            },
+        }];
+        let spans = line_spans(line, 0, &paint(&links, &bold));
+        let drawn: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(drawn, line);
+    }
+
+    #[test]
     fn a_link_preview_sits_under_the_text_with_the_links_real_host() {
         let mut open = OpenChat::new(42);
         let mut m = msg(false, 1_790_000_000, "look https://example.com/a");
@@ -2056,6 +2096,50 @@ mod tests {
         let description = rows.iter().filter(|r| r.contains("▎ word")).count();
         assert_eq!(description, CARD_LINES, "a few lines of it");
         assert!(rows[title + CARD_LINES].contains('…'), "then it stops");
+    }
+
+    #[test]
+    fn a_link_previews_long_host_keeps_the_domain_it_goes_to() {
+        let url = "https://paypal.com.account-security-verification-center.evil.example/signin";
+        let message = crate::messages::tests::meta_message(serde_json::json!({
+            "sender_id": 2, "date": 1_790_000_000, "text": url,
+            "link_preview": {"url": url, "title": "PayPal"}}));
+        let mut open = OpenChat::new(42);
+        open.messages.insert(1, Msg::from(&message));
+        let rows = render(&mut open, false);
+        let host = rows
+            .iter()
+            .find(|r| r.contains("▎ …"))
+            .unwrap_or_else(|| panic!("the host, cut: {rows:#?}"));
+        assert!(host.contains("center.evil.example "), "{host}");
+        assert!(
+            !rows.iter().any(|r| r.contains("▎ paypal.com")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_long_link_in_a_menu_shows_its_real_host_then_its_path() {
+        let url = "https://paypal.com.account-security-verification-center.evil.example/signin";
+        assert_eq!(link_label(url, 100), url, "it fits");
+        let cut = link_label(url, 40);
+        assert!(
+            cut.starts_with('…') && cut.ends_with("center.evil.example") && cut.width() <= 40,
+            "the domain stays: {cut}"
+        );
+        assert_eq!(
+            link_label(url, 69),
+            "paypal.com.account-security-verification-center.evil.example/signin"
+        );
+        assert_eq!(
+            link_label("https://a.example/a/long/path", 16),
+            "a.example/a/lon…"
+        );
+        assert_eq!(
+            link_label("https://bank.com@evil.example/", 12),
+            "evil.example",
+            "where it goes, not what it says first"
+        );
     }
 
     #[test]

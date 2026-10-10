@@ -71,10 +71,12 @@ func (l *linkTry) over() (bool, error) {
 
 // CancelLink ends the waiting link of attempt (any, with 0), unless the
 // phone has already confirmed it. A cancel meant for an older attempt never
-// ends a newer one.
+// ends a newer one, and a link of attempt (or an older one) that comes
+// after its cancel isn't started.
 func (w *WhatsApp) CancelLink(attempt uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.cancelled = max(w.cancelled, attempt)
 	if w.link != nil && (attempt == 0 || w.link.attempt == attempt) {
 		w.link.end(errCancelled, false)
 	}
@@ -93,6 +95,12 @@ func (w *WhatsApp) Link(ctx context.Context, phone string, attempt uint64) error
 		w.mu.Unlock()
 		cancel()
 		return proto.Err(proto.Internal, "The helper is quitting.")
+	}
+	if attempt != 0 && attempt <= w.cancelled {
+		// Given up before it started: nothing is wiped, nothing opened.
+		w.mu.Unlock()
+		cancel()
+		return errCancelled
 	}
 	if w.ready || w.linked() {
 		// A kept device reconnects by itself; linking again would throw it
@@ -127,6 +135,7 @@ func (w *WhatsApp) Link(ctx context.Context, phone string, attempt uint64) error
 	if old != nil {
 		_ = old.Close()
 	}
+	w.keeping.Wait() // an unlinked device's store being opened is closed first
 	if err := w.d.Session.Wipe(); err != nil {
 		hlog.Error("whatsapp: can't wipe session", hlog.Kind(err))
 	}
@@ -165,7 +174,7 @@ func (w *WhatsApp) Link(ctx context.Context, phone string, attempt uint64) error
 		_ = st.Close()
 		return errCancelled
 	}
-	w.st, w.cli = st, &waConn{cli: cli}
+	w.st, w.cli = st, newConn(cli)
 	w.watch(st)
 	w.mu.Unlock()
 

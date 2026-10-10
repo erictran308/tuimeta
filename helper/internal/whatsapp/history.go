@@ -190,11 +190,19 @@ func (w *WhatsApp) sweep(st *waStore) bool {
 	for _, e := range gone {
 		c := w.chats[e.chat]
 		if c == nil {
+			// Kept for a chat that isn't here (a device the phone unlinked
+			// has none): it goes with what was downloaded of it.
+			if e.msg != nil {
+				w.forgetFiles(e.msg)
+			}
 			ctx, cancel := dbCtx()
-			_ = w.st.deleteMessage(ctx, e.chat, e.id)
+			_ = w.st.deleteMessage(ctx, e.chat, e.id, nil)
 			cancel()
+			w.scrub = true
 			continue
 		}
+		// Read in or not (one whose time is up is left out when they're
+		// read in), it goes from tuimeta too, with its files.
 		w.ensureLoaded(c)
 		w.deleted(c, e.id)
 	}

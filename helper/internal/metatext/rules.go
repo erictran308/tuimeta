@@ -230,18 +230,25 @@ func lineEnd(text string, offset int) int {
 
 func findCodeBlocks(text string) []formatRange {
 	matches := make([]formatRange, 0)
-	scan := &codeScan{text: text, closes: map[string][]fenceAt{}}
+	scan := newCodeScan(text)
+	runEnd := 0
 	for offset := 0; offset < len(text); {
 		startRel := strings.Index(text[offset:], "```")
 		if startRel < 0 {
 			break
 		}
 		start := offset + startRel
-		fenceEnd := start
-		for fenceEnd < len(text) && text[fenceEnd] == '`' {
-			fenceEnd++
+		// A fence that doesn't close is tried again from the next backtick
+		// (as mautrix-meta does), and every start inside one run of
+		// backticks shares the run's end: it's found once per run, not
+		// walked again from each.
+		if start >= runEnd {
+			runEnd = start
+			for runEnd < len(text) && text[runEnd] == '`' {
+				runEnd++
+			}
 		}
-		if match, ok := scan.codeBlockAt(start, fenceEnd, text[start:fenceEnd]); ok {
+		if match, ok := scan.codeBlockAt(start, runEnd); ok {
 			matches = append(matches, match)
 			offset = match.end
 		} else {
@@ -251,20 +258,66 @@ func findCodeBlocks(text string) []formatRange {
 	return matches
 }
 
-// codeScan remembers, for one text, where each fence can close and where
-// the line goes on to, so a fence that never closes doesn't make the rest of
-// the text be searched again for every opening one.
+// codeScan knows, for one text, every place a fence can close and where the
+// line goes on to, so a fence that never closes, or a long run of backticks
+// tried as one fence after another, doesn't make the rest of the text be
+// searched again.
 type codeScan struct {
-	text   string
-	closes map[string][]fenceAt // per fence, every place it closes, in order
+	text string
+	// A fence of n backticks closes only at the last n backticks of a run,
+	// followed by nothing but spaces to the end of the line: closers are
+	// those runs (three backticks or more, as a fence is), in order. longest
+	// is a tree of the longest run in each stretch of closers, so the first
+	// one long enough for a fence is found without walking the shorter ones
+	// between.
+	closers []closer
+	longest []int
+	leaves  int
 	// The last line break found, and the offsets it's the answer for.
 	breakFrom, breakStop, breakNext int
 	breakOK, breakKnown             bool
 }
 
+// closer is a run of backticks text[start:end] that can close a block, which
+// then ends at tail (past the spaces and line break after it).
+type closer struct{ start, end, tail int }
+
 type fenceAt struct{ start, end int }
 
-func (s *codeScan) codeBlockAt(start, fenceEnd int, fence string) (formatRange, bool) {
+func newCodeScan(text string) *codeScan {
+	s := &codeScan{text: text}
+	for offset := 0; offset < len(text); {
+		rel := strings.Index(text[offset:], "```")
+		if rel < 0 {
+			break
+		}
+		start := offset + rel
+		end := start + 3
+		for end < len(text) && text[end] == '`' {
+			end++
+		}
+		if tail, ok := consumeTail(text, end); ok {
+			s.closers = append(s.closers, closer{start, end, tail})
+		}
+		offset = end
+	}
+	s.leaves = 1
+	for s.leaves < len(s.closers) {
+		s.leaves *= 2
+	}
+	s.longest = make([]int, 2*s.leaves)
+	for i, c := range s.closers {
+		s.longest[s.leaves+i] = c.end - c.start
+	}
+	for i := s.leaves - 1; i > 0; i-- {
+		s.longest[i] = max(s.longest[2*i], s.longest[2*i+1])
+	}
+	return s
+}
+
+// codeBlockAt is the block a fence text[start:fenceEnd] opens, if it closes.
+func (s *codeScan) codeBlockAt(start, fenceEnd int) (formatRange, bool) {
+	fence := fenceEnd - start
 	if lineStop, nextLine, ok := s.nextLineBreak(fenceEnd); ok {
 		if closeStart, closeEnd, ok := s.closingFence(nextLine, fence); ok {
 			infoLine := s.text[fenceEnd:nextLine]
@@ -284,30 +337,34 @@ func (s *codeScan) codeBlockAt(start, fenceEnd int, fence string) (formatRange, 
 	return formatRange{format: codeBlock, start: start, end: closeEnd, text: s.text[fenceEnd:closeStart]}, true
 }
 
-// closingFence is the first place from offset on where fence closes a block:
-// the fence, then only spaces to the end of the line.
-func (s *codeScan) closingFence(offset int, fence string) (start, end int, ok bool) {
-	list, known := s.closes[fence]
-	if !known {
-		list = []fenceAt{}
-		for from := 0; ; {
-			rel := strings.Index(s.text[from:], fence)
-			if rel < 0 {
-				break
-			}
-			at := from + rel
-			if end, ok := consumeTail(s.text, at+len(fence)); ok {
-				list = append(list, fenceAt{at, end})
-			}
-			from = at + 1
-		}
-		s.closes[fence] = list
-	}
-	i, _ := slices.BinarySearchFunc(list, offset, func(f fenceAt, o int) int { return cmp.Compare(f.start, o) })
-	if i == len(list) {
+// closingFence is the first place from offset on where a fence of n
+// backticks closes a block: n backticks, then only spaces to the end of the
+// line. n backticks followed by another aren't followed by a space, so that
+// is the end of a closer at least n long, the first ending far enough on.
+func (s *codeScan) closingFence(offset, n int) (start, end int, ok bool) {
+	i, _ := slices.BinarySearchFunc(s.closers, offset+n, func(c closer, end int) int { return cmp.Compare(c.end, end) })
+	i = s.firstLong(1, 0, s.leaves, i, n)
+	if i < 0 {
 		return 0, 0, false
 	}
-	return list[i].start, list[i].end, true
+	return s.closers[i].end - n, s.closers[i].tail, true
+}
+
+// firstLong is the first closer from index from on that is at least n
+// backticks long, or -1, looked for under node, which covers closers lo to
+// hi: a stretch without one that long is passed over in one look.
+func (s *codeScan) firstLong(node, lo, hi, from, n int) int {
+	if hi <= from || from >= len(s.closers) || s.longest[node] < n {
+		return -1
+	}
+	if hi-lo == 1 {
+		return lo
+	}
+	mid := (lo + hi) / 2
+	if i := s.firstLong(2*node, lo, mid, from, n); i >= 0 {
+		return i
+	}
+	return s.firstLong(2*node+1, mid, hi, from, n)
 }
 
 // nextLineBreak is nextLineBreak(s.text, offset), found once for every

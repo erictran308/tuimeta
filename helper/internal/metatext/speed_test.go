@@ -98,6 +98,7 @@ func TestTheLinearRuleFindsWhatTheOriginalFinds(t *testing.T) {
 // message can be: reading one must stay well under a second.
 func TestNoTextTakesLongToRead(t *testing.T) {
 	const size = 64 << 10
+	texts := map[string]string{}
 	for name, unit := range map[string]string{
 		"bold":        "(*a",
 		"code":        "`a",
@@ -108,11 +109,61 @@ func TestNoTextTakesLongToRead(t *testing.T) {
 		"mixed":       "*_~`a",
 		"words":       "*a* ",
 	} {
-		text := strings.Repeat(unit, size/len(unit))
+		texts[name] = strings.Repeat(unit, size/len(unit))
+	}
+	// One run of backticks is a fence at every backtick, each one shorter.
+	texts["backtick run"] = strings.Repeat("`", size)
+	texts["backtick run, then a word"] = strings.Repeat("`", size-2) + " a"
+	// Runs each longer than the last close the fence before; runs each
+	// shorter than the last close none of the fences in it.
+	var growing, shrinking strings.Builder
+	for n := 3; growing.Len() < size; n++ {
+		growing.WriteString(strings.Repeat("`", n) + " ")
+	}
+	texts["growing runs"] = growing.String()[:size]
+	for n := 361; n >= 3 && shrinking.Len() < size; n-- {
+		shrinking.WriteString(strings.Repeat("`", n) + "\n")
+	}
+	texts["shrinking runs"] = shrinking.String()
+	for name, text := range texts {
 		start := time.Now()
 		Parse(text)
 		if took := time.Since(start); took > slowdown*50*time.Millisecond {
 			t.Errorf("%s: %v for %d bytes", name, took, len(text))
+		}
+	}
+}
+
+// TestManyMentionsDontMakeReadingSlow gives the longest message as many
+// mentions as fit in it: putting them back must stay linear in the text and
+// the mentions.
+func TestManyMentionsDontMakeReadingSlow(t *testing.T) {
+	const size = 64 << 10
+	every := func(n, step, offset, length int) []Mention {
+		ms := make([]Mention, n)
+		for i := range ms {
+			ms[i] = Mention{Offset: i*step + offset, Length: length, UserID: int64(i%1000 + 1)}
+		}
+		return ms
+	}
+	for name, tc := range map[string]struct {
+		text      string
+		mentions  []Mention
+		plain     string
+		formatted int
+	}{
+		"32768 side by side": {strings.Repeat("@a", size/2), every(size/2, 2, 0, 2), strings.Repeat("@a", size/2), 0},
+		"65536 one letter":   {strings.Repeat("a", size), every(size, 1, 0, 1), strings.Repeat("a", size), 0},
+		"each one bold":      {strings.Repeat("*@a* b ", size/7), every(size/7, 7, 1, 2), strings.Repeat("@a b ", size/7), size / 7},
+		"spread out":         {strings.Repeat("@a b ", size/5), every(size/5, 5, 0, 2), strings.Repeat("@a b ", size/5), 0},
+	} {
+		start := time.Now()
+		text, ents := ParseWithMentions(tc.text, tc.mentions)
+		if took := time.Since(start); took > slowdown*50*time.Millisecond {
+			t.Errorf("%s: %v for %d mentions in %d bytes", name, took, len(tc.mentions), len(tc.text))
+		}
+		if text != tc.plain || len(ents) != len(tc.mentions)+tc.formatted {
+			t.Errorf("%s: %d bytes, %d entities", name, len(text), len(ents))
 		}
 	}
 }
@@ -179,6 +230,24 @@ func TestTheCodeBlockRuleFindsWhatTheOriginalFinds(t *testing.T) {
 		var b strings.Builder
 		for range rng.IntN(30) {
 			b.WriteString(alphabet[rng.IntN(len(alphabet))])
+		}
+		text := b.String()
+		if got, want := findCodeBlocks(text), slowCodeBlocks(text); !slices.Equal(got, want) {
+			t.Fatalf("%q: got %+v, want %+v", text, got, want)
+		}
+	}
+}
+
+func TestLongFencesCloseWhereTheOriginalClosesThem(t *testing.T) {
+	// Longer texts with runs of many lengths, so a fence has to pass over
+	// closers too short for it, near and far.
+	rng := rand.New(rand.NewPCG(7, 8))
+	tails := []string{" ", "\n", "\t", "a", " ", "go\n", "\t\n", ""}
+	for range 3000 {
+		var b strings.Builder
+		for range rng.IntN(60) {
+			b.WriteString(strings.Repeat("`", rng.IntN(9)))
+			b.WriteString(tails[rng.IntN(len(tails))])
 		}
 		text := b.String()
 		if got, want := findCodeBlocks(text), slowCodeBlocks(text); !slices.Equal(got, want) {

@@ -1427,10 +1427,15 @@ fn draw_menu(frame: &mut Frame, area: Rect, menu: &PickMenu, colors: &Colors) {
                 "  ".into()
             };
             let label = target.label();
+            let shown = match target {
+                // A long link keeps the end of the host it goes to.
+                Target::Link(link) => messages::link_label(&link.url, text_width),
+                _ => truncate(label, text_width),
+            };
             let mut line = vec![
                 bar,
                 Span::from(shortcut).fg(colors.muted),
-                Span::from(truncate(label, text_width)),
+                Span::from(shown),
             ];
             // The whole message is easier to recognize by how it starts.
             if let Target::Text(text) = target {

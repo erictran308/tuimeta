@@ -216,7 +216,10 @@ func libCookies(values map[string]string) *mcookies.Cookies {
 }
 
 // saveSession keeps the connection's cookies, which Instagram rotates, and
-// the browser it says it is.
+// the browser it says it is; b.mu is held, and conn is still the account's.
+// Logout lets go of the connection under b.mu before it wipes the folder, and
+// SaveJSON would make a wiped folder again: saving only after that check,
+// under the same lock, keeps a logout from being followed by cookies on disk.
 func (b *Instagram) saveSession(conn *connection) error {
 	values := map[string]string{}
 	for k, v := range conn.cookies.GetAll() {
@@ -330,11 +333,37 @@ func (b *Instagram) open(ctx context.Context, c *mcookies.Cookies, epoch int) (*
 		return nil, errNoAccount
 	}
 
-	b.mu.Lock()
-	if b.epoch != epoch {
-		b.mu.Unlock()
+	if !b.adopt(conn, epoch, fbid, viewer, mailbox) {
 		conn.cancel()
 		return nil, context.Canceled
+	}
+
+	hlog.Go("instagram socket", func() { conn.cli.Connect(conn.ctx) })
+	timer := time.NewTimer(connectTimeout)
+	defer timer.Stop()
+	select {
+	case <-conn.connected:
+		return conn, nil
+	case err = <-conn.failed:
+	case <-timer.C:
+		err = errConnectTimeout
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	b.drop(conn)
+	return nil, err
+}
+
+// adopt keeps the account and inbox a connection loaded and makes it the
+// current one, unless a login or logout since (epoch) has made it stale.
+// Applying Instagram's data could panic on something unforeseen: the unlock
+// is deferred so that can't leave b.mu held, and the backend stuck, for the
+// rest of the run.
+func (b *Instagram) adopt(conn *connection, epoch int, fbid int64, viewer *types.PolarisViewer, mailbox *slidetypes.Mailbox) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.epoch != epoch {
+		return false
 	}
 	if b.selfFBID != 0 && b.selfFBID != fbid {
 		b.reset() // another account: nothing of the old one carries over
@@ -353,34 +382,19 @@ func (b *Instagram) open(ctx context.Context, c *mcookies.Cookies, epoch int) (*
 		}
 	}
 	b.conn = conn
-	b.mu.Unlock()
-
-	hlog.Go("instagram socket", func() { conn.cli.Connect(conn.ctx) })
-	timer := time.NewTimer(connectTimeout)
-	defer timer.Stop()
-	select {
-	case <-conn.connected:
-		return conn, nil
-	case err = <-conn.failed:
-	case <-timer.C:
-		err = errConnectTimeout
-	case <-ctx.Done():
-		err = ctx.Err()
-	}
-	b.drop(conn)
-	return nil, err
+	return true
 }
 
 // establish saves the session of a connection that works and says the
 // account is ready.
 func (b *Instagram) establish(conn *connection, epoch int) {
-	if err := b.saveSession(conn); err != nil {
-		hlog.Error("instagram: can't save the session", hlog.Kind(err))
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.conn != conn || b.epoch != epoch {
-		return
+		return // logged out, or in again, since it connected: nothing is saved
+	}
+	if err := b.saveSession(conn); err != nil {
+		hlog.Error("instagram: can't save the session", hlog.Kind(err))
 	}
 	conn.established = true
 	close(conn.ready)
@@ -533,18 +547,17 @@ func (b *Instagram) Logout(ctx context.Context) error {
 // rotated them.
 func (b *Instagram) Close() {
 	b.mu.Lock()
-	b.epoch++
 	conn := b.conn
-	b.conn = nil
-	established := conn != nil && conn.established
-	b.mu.Unlock()
-	if conn == nil {
-		return
-	}
-	if established {
+	if conn != nil && conn.established {
 		if err := b.saveSession(conn); err != nil {
 			hlog.Warn("instagram: can't save the session", hlog.Kind(err))
 		}
+	}
+	b.epoch++
+	b.conn = nil
+	b.mu.Unlock()
+	if conn == nil {
+		return
 	}
 	b.disconnect(conn, closeWait)
 }
@@ -642,18 +655,21 @@ func (b *Instagram) waitEstablished(conn *connection) bool {
 }
 
 func (b *Instagram) onConnected(conn *connection) {
-	conn.connOnce.Do(func() { close(conn.connected) })
+	hlog.Info("instagram: connected")
 	b.mu.Lock()
-	established := conn.established
-	if established && b.state != proto.Ready {
+	defer b.mu.Unlock()
+	// The first connect is establish's to save (it waits for this one), so
+	// whether this is a later one is read before establish can run.
+	again := conn.established
+	conn.connOnce.Do(func() { close(conn.connected) })
+	if !again || b.conn != conn {
+		return
+	}
+	if b.state != proto.Ready {
 		b.account(proto.Ready, "")
 	}
-	b.mu.Unlock()
-	hlog.Info("instagram: connected")
-	if established {
-		if err := b.saveSession(conn); err != nil {
-			hlog.Warn("instagram: can't save the session", hlog.Kind(err))
-		}
+	if err := b.saveSession(conn); err != nil {
+		hlog.Warn("instagram: can't save the session", hlog.Kind(err))
 	}
 }
 

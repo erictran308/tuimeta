@@ -123,7 +123,7 @@ func TestApplyingWhatArrivesTellsNobodyAnything(t *testing.T) {
 			t.Errorf("applying incoming data sent %T", task)
 		}
 	}
-	if len(h.meta.stateless) != 0 || len(h.e2ee.reads) != 0 || len(h.e2ee.presences) != 0 || len(h.e2ee.sent) != 0 {
+	if len(h.meta.stateless) != 0 || len(h.e2ee.reads) != 0 || len(h.e2ee.selfReads) != 0 || len(h.e2ee.presences) != 0 || len(h.e2ee.sent) != 0 {
 		t.Error("applying incoming data sent something")
 	}
 	// The chats are still unread.

@@ -18,6 +18,7 @@ import (
 
 	"github.com/erictran308/tuimeta/helper/internal/fake"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
+	"github.com/erictran308/tuimeta/helper/internal/server"
 	"github.com/erictran308/tuimeta/helper/internal/wiretest"
 )
 
@@ -752,16 +753,20 @@ func TestFakeSendFilesIsAnAlbumWithTheCaptionLast(t *testing.T) {
 			group = c
 		}
 	}
-	var paths []string
+	var files []server.UploadFile
 	for i, data := range [][]byte{testPNG(40, 30), []byte("just some notes\n")} {
 		p := filepath.Join(dir, []string{"pic.png", "notes.txt"}[i])
 		if err := os.WriteFile(p, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		paths = append(paths, p)
+		f, err := server.Listed(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
 	}
 	from := h.c.Mark()
-	resp := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "paths": paths, "caption": "two things"})
+	resp := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "files": files, "caption": "two things"})
 	temps := wiretest.Decode[struct {
 		IDs []int64 `json:"message_ids"`
 	}](t, resp.Result).IDs
@@ -789,12 +794,20 @@ func TestFakeSendFilesIsAnAlbumWithTheCaptionLast(t *testing.T) {
 			t.Errorf("sent part: %s", sent.Raw)
 		}
 	}
-	// Relative paths and missing files are refused.
-	if l := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "paths": []string{"pic.png"}}); l.Error == nil || l.Error.Code != proto.BadRequest {
+	// Relative paths, missing files and a version 3 request (paths only)
+	// are refused.
+	relative := files[0]
+	relative.Path = "pic.png"
+	if l := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "files": []server.UploadFile{relative}}); l.Error == nil || l.Error.Code != proto.BadRequest {
 		t.Errorf("relative path: %s", l.Raw)
 	}
-	if l := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "paths": []string{filepath.Join(dir, "gone.png")}}); l.Error == nil || l.Error.Code != proto.NotFound {
+	gone := files[0]
+	gone.Path = filepath.Join(dir, "gone.png")
+	if l := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "files": []server.UploadFile{gone}}); l.Error == nil || l.Error.Code != proto.NotFound {
 		t.Errorf("missing file: %s", l.Raw)
+	}
+	if l := h.c.Call("send_files", map[string]any{"chat_id": group.ID, "paths": []string{files[0].Path}}); l.Error == nil || l.Error.Code != proto.BadRequest {
+		t.Errorf("paths without what was checked: %s", l.Raw)
 	}
 }
 

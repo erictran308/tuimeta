@@ -75,10 +75,36 @@ func (m *Messenger) run(ctx context.Context, purpose string, tasks ...socket.Tas
 		hlog.Info("messenger: request failed", hlog.Str("request", purpose), hlog.Kind(err))
 		return nil, requestError(err)
 	}
-	m.mu.Lock()
-	m.applyTable(tbl, fromResponse)
-	m.mu.Unlock()
+	m.applyAnswer(tbl)
 	return tbl, nil
+}
+
+// applyAnswer applies a table Messenger answered a request with. A panic
+// while applying is recovered further up (by the request's dispatcher, or a
+// download worker's), so m.mu is let go of by defer: the backend never stays
+// locked for the rest of the run.
+func (m *Messenger) applyAnswer(tbl *table.LSTable) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.applyTable(tbl, fromResponse)
+}
+
+// applyOwnSent applies an encrypted message sent from here (an edit, a
+// reaction) and gives the store to keep it in; m.mu is let go of by defer,
+// as in applyAnswer.
+func (m *Messenger) applyOwnSent(evt *events.FBMessage) *e2eeStore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.applyWA(evt)
+	return m.store
+}
+
+// locked runs apply with m.mu held and lets go of it by defer, as in
+// applyAnswer: for what a request applies once the network took it.
+func (m *Messenger) locked(apply func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	apply()
 }
 
 // sendsEncrypted reports whether c's messages go through the encrypted
@@ -198,9 +224,11 @@ func (m *Messenger) sendFB(ctx context.Context, c *chat, out *backend.Outgoing, 
 		msg.reply = &replyRef{netID: replied.netID, sender: replied.sender, text: quoteOf(replied)}
 	}
 	if cur := m.lookupChat(c.key); cur != nil {
+		// Flushed by defer, so a panic in arrived can't leave the batch
+		// open and every later chat event held back in it.
 		m.dirty = map[int64]bool{}
+		defer m.flushDirty()
 		m.arrived(cur, msg, key)
-		m.flushDirty()
 	}
 	return nil
 }
@@ -257,12 +285,11 @@ func (m *Messenger) sendEncrypted(ctx context.Context, c *chat, out *backend.Out
 	var parts []proto.Message
 	for i, content := range contents {
 		app := wrapConsumer(content)
-		meta := &waMsgApplication.MessageApplication_Metadata{}
-		if i == 0 && replied != nil && replied.wa != nil {
-			meta.QuotedMessage = &waMsgApplication.MessageApplication_Metadata_QuotedMessage{
-				StanzaID: gproto.String(replied.wa.id), Participant: gproto.String(replied.wa.sender.String()),
-			}
+		quoted := replied
+		if i > 0 {
+			quoted = nil // only the first part answers it
 		}
+		meta := m.sendMeta(c, quoted)
 		id := strconv.FormatInt(methods.GenerateEpochID(), 10)
 		resp, err := e2ee.SendFBMessage(ctx, jid, app, meta, whatsmeow.SendRequestExtra{ID: id})
 		if err != nil {
@@ -276,28 +303,28 @@ func (m *Messenger) sendEncrypted(ctx context.Context, c *chat, out *backend.Out
 			ts = m.now()
 		}
 		evt := ownEvent(jid, own, id, ts, app, meta)
-		m.mu.Lock()
-		msg := m.newWA(c, evt, own, m.self)
-		m.consumerContent(msg, content)
-		cur := m.lookupChat(c.key)
-		if cur != nil {
-			p, gone := m.keep(cur, msg)
-			m.d.Events.MessageDeleted(cur.id, gone)
-			cur.activity = max(cur.activity, msg.ms)
-			m.recount(cur)
-			m.tellPeople(msg)
-			parts = append(parts, p...)
-		}
-		st := m.store
-		m.mu.Unlock()
+		var st *e2eeStore
+		m.locked(func() {
+			msg := m.newWA(c, evt, own, m.self)
+			m.consumerContent(msg, content)
+			if cur := m.lookupChat(c.key); cur != nil {
+				p, gone := m.keep(cur, msg)
+				m.d.Events.MessageDeleted(cur.id, gone)
+				cur.activity = max(cur.activity, msg.ms)
+				m.recount(cur)
+				m.tellPeople(msg)
+				parts = append(parts, p...)
+			}
+			st = m.store
+		})
 		m.keepOwn(st, evt)
 	}
 	out.Sent(parts...)
-	m.mu.Lock()
-	if cur := m.lookupChat(c.key); cur != nil {
-		m.touch(cur)
-	}
-	m.mu.Unlock()
+	m.locked(func() {
+		if cur := m.lookupChat(c.key); cur != nil {
+			m.touch(cur)
+		}
+	})
 	return nil
 }
 
@@ -448,18 +475,22 @@ func ownEvent(chat, own waTypes.JID, id string, ts time.Time, sub armadillo.Real
 	return evt
 }
 
-// keepOwn stores a message sent from here.
+// keepOwn stores a message sent from here (or an edit or a reaction of
+// one) as receiveWA stores one that arrived: an edit or reaction with the
+// message it changes, a message within the chat's cap.
 func (m *Messenger) keepOwn(st *e2eeStore, evt *events.FBMessage) {
 	if st == nil {
 		return
 	}
-	app, err := gproto.Marshal(evt.FBApplication)
-	if err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err = st.put(ctx, storedMessage{Chat: evt.Info.Chat.String(), Sender: evt.Info.Sender.ToNonAD().String(), ID: evt.Info.ID, TS: evt.Info.Timestamp, FromMe: true, App: app})
-		cancel()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.ownChange(evt)
+	if !ok {
+		return
 	}
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := keepWA(ctx, st, evt, r); err != nil {
 		hlog.Error("messenger: can't keep a sent encrypted message", hlog.Kind(err))
 	}
 }
@@ -563,11 +594,7 @@ func (m *Messenger) editEncrypted(ctx context.Context, c *chat, msg *message, te
 	if err != nil {
 		return err
 	}
-	m.mu.Lock()
-	m.applyWA(evt)
-	st := m.store
-	m.mu.Unlock()
-	m.keepOwn(st, evt)
+	m.keepOwn(m.applyOwnSent(evt), evt)
 	return nil
 }
 
@@ -596,11 +623,13 @@ func (m *Messenger) Delete(ctx context.Context, ref backend.MessageRef) error {
 		if _, err := m.sendOwn(ctx, c, payload); err != nil {
 			return err
 		}
-		m.mu.Lock()
-		ref := msg.wa
-		m.deleted(c, msg.netID)
-		st := m.store
-		m.mu.Unlock()
+		var ref *waRef
+		var st *e2eeStore
+		m.locked(func() {
+			ref = msg.wa
+			m.deleted(c, msg.netID)
+			st = m.store
+		})
 		if st != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = st.remove(ctx, ref.chat.String(), ref.sender.String(), ref.id)
@@ -611,9 +640,7 @@ func (m *Messenger) Delete(ctx context.Context, ref backend.MessageRef) error {
 	if _, err := m.run(ctx, "delete", &socket.DeleteMessageTask{MessageId: msg.netID}); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	m.deleted(c, msg.netID)
-	m.mu.Unlock()
+	m.locked(func() { m.deleted(c, msg.netID) })
 	return nil
 }
 
@@ -639,11 +666,7 @@ func (m *Messenger) React(ctx context.Context, ref backend.MessageRef, emoji str
 		if err != nil {
 			return err
 		}
-		m.mu.Lock()
-		m.applyWA(evt)
-		st := m.store
-		m.mu.Unlock()
-		m.keepOwn(st, evt)
+		m.keepOwn(m.applyOwnSent(evt), evt)
 		return nil
 	}
 	m.mu.Lock()
@@ -655,17 +678,20 @@ func (m *Messenger) React(ctx context.Context, ref backend.MessageRef, emoji str
 	}); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	if cur := c.msgs[msg.netID]; cur != nil && cur.setReaction(self, emoji) {
-		m.changed(c, cur)
-	}
-	m.mu.Unlock()
+	m.locked(func() {
+		if cur := c.msgs[msg.netID]; cur != nil && cur.setReaction(self, emoji) {
+			m.changed(c, cur)
+		}
+	})
 	return nil
 }
 
 // MarkRead is the only place read receipts go out: for the chat's
 // Facebook messages up to msg, a receipt for the chat; for its encrypted
-// ones, a receipt per sender for the unread messages up to msg.
+// ones, a receipt per sender for the unread messages up to msg. A message
+// request you haven't accepted gets none: its sender learns nothing until
+// you answer (answering accepts it). Where your read receipts are off, the
+// encrypted ones tell only your own devices.
 func (m *Messenger) MarkRead(ctx context.Context, ref backend.MessageRef) error {
 	m.mu.Lock()
 	c, msg, err := m.messageOf(ref)
@@ -673,16 +699,24 @@ func (m *Messenger) MarkRead(ctx context.Context, ref backend.MessageRef) error 
 		m.mu.Unlock()
 		return err
 	}
+	if c.request {
+		m.mu.Unlock()
+		return nil
+	}
 	upTo := msg.ms
 	from := c.readUpTo
 	waFrom := c.receipted
 	thread := c.threadKey()
 	jid := c.jid()
 	group := c.kind == proto.Group
+	receiptsOff := c.receiptsOff
 	var fb bool
 	bySender := map[waTypes.JID][]waTypes.MessageID{}
+	// A group's changes shown as messages ("wa-event:") are no one's
+	// message: nothing to tell anyone, on Messenger or encrypted.
+	event := func(msg *message) bool { return strings.HasPrefix(msg.netID, "wa-event:") }
 	for _, other := range c.msgs {
-		if other.ms > upTo || other.sender == m.self {
+		if other.ms > upTo || other.sender == m.self || event(other) {
 			continue
 		}
 		if other.wa == nil {
@@ -692,24 +726,19 @@ func (m *Messenger) MarkRead(ctx context.Context, ref backend.MessageRef) error 
 		if other.ms <= waFrom {
 			continue
 		}
-		if strings.HasPrefix(other.netID, "wa-event:") {
-			continue
-		}
 		sender := waTypes.EmptyJID
 		if group {
 			sender = other.wa.sender
 		}
 		bySender[sender] = append(bySender[sender], other.wa.id)
 	}
-	if msg.wa == nil && upTo > from {
+	if msg.wa == nil && !event(msg) && upTo > from {
 		fb = true
 	}
 	m.mu.Unlock()
 	if !fb && len(bySender) == 0 {
 		// Nothing new to read: nobody is told anything.
-		m.mu.Lock()
-		m.readElsewhere(c.key, upTo)
-		m.mu.Unlock()
+		m.locked(func() { m.readElsewhere(c.key, upTo) })
 		return nil
 	}
 
@@ -724,15 +753,13 @@ func (m *Messenger) MarkRead(ctx context.Context, ref backend.MessageRef) error 
 			return err
 		}
 		for sender, list := range bySender {
-			if err := e2ee.MarkRead(ctx, list, m.now(), jid, sender); err != nil {
+			if err := markReadWA(ctx, e2ee, "mark_read", receiptsOff, list, m.now(), jid, sender); err != nil {
 				hlog.Info("messenger: encrypted read receipt failed", hlog.Kind(err))
 				return requestError(err)
 			}
 		}
 	}
-	m.mu.Lock()
-	m.readElsewhere(c.key, upTo)
-	m.mu.Unlock()
+	m.locked(func() { m.readElsewhere(c.key, upTo) })
 	return nil
 }
 
@@ -758,7 +785,7 @@ func (m *Messenger) SetTyping(ctx context.Context, ref backend.ChatRef, typing b
 		if typing {
 			state = waTypes.ChatPresenceComposing
 		}
-		return requestError(e2ee.SendChatPresence(ctx, jid, state, waTypes.ChatPresenceMediaText))
+		return requestError(e2ee.SendChatPresence(ctx, "typing", jid, state, waTypes.ChatPresenceMediaText))
 	}
 	task := &socket.UpdatePresenceTask{ThreadKey: thread, SyncGroup: 1, ThreadType: int64(ttype)}
 	if group {
@@ -791,12 +818,12 @@ func (m *Messenger) Mute(ctx context.Context, ref backend.ChatRef, muted bool) e
 	if _, err := m.run(ctx, "mute", &socket.MuteThreadTask{ThreadKey: c.threadKey(), MuteExpireTimeMS: until, SyncGroup: 1}); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	if cur := m.lookupChat(c.key); cur != nil && cur.muteUntil != until {
-		cur.muteUntil = until
-		m.touch(cur)
-	}
-	m.mu.Unlock()
+	m.locked(func() {
+		if cur := m.lookupChat(c.key); cur != nil && cur.muteUntil != until {
+			cur.muteUntil = until
+			m.touch(cur)
+		}
+	})
 	return nil
 }
 

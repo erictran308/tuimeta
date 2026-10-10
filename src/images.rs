@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use image::imageops::FilterType;
@@ -74,13 +75,54 @@ pub fn open_image(path: &str) -> image::ImageResult<image::DynamicImage> {
 /// they're saved as `.jpg`.
 fn open_within(path: &str, limits: image::Limits) -> image::ImageResult<image::DynamicImage> {
     let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    picture_format(reader.format())?;
     reader.limits(limits);
     reader.decode()
+}
+
+/// The formats Meta's networks send pictures in, and the ones tuimeta
+/// sends; anything else is refused before it's decoded. The `image` crate
+/// reads many more, from the file's first bytes, whatever its name, and
+/// some decode on threads of their own (OpenEXR), where a panic isn't
+/// caught and would end the app.
+fn picture_format(format: Option<image::ImageFormat>) -> image::ImageResult<()> {
+    use image::ImageFormat::{Gif, Jpeg, Png, WebP};
+    use image::error::{ImageError, ImageFormatHint};
+    match format {
+        Some(Png | Jpeg | Gif | WebP) => Ok(()),
+        other => Err(ImageError::Unsupported(
+            other
+                .map_or(ImageFormatHint::Unknown, ImageFormatHint::from)
+                .into(),
+        )),
+    }
 }
 
 /// At most this many images decode at once; the rest wait for a later frame.
 /// Each may take a few hundred MB while it decodes.
 const MAX_BUILDING: usize = 4;
+
+/// Decoders running, counting the ones given up on after [`BUILD_TIMEOUT`],
+/// which can't be stopped: past this many, nothing new starts until some
+/// finish, so stuck ones can't pile up threads and memory without end.
+const MAX_RUNNING: usize = 2 * MAX_BUILDING;
+
+/// One decoder running, counted in [`Images::running`] until it's dropped,
+/// however its thread ends (or if it never starts).
+struct Running(Arc<AtomicUsize>);
+
+impl Running {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Running(count.clone())
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Encoded photos kept for the open chat; the least recently drawn go first.
 const MAX_READY: usize = 200;
@@ -125,6 +167,7 @@ const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Like `image::load_from_memory`, within [`limits`].
 fn decode_bytes(data: &[u8]) -> image::ImageResult<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
+    picture_format(reader.format())?;
     reader.limits(limits());
     reader.decode()
 }
@@ -203,6 +246,8 @@ pub struct Images {
     avatar_clock: u64,
     /// Images being built, and when each started.
     building: HashMap<Key, std::time::Instant>,
+    /// Decoders still running, given up on or not.
+    running: Arc<AtomicUsize>,
     /// Keys that failed to decode; never retried.
     failed: HashSet<Key>,
     files: HashMap<i32, FileState>,
@@ -223,6 +268,7 @@ impl Images {
             avatars: HashMap::new(),
             avatar_clock: 0,
             building: HashMap::new(),
+            running: Arc::new(AtomicUsize::new(0)),
             failed: HashSet::new(),
             files: HashMap::new(),
             wanted: Vec::new(),
@@ -502,6 +548,20 @@ impl Images {
         self.ready.clear();
     }
 
+    /// Forgets every picture and where each downloaded file is, as when a
+    /// network was logged out of and its downloads deleted. Which files were
+    /// whose isn't known here, so all go: one still being made is dropped
+    /// when done, and the others' files are asked for again, which the
+    /// helper answers at once for those it still has.
+    pub fn forget(&mut self) {
+        self.generation += 1;
+        self.ready.clear();
+        self.avatars.clear();
+        self.building.clear();
+        self.failed.clear();
+        self.files.clear();
+    }
+
     /// Decodes and encodes on a blocking thread, once per key.
     fn build(
         &mut self,
@@ -527,6 +587,7 @@ impl Images {
             || self.building.contains_key(&key)
             || self.failed.contains(&key)
             || self.building.len() >= MAX_BUILDING
+            || self.running.load(Ordering::SeqCst) >= MAX_RUNNING
         {
             return;
         }
@@ -534,15 +595,19 @@ impl Images {
         let picker = self.picker.clone();
         let tx = self.tx.clone();
         let generation = self.generation;
+        let running = Running::new(&self.running);
         tokio::task::spawn_blocking(move || {
-            let result = contained(|| {
-                decode().and_then(|image| {
-                    let size = Size::new(key.cols, key.rows);
-                    Ok(SlicedProtocol::new_with_resize(
-                        &picker, image, size, RESIZE,
-                    )?)
+            let result = {
+                let _running = running;
+                contained(|| {
+                    decode().and_then(|image| {
+                        let size = Size::new(key.cols, key.rows);
+                        Ok(SlicedProtocol::new_with_resize(
+                            &picker, image, size, RESIZE,
+                        )?)
+                    })
                 })
-            });
+            };
             let _ = tx.send(ImageEvent {
                 key,
                 generation,
@@ -621,6 +686,22 @@ mod tests {
         images.on_built(rx.recv().await.unwrap());
         assert!(images.is_broken(&preview(7)));
         assert!(!panic_is_contained(), "only while decoding");
+    }
+
+    #[tokio::test]
+    async fn forgetting_drops_every_picture_and_file_and_what_was_still_being_made() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.on_downloaded(5, Some("/data/helper/files/5.jpg".into()));
+        images.insert_ready(key(6), DynamicImage::new_rgba8(8, 8));
+        images.build(key(7), || Ok(DynamicImage::new_rgba8(8, 8)));
+        let late = rx.recv().await.unwrap();
+
+        images.forget();
+        assert!(images.files.is_empty() && images.ready.is_empty());
+        assert!(images.building.is_empty());
+        images.on_built(late);
+        assert!(images.ready.is_empty(), "made for what was forgotten");
     }
 
     #[tokio::test]
@@ -719,6 +800,79 @@ mod tests {
         let image = open_image(path.to_str().unwrap()).unwrap();
         assert_eq!((image.width(), image.height()), (80, 60));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn encoded(image: DynamicImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut data = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut data, format).unwrap();
+        data.into_inner()
+    }
+
+    #[test]
+    fn only_the_formats_pictures_come_in_are_decoded() {
+        let exr = encoded(
+            image::Rgba32FImage::new(64, 64).into(),
+            image::ImageFormat::OpenExr,
+        );
+        let bmp = encoded(image::RgbImage::new(8, 8).into(), image::ImageFormat::Bmp);
+        let tiff = encoded(image::RgbImage::new(8, 8).into(), image::ImageFormat::Tiff);
+        for data in [&exr, &bmp, &tiff] {
+            let error = decode_bytes(data).unwrap_err();
+            assert!(
+                matches!(error, image::ImageError::Unsupported(_)),
+                "{error}"
+            );
+        }
+        // Whatever the file is called: OpenEXR decodes on threads of its own.
+        let dir = std::env::temp_dir().join(format!("tuimeta-formats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.jpg");
+        std::fs::write(&path, &exr).unwrap();
+        assert!(open_image(path.to_str().unwrap()).is_err());
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+        ] {
+            let data = encoded(image::RgbImage::new(8, 8).into(), format);
+            assert!(decode_bytes(&data).is_ok(), "{format:?}");
+            std::fs::write(&path, &data).unwrap();
+            assert!(open_image(path.to_str().unwrap()).is_ok(), "{format:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoders_given_up_on_still_count_until_they_end() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        // Decodes that never finish, each given up on in its time.
+        for id in 0..MAX_RUNNING as i32 {
+            let wait = wait.clone();
+            images.build(key(id), move || {
+                let _ = wait.lock().unwrap().recv();
+                Ok(DynamicImage::new_rgba8(8, 8))
+            });
+            assert!(images.building.contains_key(&key(id)));
+            for started in images.building.values_mut() {
+                *started = std::time::Instant::now() - BUILD_TIMEOUT;
+            }
+        }
+        images.build(key(99), || Ok(DynamicImage::new_rgba8(8, 8)));
+        assert!(
+            !images.building.contains_key(&key(99)),
+            "no more threads while they run"
+        );
+        drop(go);
+        for _ in 0..MAX_RUNNING {
+            images.on_built(rx.recv().await.unwrap());
+        }
+        assert_eq!(images.running.load(Ordering::SeqCst), 0);
+        images.build(key(99), || Ok(DynamicImage::new_rgba8(8, 8)));
+        assert!(images.building.contains_key(&key(99)), "its turn came");
     }
 
     #[test]

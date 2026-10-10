@@ -43,7 +43,9 @@ func NewFiles() *Files {
 }
 
 // Register gives ref an id, or returns the id its key already has, updating
-// what's known about it (a fresh URL, a size).
+// what's known about it (a fresh URL, a size). The name and type it was
+// first registered with stay: another message carrying the same file can't
+// rename what's saved, or what it opens as.
 func (f *Files) Register(ref FileRef) int32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -54,10 +56,10 @@ func (f *Files) Register(ref FileRef) int32 {
 		if ref.Size == 0 {
 			ref.Size = old.Size
 		}
-		if ref.Mime == "" {
+		if old.Mime != "" {
 			ref.Mime = old.Mime
 		}
-		if ref.Name == "" {
+		if old.Name != "" {
 			ref.Name = old.Name
 		}
 		if ref.Source == nil {
@@ -82,4 +84,32 @@ func (f *Files) Get(id int32) (FileRef, bool) {
 	defer f.mu.Unlock()
 	ref, ok := f.byID[id]
 	return ref, ok
+}
+
+// Forget drops the id of the network's file with key, once what it came with
+// is gone (its message deleted): Get no longer finds it, and the key
+// registered again gets a new id. It returns the id it dropped.
+func (f *Files) Forget(n proto.Network, key string) (int32, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := fileKey{n, key}
+	id, ok := f.byKey[k]
+	if ok {
+		delete(f.byKey, k)
+		delete(f.byID, id)
+	}
+	return id, ok
+}
+
+// ForgetNetwork drops the ids of all the network's files (logout), so an id
+// from the account before can't be fetched with the next one's session.
+func (f *Files) ForgetNetwork(n proto.Network) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, id := range f.byKey {
+		if k.network == n {
+			delete(f.byKey, k)
+			delete(f.byID, id)
+		}
+	}
 }

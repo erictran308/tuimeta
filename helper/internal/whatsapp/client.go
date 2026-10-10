@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -68,7 +69,28 @@ var errUnasked = proto.Err(proto.Internal, "Something was about to tell people a
 
 // waConn is the live connection: a whatsmeow client, of which only the calls
 // above are reachable.
-type waConn struct{ cli *whatsmeow.Client }
+type waConn struct {
+	cli *whatsmeow.Client
+	// settled is set once the account's privacy settings were asked for on
+	// the current connection. whatsmeow keeps them, but only WhatsApp's
+	// notices of a change update its copy, and a device that was offline
+	// when the setting changed on the phone misses them.
+	settled atomic.Bool
+}
+
+// newConn wraps cli, and watches it connect.
+func newConn(cli *whatsmeow.Client) *waConn {
+	c := &waConn{cli: cli}
+	cli.AddEventHandler(func(evt any) {
+		if _, ok := evt.(*events.Connected); ok {
+			c.reconnected()
+		}
+	})
+	return c
+}
+
+// reconnected makes the next read receipt ask for the setting afresh.
+func (c *waConn) reconnected() { c.settled.Store(false) }
 
 func (c *waConn) SendMessage(ctx context.Context, to waTypes.JID, msg *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	return c.cli.SendMessage(ctx, to, msg, extra...)
@@ -80,17 +102,27 @@ func (c *waConn) MarkRead(ctx context.Context, purpose string, ids []waTypes.Mes
 	}
 	// With read receipts off in WhatsApp's settings, a read is told only to
 	// your own devices. whatsmeow checks that setting itself, but sends a
-	// receipt everyone sees when it can't get it: it's got first here, and
-	// without it nothing goes.
-	settings, err := c.cli.TryFetchPrivacySettings(ctx, false)
+	// receipt everyone sees when it can't get it: it's got first here (from
+	// WhatsApp, once each connection), and without it nothing goes.
+	fetch := !c.settled.Load()
+	settings, err := c.cli.TryFetchPrivacySettings(ctx, fetch)
 	if err != nil {
 		return err
 	}
-	kind := waTypes.ReceiptTypeRead
-	if settings.ReadReceipts == waTypes.PrivacySettingNone {
-		kind = waTypes.ReceiptTypeReadSelf
+	if fetch {
+		c.settled.Store(true)
 	}
-	return c.cli.MarkRead(ctx, ids, at, chat, sender, kind)
+	return c.cli.MarkRead(ctx, ids, at, chat, sender, receiptKind(settings))
+}
+
+// receiptKind is how a read is told: to everyone only when the account's
+// setting says so, else (read receipts off, or a setting not known) only to
+// your own devices.
+func receiptKind(s *waTypes.PrivacySettings) waTypes.ReceiptType {
+	if s != nil && s.ReadReceipts == waTypes.PrivacySettingAll {
+		return waTypes.ReceiptTypeRead
+	}
+	return waTypes.ReceiptTypeReadSelf
 }
 
 func (c *waConn) SendChatPresence(ctx context.Context, purpose string, chat waTypes.JID, state waTypes.ChatPresence) error {

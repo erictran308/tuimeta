@@ -4,8 +4,10 @@ package messenger
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -83,18 +85,396 @@ func (m *Messenger) openStore(gen int) {
 	m.store = st
 	m.replaying = true
 	m.dirty = map[int64]bool{}
+	defer func() {
+		// Set back however reading back ends, a panic included: what
+		// arrives next is new and is reported.
+		m.replaying = false
+		m.dirty = nil
+	}()
+	rewritten := false
 	for _, s := range kept {
-		if evt := decodeStored(s); evt != nil {
-			m.applyWA(evt)
-		}
+		rewritten = m.replay(ctx, st, s) || rewritten
+	}
+	if rewritten {
+		st.checkpoint(ctx)
 	}
 	for _, c := range m.chats {
 		// Receipts went out for what was read before this run.
 		c.receipted = max(c.receipted, c.readUpTo)
 	}
+	// Disappearing messages whose time ran out while tuimeta wasn't
+	// running go before anything is shown, their downloads too.
+	m.expire()
 	m.flushDirty()
-	m.replaying = false
+	m.watch(st)
 	hlog.Info("messenger: encrypted messages read back", hlog.Int("count", int64(len(kept))))
+}
+
+// SweepEvery is how often disappearing messages whose time is up are looked
+// for.
+const SweepEvery = time.Minute
+
+// watch runs the disappearing-message sweep for as long as st is the open
+// store; m.mu is held.
+func (m *Messenger) watch(st *e2eeStore) {
+	life := m.life
+	hlog.Go("messenger sweep", func() { m.sweepLoop(life, st) })
+}
+
+// sweepLoop deletes disappearing messages once their time is up, here as on
+// the phone.
+func (m *Messenger) sweepLoop(life context.Context, st *e2eeStore) {
+	tick := time.NewTicker(SweepEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+		case <-life.Done():
+			return
+		}
+		if !m.sweep(st) {
+			return
+		}
+	}
+}
+
+// sweep deletes the messages whose time is up; false once st isn't the open
+// store any more.
+func (m *Messenger) sweep(st *e2eeStore) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store != st || m.closed {
+		return false
+	}
+	m.expire()
+	return true
+}
+
+// expire deletes the disappearing messages whose time is up: from their chat
+// (reported, unless they're being read back), from the store, and what was
+// downloaded of them; m.mu is held.
+func (m *Messenger) expire() {
+	now := m.now().UnixMilli()
+	type gone struct {
+		c     *chat
+		netID string
+	}
+	var list []gone
+	for _, c := range m.chats {
+		for netID, msg := range c.msgs {
+			if msg.expires > 0 && msg.expires <= now {
+				list = append(list, gone{c, netID})
+			}
+		}
+	}
+	for _, g := range list {
+		m.forgetFiles(g.c.msgs[g.netID])
+		m.deleted(g.c, g.netID)
+	}
+	if m.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.store.deleteExpired(ctx, now); err != nil {
+			hlog.Error("messenger: can't delete disappeared messages", hlog.Kind(err))
+		}
+	}
+	if len(list) > 0 {
+		hlog.Info("messenger: disappearing messages deleted", hlog.Int("count", int64(len(list))))
+	}
+}
+
+// forgetFiles deletes what was downloaded of msg (its files, their stills,
+// its link's picture), once msg is gone; m.mu is held.
+func (m *Messenger) forgetFiles(msg *message) {
+	if msg == nil || m.d.Downloads == nil {
+		return
+	}
+	var files []int32
+	for _, md := range msg.media {
+		files = append(files, md.FileID)
+		if md.Thumbnail != nil {
+			files = append(files, md.Thumbnail.FileID)
+		}
+	}
+	if msg.preview != nil && msg.preview.Image != nil {
+		files = append(files, msg.preview.Image.FileID)
+	}
+	for _, id := range files {
+		if ref, ok := m.d.Files.Get(id); ok {
+			m.d.Downloads.Remove(ref)
+		}
+	}
+}
+
+// disappears is when a message with setting s goes: for one counted from
+// when it was sent (at ms), a time in unix ms; for one counted from when
+// it's seen, how many seconds it lasts then. View-once text ("seen once")
+// lasts five minutes once seen, as mautrix-meta has it.
+func disappears(s *waMsgApplication.MessageApplication_EphemeralSetting, ms int64) (expires, seenTimer int64) {
+	secs := int64(s.GetEphemeralExpiration())
+	switch s.GetEphemeralityType() {
+	case waMsgApplication.MessageApplication_EphemeralSetting_SEEN_ONCE:
+		return 0, 5 * 60
+	case waMsgApplication.MessageApplication_EphemeralSetting_SEEN_BASED_WITH_TIMER:
+		return 0, secs
+	}
+	if secs > 0 {
+		return ms + secs*1000, 0
+	}
+	return 0, 0
+}
+
+// unixSeconds is a setting's time in unix seconds, as mautrix-meta reads
+// it; one written in milliseconds is brought down to seconds, so it can't
+// outrank every later setting.
+func unixSeconds(t int64) int64 {
+	if t > 1e11 {
+		return t / 1000
+	}
+	return t
+}
+
+// setTimer records the chat's disappearing-messages setting s as of at
+// (unix seconds): what you send carries it, as the official apps' messages
+// do.
+func (c *chat) setTimer(s *waMsgApplication.MessageApplication_EphemeralSetting, at int64) {
+	c.timerAt = at
+	c.timer = int64(s.GetEphemeralExpiration())
+	if s.GetEphemeralityType() == waMsgApplication.MessageApplication_EphemeralSetting_SEEN_ONCE {
+		c.timer = 5 * 60
+	}
+}
+
+// startTimer starts the time of a message that disappears once seen, if it
+// has been: yours at once, someone else's once the chat is read past it;
+// m.mu is held.
+func (m *Messenger) startTimer(c *chat, msg *message) {
+	if msg.seenTimer == 0 || msg.expires != 0 {
+		return
+	}
+	switch {
+	case msg.sender == m.self:
+		msg.expires = msg.ms + msg.seenTimer*1000
+	case msg.ms <= c.readUpTo:
+		msg.expires = m.now().UnixMilli() + msg.seenTimer*1000
+	}
+}
+
+// startTimers starts the time of c's messages that disappear once seen and
+// now have been, and keeps when they go; m.mu is held.
+func (m *Messenger) startTimers(c *chat) {
+	var ctx context.Context
+	for _, msg := range c.msgs {
+		if msg.seenTimer == 0 || msg.expires != 0 || msg.wa == nil {
+			continue
+		}
+		m.startTimer(c, msg)
+		if msg.expires == 0 || m.store == nil {
+			continue
+		}
+		if ctx == nil {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+		}
+		if err := m.store.setExpires(ctx, msg.wa.chat.String(), msg.wa.sender.String(), msg.wa.id, msg.expires); err != nil {
+			hlog.Error("messenger: can't keep when a message disappears", hlog.Kind(err))
+		}
+	}
+}
+
+// sendMeta is what a message sent in c says besides its content: the
+// message it answers, if any, and the chat's disappearing-messages timer,
+// which the official apps put on every message they send (leaving its kind
+// unset), so what you send disappears as theirs does.
+func (m *Messenger) sendMeta(c *chat, replied *message) *waMsgApplication.MessageApplication_Metadata {
+	meta := &waMsgApplication.MessageApplication_Metadata{}
+	if replied != nil && replied.wa != nil {
+		meta.QuotedMessage = &waMsgApplication.MessageApplication_Metadata_QuotedMessage{
+			StanzaID: gproto.String(replied.wa.id), Participant: gproto.String(replied.wa.sender.String()),
+		}
+	}
+	m.mu.Lock()
+	timer, at := c.timer, c.timerAt
+	m.mu.Unlock()
+	if timer > 0 && timer <= math.MaxUint32 {
+		setting := &waMsgApplication.MessageApplication_EphemeralSetting{
+			EphemeralExpiration: gproto.Uint32(uint32(timer)),
+			EphemeralityType:    waMsgApplication.MessageApplication_EphemeralSetting_UNKNOWN.Enum(),
+		}
+		if at > 0 {
+			setting.EphemeralSettingTimestamp = gproto.Int64(at)
+		}
+		meta.Ephemeral = &waMsgApplication.MessageApplication_Metadata_ChatEphemeralSetting{ChatEphemeralSetting: setting}
+	}
+	return meta
+}
+
+// replay applies a kept row again, and brings the row up to date with what
+// applying it says now: an edit or a reaction an older build kept as a
+// message is kept as one (its message's earlier ones go), a row that
+// changes or shows nothing (an edit of nothing, a reaction that's no emoji,
+// an address that names no chat) is dropped, and what an older build kept
+// of a view-once message or a quote is taken out. It says whether the store
+// changed; m.mu is held.
+func (m *Messenger) replay(ctx context.Context, st *e2eeStore, s storedMessage) bool {
+	evt := decodeStored(s)
+	if evt == nil {
+		return false
+	}
+	r := m.applyWA(evt)
+	if !r.keep {
+		if err := st.drop(ctx, s.Chat, s.Sender, s.ID); err != nil {
+			hlog.Error("messenger: can't drop a kept message", hlog.Kind(err))
+			return false
+		}
+		return true
+	}
+	want := s
+	want.Kind = r.kind
+	if r.target != nil {
+		want.TargetSender, want.TargetID = r.target.sender.String(), r.target.id
+	}
+	if r.msg != nil {
+		// When it goes was kept once its time started (read, for one that
+		// goes once seen); one read since starts now.
+		if s.Expires > 0 {
+			r.msg.expires = s.Expires
+		}
+		want.Expires = r.msg.expires
+	}
+	kept, stripped := keptApplication(evt.FBApplication)
+	if stripped {
+		app, err := gproto.Marshal(kept)
+		if err != nil {
+			return false
+		}
+		want.App = app
+	}
+	if !stripped && want.Kind == s.Kind && want.TargetSender == s.TargetSender && want.TargetID == s.TargetID && want.Expires == s.Expires {
+		return false
+	}
+	if err := st.put(ctx, want); err != nil {
+		hlog.Error("messenger: can't rewrite a kept message", hlog.Kind(err))
+		return false
+	}
+	return true
+}
+
+// forgetKept deletes what the store kept of a chat that left the list
+// (deleted, a message request deleted, a group left), as the WhatsApp
+// backend does: else the next start would read it back as a chat, and a
+// deleted request as an ordinary one. m.mu is held.
+func (m *Messenger) forgetKept(c *chat) {
+	if m.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.store.forgetChat(ctx, c.netID()); err != nil {
+		hlog.Error("messenger: can't forget a removed chat's messages", hlog.Kind(err))
+	}
+}
+
+// keptApplication is app as the store keeps it: a view-once photo or video
+// without what it could be fetched with (it's shown only on the phone, so
+// tuimeta keeps nothing that could fetch it), and a quote's copy of the
+// message it answers only if that's text, all a reply shows of it.
+// stripped says whether anything was taken out; app itself is left as it
+// is.
+func keptApplication(app *waMsgApplication.MessageApplication) (kept *waMsgApplication.MessageApplication, stripped bool) {
+	kept = app
+	own := func() *waMsgApplication.MessageApplication {
+		if !stripped {
+			kept = gproto.Clone(app).(*waMsgApplication.MessageApplication)
+			stripped = true
+		}
+		return kept
+	}
+	switch sub := app.GetPayload().GetSubProtocol().GetSubProtocol().(type) {
+	case *waMsgApplication.MessageApplication_SubProtocolPayload_ConsumerMessage:
+		if cm, err := sub.Decode(); err == nil && bareViewOnce(cm) {
+			bare := &waMsgApplication.MessageApplication_SubProtocolPayload_ConsumerMessage{}
+			if bare.Set(cm) == nil {
+				own().GetPayload().GetSubProtocol().SubProtocol = bare
+			}
+		}
+	case *waMsgApplication.MessageApplication_SubProtocolPayload_Armadillo:
+		if a, err := sub.Decode(); err == nil && bareRaven(a) {
+			bare := &waMsgApplication.MessageApplication_SubProtocolPayload_Armadillo{}
+			if bare.Set(a) == nil {
+				own().GetPayload().GetSubProtocol().SubProtocol = bare
+			}
+		}
+	}
+	if q := app.GetMetadata().GetQuotedMessage(); q.GetPayload() != nil && !textMessage(q.GetPayload()) {
+		own().GetMetadata().GetQuotedMessage().Payload = nil
+	}
+	return kept, stripped
+}
+
+// bareViewOnce takes out of a view-once photo or video in cm what it could
+// be fetched with (and its caption, never shown); false if there was
+// nothing to take. What kind it was stays.
+func bareViewOnce(cm *waConsumerApplication.ConsumerApplication) bool {
+	switch c := cm.GetPayload().GetContent().GetViewOnceMessage().GetViewOnceContent().(type) {
+	case *waConsumerApplication.ConsumerApplication_ViewOnceMessage_ImageMessage:
+		if c.ImageMessage.GetImage() == nil && c.ImageMessage.GetCaption() == nil {
+			return false
+		}
+		c.ImageMessage = &waConsumerApplication.ConsumerApplication_ImageMessage{}
+	case *waConsumerApplication.ConsumerApplication_ViewOnceMessage_VideoMessage:
+		if c.VideoMessage.GetVideo() == nil && c.VideoMessage.GetCaption() == nil {
+			return false
+		}
+		c.VideoMessage = &waConsumerApplication.ConsumerApplication_VideoMessage{}
+	default:
+		return false
+	}
+	return true
+}
+
+// bareRaven does what bareViewOnce does for Messenger's own view-once
+// messages.
+func bareRaven(a *waArmadilloApplication.Armadillo) bool {
+	var rm *waArmadilloApplication.Armadillo_Content_RavenMessage
+	switch c := a.GetPayload().GetContent().GetContent().(type) {
+	case *waArmadilloApplication.Armadillo_Content_RavenMessage_:
+		rm = c.RavenMessage
+	case *waArmadilloApplication.Armadillo_Content_RavenMessageMsgr:
+		rm = c.RavenMessageMsgr
+	default:
+		return false
+	}
+	switch mc := rm.GetMediaContent().(type) {
+	case *waArmadilloApplication.Armadillo_Content_RavenMessage_ImageMessage:
+		if len(mc.ImageMessage.GetPayload()) == 0 {
+			return false
+		}
+		mc.ImageMessage = &waCommon.SubProtocol{}
+	case *waArmadilloApplication.Armadillo_Content_RavenMessage_VideoMessage:
+		if len(mc.VideoMessage.GetPayload()) == 0 {
+			return false
+		}
+		mc.VideoMessage = &waCommon.SubProtocol{}
+	default:
+		return false
+	}
+	return true
+}
+
+// textMessage reports whether a quote's copy of a message is a text message.
+func textMessage(p *waMsgApplication.MessageApplication_Payload) bool {
+	sub, ok := p.GetSubProtocol().GetSubProtocol().(*waMsgApplication.MessageApplication_SubProtocolPayload_ConsumerMessage)
+	if !ok {
+		return false
+	}
+	cm, err := sub.Decode()
+	if err != nil {
+		return false
+	}
+	_, text := cm.GetPayload().GetContent().GetContent().(*waConsumerApplication.ConsumerApplication_Content_MessageText)
+	return text
 }
 
 // decodeStored rebuilds a kept message as whatsmeow delivered it.
@@ -110,7 +490,10 @@ func decodeStored(s storedMessage) *events.FBMessage {
 	}
 	sub, err := decodeApplication(&app)
 	if err != nil {
-		return nil
+		if app.GetMetadata().GetChatEphemeralSetting() == nil {
+			return nil
+		}
+		sub = nil // a chat's disappearing-messages setting has no message
 	}
 	evt := &events.FBMessage{Message: sub, FBApplication: &app}
 	evt.Info.Chat = chat
@@ -173,18 +556,12 @@ func (m *Messenger) connectE2EE(gen int) {
 			fail("save", err)
 			return
 		}
-		m.mu.Lock()
-		if m.sess != nil && dev.ID != nil {
-			m.sess.WADevice = dev.ID.String()
-			m.sess.Cookies = cookieValues(cli)
+		registered := ""
+		if dev.ID != nil {
+			registered = dev.ID.String()
 		}
-		var sess savedSession
-		if m.sess != nil {
-			sess = *m.sess
-		}
-		m.mu.Unlock()
-		if err := m.d.Session.SaveJSON(sessionFile, sess); err != nil {
-			hlog.Error("messenger: can't save session", hlog.Kind(err))
+		if !m.keepDevice(gen, registered, cookieValues(cli)) {
+			return // logged out (or replaced) as it registered
 		}
 		hlog.Info("messenger: registered an encrypted-chat device")
 	}
@@ -207,6 +584,30 @@ func (m *Messenger) connectE2EE(gen int) {
 	if err := wa.Connect(); err != nil {
 		fail("connect", err)
 	}
+}
+
+// keepDevice records the encrypted-chat device connection gen registered,
+// with the cookies as they are now, and saves the session; it reports
+// whether gen is still the connection. As in keepSession, it's saved under
+// the lock and only then, so a logout can't wipe the folder in between and
+// find the session back at the next start.
+func (m *Messenger) keepDevice(gen int, device string, values map[string]string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen != gen || m.closed {
+		return false
+	}
+	if m.sess == nil {
+		return true
+	}
+	if device != "" {
+		m.sess.WADevice = device
+		m.sess.Cookies = values
+	}
+	if err := m.d.Session.SaveJSON(sessionFile, *m.sess); err != nil {
+		hlog.Error("messenger: can't save session", hlog.Kind(err))
+	}
+	return true
 }
 
 // onE2EE handles whatsmeow's events. It returns false only when a message
@@ -297,12 +698,15 @@ func (m *Messenger) forgetDevice(gen int) {
 }
 
 // receiveWA handles an encrypted message: it's applied, then kept in the
-// store before whatsmeow acknowledges it (SynchronousAck).
+// store before whatsmeow acknowledges it (SynchronousAck). Both happen under
+// m.mu, so a chat removed in between can't have the message kept after what
+// was kept of it was forgotten, and a panic while applying (recovered in
+// onE2EE) leaves the lock free.
 func (m *Messenger) receiveWA(evt *events.FBMessage) {
 	m.mu.Lock()
-	keep, revoked := m.applyWA(evt)
+	defer m.mu.Unlock()
+	r := m.applyWA(evt)
 	st := m.store
-	m.mu.Unlock()
 	if st == nil {
 		return
 	}
@@ -310,32 +714,113 @@ func (m *Messenger) receiveWA(evt *events.FBMessage) {
 	defer cancel()
 	var err error
 	switch {
-	case revoked != nil:
-		err = st.remove(ctx, revoked.chat.String(), revoked.sender.String(), revoked.id)
-	case keep && evt.FBApplication != nil:
-		var app []byte
-		app, err = gproto.Marshal(evt.FBApplication)
-		if err == nil {
-			chat := evt.Info.Chat.String()
-			err = st.put(ctx, storedMessage{
-				Chat: chat, Sender: evt.Info.Sender.ToNonAD().String(), ID: evt.Info.ID,
-				TS: evt.Info.Timestamp, FromMe: evt.Info.IsFromMe, App: app,
-			})
-			if err == nil {
-				err = st.pruneChat(ctx, chat)
-			}
-		}
+	case r.revoked != nil:
+		err = st.remove(ctx, r.revoked.chat.String(), r.revoked.sender.String(), r.revoked.id)
+	case r.keep:
+		err = keepWA(ctx, st, evt, r)
 	}
 	if err != nil {
 		hlog.Error("messenger: can't keep an encrypted message", hlog.Kind(err))
 	}
 }
 
-// waChat is the chat an encrypted message is in; m.mu is held.
-func (m *Messenger) waChat(jid waTypes.JID) *chat {
-	key, err := strconv.ParseInt(jid.User, 10, 64)
-	if err != nil || key == 0 {
+// ownChange is how a message sent from here is kept: as a message (going
+// when the chat's timer says), or as an edit or a reaction of the kept
+// message it names. ok is false when there's nothing to keep: the chat or
+// that message isn't here, or the reaction is no emoji; m.mu is held.
+func (m *Messenger) ownChange(evt *events.FBMessage) (r waApplied, ok bool) {
+	key, ok := waChatKey(evt.Info.Chat)
+	if !ok {
+		return waApplied{}, false
+	}
+	c := m.lookupChat(key)
+	if c == nil {
+		return waApplied{}, false
+	}
+	sender := evt.Info.Sender.ToNonAD()
+	consumer, _ := evt.Message.(*waConsumerApplication.ConsumerApplication)
+	var mk *waCommon.MessageKey
+	switch ct := consumer.GetPayload().GetContent().GetContent().(type) {
+	case nil:
+		return waApplied{}, false
+	case *waConsumerApplication.ConsumerApplication_Content_EditMessage:
+		r.kind, mk = rowEdit, ct.EditMessage.GetKey()
+	case *waConsumerApplication.ConsumerApplication_Content_ReactionMessage:
+		if !reactionLike(ct.ReactionMessage.GetText()) {
+			return waApplied{}, false
+		}
+		r.kind, mk = rowReaction, ct.ReactionMessage.GetKey()
+	default:
+		return waApplied{keep: true, kind: rowMessage, msg: c.msgs[waNetID(sender, evt.Info.ID)]}, true
+	}
+	msg := c.msgs[m.waTarget(c, evt.Info.Chat, sender, mk)]
+	if msg == nil || msg.wa == nil {
+		return waApplied{}, false
+	}
+	r.keep, r.target = true, msg.wa
+	return r, true
+}
+
+// keepWA stores an encrypted message (or an edit or reaction of one) as
+// applying it said: as its kind, with the message it changed.
+func keepWA(ctx context.Context, st *e2eeStore, evt *events.FBMessage, r waApplied) error {
+	if evt.FBApplication == nil {
 		return nil
+	}
+	kept, _ := keptApplication(evt.FBApplication)
+	app, err := gproto.Marshal(kept)
+	if err != nil {
+		return err
+	}
+	row := storedMessage{
+		Chat: evt.Info.Chat.String(), Sender: evt.Info.Sender.ToNonAD().String(), ID: evt.Info.ID,
+		TS: evt.Info.Timestamp, FromMe: evt.Info.IsFromMe, App: app, Kind: r.kind,
+	}
+	if r.target != nil {
+		row.TargetSender, row.TargetID = r.target.sender.String(), r.target.id
+	}
+	if r.msg != nil {
+		row.Expires = r.msg.expires
+	}
+	if err := st.put(ctx, row); err != nil {
+		return err
+	}
+	if r.kind != rowMessage {
+		return nil // only messages count toward the cap
+	}
+	return st.pruneChat(ctx, row.Chat)
+}
+
+// waChatKey is the key of the chat an encrypted chat's JID names: a
+// person's (on Messenger's server or WhatsApp's) or a group's. Any other
+// address (a broadcast list, a channel, a bot) names no chat here, and so
+// is never one sent to.
+func waChatKey(jid waTypes.JID) (int64, bool) {
+	switch jid.Server {
+	case waTypes.MessengerServer, waTypes.DefaultUserServer, waTypes.GroupServer:
+	default:
+		return 0, false
+	}
+	key, err := strconv.ParseInt(jid.User, 10, 64)
+	if err != nil || key <= 0 {
+		return 0, false
+	}
+	return key, true
+}
+
+// waChat is the chat an encrypted message from sender is in, or nil when its
+// address names none. Someone else's message in a one-to-one chat comes from
+// the other person, so it can't be filed under another chat (or change
+// where that chat's messages go); m.mu is held.
+func (m *Messenger) waChat(jid, sender waTypes.JID, fromMe bool) *chat {
+	key, ok := waChatKey(jid)
+	if !ok {
+		return nil
+	}
+	if !fromMe && int64(sender.UserInt()) != m.self {
+		if sender.UserInt() == 0 || (jid.Server != waTypes.GroupServer && sender.User != jid.User) {
+			return nil
+		}
 	}
 	c := m.chatByKey(key)
 	c.encrypted = true
@@ -391,16 +876,30 @@ func (m *Messenger) askGroup(c *chat, jid waTypes.JID) {
 	})
 }
 
+// waApplied is what applying an encrypted message did.
+type waApplied struct {
+	// keep says the message (or the edit or reaction) is to be kept in the
+	// store, as kind; msg is the message, when it's one.
+	keep bool
+	kind string
+	msg  *message
+	// target is the kept message an edit or a reaction changed. One that
+	// changed nothing isn't kept: it would only take room.
+	target *waRef
+	// revoked is the kept message an unsend removed.
+	revoked *waRef
+}
+
 // applyWA applies an encrypted message (or an edit, reaction or unsend of
 // one); m.mu is held. It says whether the message should be kept, or which
 // kept message was unsent.
-func (m *Messenger) applyWA(evt *events.FBMessage) (keep bool, revoked *waRef) {
+func (m *Messenger) applyWA(evt *events.FBMessage) waApplied {
 	info := evt.Info
-	c := m.waChat(info.Chat)
-	if c == nil {
-		return false, nil
-	}
 	sender := info.Sender.ToNonAD()
+	c := m.waChat(info.Chat, sender, info.IsFromMe)
+	if c == nil {
+		return waApplied{}
+	}
 	fbid := int64(sender.UserInt())
 	if info.IsFromMe {
 		fbid = m.self
@@ -411,49 +910,61 @@ func (m *Messenger) applyWA(evt *events.FBMessage) (keep bool, revoked *waRef) {
 		case *waConsumerApplication.ConsumerApplication_Payload_Content:
 			switch content := p.Content.GetContent().(type) {
 			case *waConsumerApplication.ConsumerApplication_Content_EditMessage:
-				target := m.waTarget(c, info.Chat, sender, content.EditMessage.GetKey())
-				m.waEdit(c, target, fbid, content.EditMessage)
-				return true, nil
-			case *waConsumerApplication.ConsumerApplication_Content_ReactionMessage:
-				target := m.waTarget(c, info.Chat, sender, content.ReactionMessage.GetKey())
-				if msg := c.msgs[target]; msg != nil && msg.setReaction(fbid, content.ReactionMessage.GetText()) {
-					m.changed(c, msg)
+				msg := c.msgs[m.waTarget(c, info.Chat, sender, content.EditMessage.GetKey())]
+				if !m.waEdit(c, msg, fbid, content.EditMessage) {
+					return waApplied{kind: rowEdit}
 				}
-				return true, nil
+				return waApplied{keep: true, kind: rowEdit, target: msg.wa}
+			case *waConsumerApplication.ConsumerApplication_Content_ReactionMessage:
+				msg := c.msgs[m.waTarget(c, info.Chat, sender, content.ReactionMessage.GetKey())]
+				emoji := content.ReactionMessage.GetText()
+				// Only an emoji is a reaction: words, a count or a time put
+				// there would read as part of the message.
+				if msg == nil || msg.wa == nil || !reactionLike(emoji) || !msg.setReaction(fbid, emoji) {
+					return waApplied{kind: rowReaction}
+				}
+				m.changed(c, msg)
+				return waApplied{keep: true, kind: rowReaction, target: msg.wa}
 			case *waConsumerApplication.ConsumerApplication_Content_PollUpdateMessage:
-				return false, nil // a vote; polls aren't shown
+				return waApplied{} // a vote; polls aren't shown
 			}
 			msg := m.newWA(c, evt, sender, fbid)
 			m.consumerContent(msg, p.Content)
-			m.waArrived(c, msg)
-			return true, nil
+			return m.waArrived(c, msg)
 		case *waConsumerApplication.ConsumerApplication_Payload_ApplicationData:
 			if rv := p.ApplicationData.GetRevoke(); rv != nil {
 				target := m.waTarget(c, info.Chat, sender, rv.GetKey())
 				msg := c.msgs[target]
 				if msg == nil || msg.sender != fbid {
-					return false, nil // only a message's sender unsends it
+					return waApplied{} // only a message's sender unsends it
 				}
 				ref := msg.wa
+				m.forgetFiles(msg)
 				m.deleted(c, target)
-				return false, ref
+				return waApplied{revoked: ref}
 			}
-			return false, nil
+			return waApplied{}
 		}
-		return false, nil
+		return waApplied{}
 	case *waArmadilloApplication.Armadillo:
 		msg := m.newWA(c, evt, sender, fbid)
 		m.armadilloContent(c, msg, typed.GetPayload().GetContent())
-		m.waArrived(c, msg)
-		return true, nil
+		return m.waArrived(c, msg)
 	}
-	if evt.Message == nil && evt.FBApplication.GetMetadata().GetChatEphemeralSetting() != nil {
-		return false, nil // a disappearing-messages setting, not a message
+	if s := evt.FBApplication.GetMetadata().GetChatEphemeralSetting(); evt.Message == nil && s != nil {
+		// A disappearing-messages setting, not a message: kept while it's
+		// the chat's newest, so what you send carries it after a restart.
+		at := info.Timestamp.Unix()
+		if at < c.timerAt {
+			return waApplied{}
+		}
+		c.setTimer(s, at)
+		return waApplied{keep: true, kind: rowSetting}
 	}
 	msg := m.newWA(c, evt, sender, fbid)
 	msg.unsupported = "[Unsupported message]"
 	m.waArrived(c, msg)
-	return false, nil
+	return waApplied{}
 }
 
 // newWA is the common part of an encrypted message; m.mu is held.
@@ -467,6 +978,14 @@ func (m *Messenger) newWA(c *chat, evt *events.FBMessage, sender waTypes.JID, fb
 	msg.forwarded = meta.GetIsForwarded()
 	if q := meta.GetQuotedMessage(); q != nil && q.GetStanzaID() != "" {
 		msg.reply = m.waQuote(c, q)
+	}
+	if s := meta.GetChatEphemeralSetting(); s != nil {
+		// The sender's timer: the message disappears when it says, here as
+		// on their phone. A newer setting than the chat's is the chat's now.
+		msg.expires, msg.seenTimer = disappears(s, msg.ms)
+		if at := unixSeconds(s.GetEphemeralSettingTimestamp()); at > c.timerAt {
+			c.setTimer(s, at)
+		}
 	}
 	return msg
 }
@@ -493,16 +1012,30 @@ func (m *Messenger) waQuote(c *chat, q *waMsgApplication.MessageApplication_Meta
 	if replied := c.msgs[ref.netID]; replied != nil {
 		ref.sender = replied.sender
 		ref.text = quoteOf(replied)
-	} else if p := q.GetPayload(); p != nil {
-		if sub, ok := p.GetSubProtocol().GetSubProtocol().(*waMsgApplication.MessageApplication_SubProtocolPayload_ConsumerMessage); ok {
-			if cm, err := sub.Decode(); err == nil {
-				if t := cm.GetPayload().GetContent().GetMessageText().GetText(); t != "" {
-					ref.text = snippet(t)
-				}
-			}
-		}
+		return ref
+	}
+	// Not a message kept here: who said it is only the sender's word, so it
+	// isn't put in anyone's mouth (nor is the person named looked up), as
+	// the WhatsApp backend does. What it says shows, unattributed.
+	ref.sender = 0
+	if t := quotedText(q.GetPayload()); t != "" {
+		ref.text = snippet(t)
 	}
 	return ref
+}
+
+// quotedText is the text of a quote's copy of the message it answers, if
+// that's a text message.
+func quotedText(p *waMsgApplication.MessageApplication_Payload) string {
+	sub, ok := p.GetSubProtocol().GetSubProtocol().(*waMsgApplication.MessageApplication_SubProtocolPayload_ConsumerMessage)
+	if !ok {
+		return ""
+	}
+	cm, err := sub.Decode()
+	if err != nil {
+		return ""
+	}
+	return cm.GetPayload().GetContent().GetMessageText().GetText()
 }
 
 // waTarget is the id among c's messages of the message key names, as the
@@ -531,29 +1064,51 @@ func (m *Messenger) waTarget(c *chat, chatJID, sender waTypes.JID, key *waCommon
 	return waNetID(target, key.GetID())
 }
 
-// waArrived records an encrypted message; m.mu is held.
-func (m *Messenger) waArrived(c *chat, msg *message) {
+// waArrived records an encrypted message, unless one with its id is here
+// already; m.mu is held.
+func (m *Messenger) waArrived(c *chat, msg *message) waApplied {
+	if old := c.msgs[msg.netID]; old != nil {
+		if !old.placeholder {
+			// A message is replaced only by its decryption, once that
+			// comes: its sender's message again under the same id (which
+			// would rewrite it unmarked, here and in the store) is dropped,
+			// as in the WhatsApp backend. Changes go through edits, which
+			// say so.
+			return waApplied{}
+		}
+		if len(msg.reactions) == 0 {
+			msg.reactions = old.reactions
+		}
+	}
+	m.startTimer(c, msg)
+	if !m.replaying && msg.expires > 0 && msg.expires <= m.now().UnixMilli() {
+		// It has disappeared already. (One read back goes once all are,
+		// with what was downloaded of it.)
+		return waApplied{}
+	}
 	if m.replaying {
 		m.keep(c, msg)
 		c.activity = max(c.activity, msg.ms)
 		m.recount(c)
 		m.touch(c)
-		return
+		return waApplied{keep: true, msg: msg}
 	}
 	m.arrived(c, msg, "")
+	return waApplied{keep: true, msg: msg}
 }
 
-// waEdit replaces the text of an encrypted message; only its sender may,
-// and an older edit never undoes a newer one; m.mu is held.
-func (m *Messenger) waEdit(c *chat, target string, fbid int64, e *waConsumerApplication.ConsumerApplication_EditMessage) {
-	msg := c.msgs[target]
-	if msg == nil || msg.sender != fbid || e.GetTimestampMS() <= msg.editTS {
-		return
+// waEdit replaces the text of an encrypted message, and says whether it
+// did: only its sender may, and an older edit never undoes a newer one;
+// m.mu is held.
+func (m *Messenger) waEdit(c *chat, msg *message, fbid int64, e *waConsumerApplication.ConsumerApplication_EditMessage) bool {
+	if msg == nil || msg.wa == nil || msg.sender != fbid || e.GetTimestampMS() <= msg.editTS {
+		return false
 	}
 	msg.editTS = e.GetTimestampMS()
 	msg.text, msg.mentions = m.waText(e.GetMessage())
 	msg.edited = true
 	m.changed(c, msg)
+	return true
 }
 
 // consumerContent fills in a consumer message's content; m.mu is held.
@@ -659,6 +1214,9 @@ func (m *Messenger) armadilloContent(c *chat, msg *message, content *waArmadillo
 		images, err := ct.ImageGalleryMessage.Decode()
 		if err == nil {
 			for _, img := range images {
+				if len(msg.media) == maxParts {
+					break // the rest wouldn't be shown, so they get no files
+				}
 				anc := img.GetAncillary()
 				msg.media = append(msg.media, m.waMedia(img.GetIntegral().GetTransport(), proto.Photo, whatsmeow.MediaImage, "", int(anc.GetWidth()), int(anc.GetHeight()), 0))
 			}
@@ -705,11 +1263,7 @@ func ravenMedia(r *waArmadilloApplication.Armadillo_Content_RavenMessage) proto.
 // waXMA reads a shared link or location; m.mu is held.
 func (m *Messenger) waXMA(msg *message, x *waArmadilloXMA.ExtendedContentMessage) {
 	msg.text = x.GetMessageText()
-	for _, mn := range x.GetMentions() {
-		if jid, err := waTypes.ParseJID(mn.GetMentionedJID()); err == nil {
-			msg.mentions = append(msg.mentions, mention{offset: int(mn.GetOffset()), length: int(mn.GetLength()), fbid: int64(jid.UserInt())})
-		}
-	}
+	msg.mentions = waMentions(x.GetMentions())
 	if x.GetTargetType() == waArmadilloXMA.ExtendedContentMessage_FB_STORY_REPLY {
 		setUnsupported(msg, "[Story reply]")
 		return
@@ -731,55 +1285,112 @@ func (m *Messenger) waXMA(msg *message, x *waArmadilloXMA.ExtendedContentMessage
 	}
 }
 
-// waText is an encrypted message's text and the mentions in it. Mentions
-// written as "@<id>@msgr" in the text are replaced by "@" and the person's
-// name, as the connector shows them; m.mu is held.
+// waMentions are the mentions a sender listed: each once, at most
+// MaxMentions.
+func waMentions(list []*waCommon.Mention) []mention {
+	var set mentionSet
+	for _, mn := range list {
+		jid, err := waTypes.ParseJID(mn.GetMentionedJID())
+		if err != nil {
+			continue
+		}
+		if !set.add(mention{offset: int(mn.GetOffset()), length: int(mn.GetLength()), fbid: int64(jid.UserInt())}) {
+			break
+		}
+	}
+	return set.list
+}
+
+// maxNamedJID is the longest mention written out in full ("@<id>@msgr")
+// looked for in a text; longer ones are looked for as "@<id>" only, so
+// finding them stays linear in the text.
+const maxNamedJID = 64
+
+// waText is an encrypted message's text and the mentions in it, each once
+// and at most MaxMentions. Mentions written as "@<id>@msgr" (or "@<id>") in
+// the text are replaced by "@" and the person's name, as the connector shows
+// them, found in one pass over the text; m.mu is held.
 func (m *Messenger) waText(t *waCommon.MessageText) (string, []mention) {
 	text := t.GetText()
 	if text == "" {
 		return "", nil
 	}
-	var out []mention
 	if mentions := t.GetMentions(); len(mentions) > 0 {
-		for _, mn := range mentions {
-			jid, err := waTypes.ParseJID(mn.GetMentionedJID())
-			if err != nil {
-				continue
-			}
-			out = append(out, mention{offset: int(mn.GetOffset()), length: int(mn.GetLength()), fbid: int64(jid.UserInt())})
-		}
-		return text, out
+		return text, waMentions(mentions)
 	}
+	type person struct {
+		raw  string // the JID as the sender wrote it
+		fbid int64
+	}
+	named := map[string]person{} // by the JID's user part, all digits
+	for _, raw := range t.GetMentionedJID() {
+		if len(named) == MaxMentions {
+			break
+		}
+		jid, err := waTypes.ParseJID(raw)
+		if err != nil || jid.UserInt() == 0 {
+			continue
+		}
+		if _, ok := named[jid.User]; !ok {
+			if len(raw) > maxNamedJID {
+				raw = ""
+			}
+			named[jid.User] = person{raw, int64(jid.UserInt())}
+		}
+	}
+	if len(named) == 0 {
+		return text, nil
+	}
+	// Where each is first written, in full or as "@<id>": an "@" is
+	// followed by at most one id, its digits.
 	type spot struct {
 		at, end int
 		fbid    int64
 	}
-	var spots []spot
-	for _, raw := range t.GetMentionedJID() {
-		jid, err := waTypes.ParseJID(raw)
-		if err != nil {
+	full, short := map[string]spot{}, map[string]spot{}
+	for i := 0; i < len(text); i++ {
+		if text[i] != '@' {
 			continue
 		}
-		for _, needle := range []string{"@" + raw, "@" + jid.User} {
-			if i := strings.Index(text, needle); i >= 0 {
-				spots = append(spots, spot{i, i + len(needle), int64(jid.UserInt())})
-				break
+		j := i + 1
+		for j < len(text) && text[j] >= '0' && text[j] <= '9' {
+			j++
+		}
+		user := text[i+1 : j]
+		if p, ok := named[user]; ok {
+			if _, seen := full[user]; !seen && p.raw != "" && strings.HasPrefix(text[i+1:], p.raw) {
+				full[user] = spot{i, i + 1 + len(p.raw), p.fbid}
 			}
+			if _, seen := short[user]; !seen {
+				short[user] = spot{i, j, p.fbid}
+			}
+		}
+		i = j - 1
+	}
+	spots := make([]spot, 0, len(named))
+	for user := range named {
+		if s, ok := full[user]; ok {
+			spots = append(spots, s)
+		} else if s, ok := short[user]; ok {
+			spots = append(spots, s)
 		}
 	}
 	slices.SortFunc(spots, func(a, b spot) int { return a.at - b.at })
 	var b strings.Builder
-	prev := 0
+	var out []mention
+	prev, units := 0, 0 // units: the UTF-16 length of what's built
 	for _, s := range spots {
 		if s.at < prev {
 			continue
 		}
-		b.WriteString(text[prev:s.at])
-		start := b.Len()
-		b.WriteString("@" + m.displayName(s.fbid))
-		built := b.String()
-		off, n := proto.UTF16Range(built, start, len(built))
-		out = append(out, mention{offset: off, length: n, fbid: s.fbid})
+		before := text[prev:s.at]
+		b.WriteString(before)
+		units += proto.UTF16Len(before)
+		name := "@" + m.displayName(s.fbid)
+		b.WriteString(name)
+		n := proto.UTF16Len(name)
+		out = append(out, mention{offset: units, length: n, fbid: s.fbid})
+		units += n
 		prev = s.end
 	}
 	b.WriteString(text[prev:])
@@ -802,25 +1413,33 @@ func (m *Messenger) displayName(fbid int64) string {
 func (m *Messenger) waMedia(t *waMediaTransport.WAMediaTransport, kind proto.MediaKind, mediaType whatsmeow.MediaType, name string, w, h, seconds int) proto.Media {
 	integral, anc := t.GetIntegral(), t.GetAncillary()
 	md := proto.Media{Kind: kind, Mime: anc.GetMimetype(), Size: int64(anc.GetFileLength()), Width: w, Height: h, Duration: seconds, Name: name}
-	hash := integral.GetFileSHA256()
-	if len(hash) == 0 {
-		hash = integral.GetFileEncSHA256()
-	}
-	if len(hash) == 0 || integral.GetDirectPath() == "" {
+	// The file is named by its hash and its media key together, as the
+	// WhatsApp backend's mediaRefs does: the hash alone is the sender's to
+	// state, so another sender stating someone else's file's hash could
+	// otherwise take over its entry (its name, where it's fetched from, its
+	// still), while the media key is held only by the file's own messages.
+	// Without the hash whatsmeow can't check what it downloads, and refuses.
+	hash, mediaKey := integral.GetFileSHA256(), integral.GetMediaKey()
+	if len(hash) == 0 || len(mediaKey) == 0 || integral.GetDirectPath() == "" {
 		return md
 	}
-	key := "wa:" + hex.EncodeToString(hash)
+	named := sha256.New()
+	named.Write(hash)
+	named.Write(mediaKey)
+	key := "wa:" + hex.EncodeToString(named.Sum(nil))
 	md.FileID = m.d.Files.Register(ids.FileRef{
 		Network: net, Key: key, Size: md.Size, Mime: md.Mime, Name: name,
-		Source: &waSource{Integral: integral, MediaType: mediaType},
+		Source: &waSource{Integral: integral, MediaType: mediaType, Kind: kind},
 	})
 	switch {
 	case (kind == proto.Photo || kind == proto.Sticker || kind == proto.GIF) && md.FileID != 0 && strings.HasPrefix(md.Mime, "image/"):
 		md.Thumbnail = &proto.Image{FileID: md.FileID, Width: w, Height: h}
 	case len(anc.GetThumbnail().GetJPEGThumbnail()) > 0:
+		// A still the message carries is named by its own bytes: they're
+		// what's shown, whatever the file's entry says.
 		th := anc.GetThumbnail()
 		id := m.d.Files.Register(ids.FileRef{
-			Network: net, Key: key + ":thumb", Size: int64(len(th.GetJPEGThumbnail())), Mime: "image/jpeg", Name: "thumbnail.jpg",
+			Network: net, Key: "wa:thumb:" + contentKey(th.GetJPEGThumbnail()), Size: int64(len(th.GetJPEGThumbnail())), Mime: "image/jpeg", Name: "thumbnail.jpg",
 			Source: &inlineSource{Data: th.GetJPEGThumbnail()},
 		})
 		if id != 0 {
@@ -828,6 +1447,12 @@ func (m *Messenger) waMedia(t *waMediaTransport.WAMediaTransport, kind proto.Med
 		}
 	}
 	return md
+}
+
+// contentKey names bytes a message carries by their hash.
+func contentKey(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // undecryptable shows a message that couldn't be decrypted yet; whatsmeow
@@ -838,11 +1463,11 @@ func (m *Messenger) undecryptable(e *events.UndecryptableMessage) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := m.waChat(e.Info.Chat)
+	sender := e.Info.Sender.ToNonAD()
+	c := m.waChat(e.Info.Chat, sender, e.Info.IsFromMe)
 	if c == nil {
 		return
 	}
-	sender := e.Info.Sender.ToNonAD()
 	netID := waNetID(sender, e.Info.ID)
 	if c.msgs[netID] != nil {
 		return
@@ -855,8 +1480,20 @@ func (m *Messenger) undecryptable(e *events.UndecryptableMessage) {
 		netID: netID, ms: e.Info.Timestamp.UnixMilli(), sender: fbid,
 		unsupported: "[Waiting for this message; it couldn't be decrypted yet]",
 		wa:          &waRef{chat: e.Info.Chat, sender: sender, id: e.Info.ID},
+		placeholder: true,
 	}
 	m.arrived(c, msg, "")
+}
+
+// markReadWA sends the receipt for what you read of sender's encrypted
+// messages, for the request purpose: one they see, or, where your read
+// receipts are off, one only your own devices act on (whatsmeow's
+// "read-self").
+func markReadWA(ctx context.Context, e2ee e2eeAPI, purpose string, off bool, ids []waTypes.MessageID, at time.Time, chat, sender waTypes.JID) error {
+	if off {
+		return e2ee.MarkReadSelf(ctx, purpose, ids, at, chat, sender)
+	}
+	return e2ee.MarkRead(ctx, purpose, ids, at, chat, sender)
 }
 
 // waReceipt handles read receipts in encrypted chats: someone read your
@@ -865,20 +1502,46 @@ func (m *Messenger) waReceipt(e *events.Receipt) {
 	if e.Type != waTypes.ReceiptTypeRead && e.Type != waTypes.ReceiptTypeReadSelf {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key, err := strconv.ParseInt(e.Chat.User, 10, 64)
-	if err != nil {
+	key, ok := waChatKey(e.Chat)
+	if !ok {
 		return
 	}
+	// The ids once each, before the lock: a receipt may name thousands.
+	named := make(map[waTypes.MessageID]bool, len(e.MessageIDs))
+	for _, id := range e.MessageIDs {
+		named[id] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c := m.lookupChat(key)
 	if c == nil {
 		return
 	}
+	// whatsmeow leaves IsFromMe unset on the users a grouped receipt lists,
+	// so your own account's id counts too.
+	fromMe := e.IsFromMe || int64(e.Sender.UserInt()) == m.self
+	if !fromMe && e.Type == waTypes.ReceiptTypeReadSelf {
+		return // someone else's "read-self" says nothing about what you read
+	}
+	// Whose messages the ids can name: someone else reads yours; you read
+	// another person's (the one the receipt says, else the chat's other
+	// person or, in a group, anyone's).
+	from := func(msg *message) bool { return msg.sender == m.self }
+	if fromMe {
+		switch {
+		case !e.MessageSender.IsEmpty():
+			who := int64(e.MessageSender.UserInt())
+			from = func(msg *message) bool { return msg.sender == who && who != m.self }
+		case c.kind == proto.DM:
+			from = func(msg *message) bool { return msg.sender == c.other && c.other != m.self }
+		default:
+			from = func(msg *message) bool { return msg.sender != m.self }
+		}
+	}
 	var newest int64
-	for _, id := range e.MessageIDs {
-		for _, msg := range c.msgs {
-			if msg.wa != nil && msg.wa.id == id {
+	for id := range named {
+		for _, netID := range c.waIDs[id] {
+			if msg := c.msgs[netID]; msg != nil && from(msg) {
 				newest = max(newest, msg.ms)
 			}
 		}
@@ -886,7 +1549,7 @@ func (m *Messenger) waReceipt(e *events.Receipt) {
 	if newest == 0 {
 		return
 	}
-	if e.Type == waTypes.ReceiptTypeReadSelf || e.IsFromMe {
+	if fromMe {
 		m.readElsewhere(c.key, newest)
 		return
 	}
@@ -895,12 +1558,12 @@ func (m *Messenger) waReceipt(e *events.Receipt) {
 
 // waTyping reports someone typing in an encrypted chat.
 func (m *Messenger) waTyping(e *events.ChatPresence) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key, err := strconv.ParseInt(e.Chat.User, 10, 64)
-	if err != nil {
+	key, ok := waChatKey(e.Chat)
+	if !ok {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c := m.lookupChat(key)
 	who := int64(e.Sender.UserInt())
 	if c == nil || who == m.self || who == 0 {
@@ -915,12 +1578,12 @@ func (m *Messenger) waTyping(e *events.ChatPresence) {
 // or left. These come as notifications, not messages, so they're shown as
 // events of their own.
 func (m *Messenger) waGroupInfo(e *events.GroupInfo) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key, err := strconv.ParseInt(e.JID.User, 10, 64)
-	if err != nil {
+	key, ok := waChatKey(e.JID)
+	if !ok || e.JID.Server != waTypes.GroupServer {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c := m.lookupChat(key)
 	if c == nil {
 		return
@@ -952,6 +1615,7 @@ func (m *Messenger) waGroupInfo(e *events.GroupInfo) {
 		fbid := int64(j.UserInt())
 		c.members = slices.DeleteFunc(c.members, func(id int64) bool { return id == fbid })
 		if fbid == m.self && (e.Sender == nil || int64(e.Sender.UserInt()) == m.self) {
+			m.forgetKept(c)
 			m.removeChat(c)
 			return
 		}

@@ -180,7 +180,9 @@ func (s *Store) ChatsOf(n proto.Network) []int64 {
 }
 
 // Forget drops everything known about the network's chats and people (on
-// logout). Their ids aren't given out again.
+// logout). Their ids aren't given out again. A file set aside as unreadable
+// goes too: it may hold the network's ids (WhatsApp's are phone numbers),
+// and nothing reads it.
 func (s *Store) Forget(n proto.Network) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,6 +192,9 @@ func (s *Store) Forget(n proto.Network) {
 			delete(s.byID, id)
 			s.dirty = true
 		}
+	}
+	if err := os.Remove(s.path + ".bad"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		hlog.Warn("can't delete the unreadable ids file", hlog.Kind(err))
 	}
 }
 

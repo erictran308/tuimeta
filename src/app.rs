@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{self, Stdio};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -198,9 +197,12 @@ pub struct Confirm {
     /// is at the end of its host, so a long one is cut from the left.
     pub site: Option<String>,
     pub action: Confirmed,
-    /// When it came up. A `y` in the first moments was typed for whatever
-    /// was on screen before, so it doesn't count.
+    /// When it came into view. A `y` in the first moments was typed for
+    /// whatever was on screen before, so it doesn't count.
     pub shown: Instant,
+    /// It has been in view since `shown`: on the chats screen, in a window
+    /// with focus.
+    in_view: bool,
 }
 
 impl Confirm {
@@ -211,6 +213,7 @@ impl Confirm {
             site: None,
             action,
             shown: Instant::now(),
+            in_view: false,
         }
     }
 }
@@ -269,6 +272,32 @@ fn safe_to_open(path: &str) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| SAFE_TO_OPEN.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Why a link written out in full can still pass for another site, if it
+/// can: its site has letters of other scripts (also when written as
+/// `xn--`), some of which look just like Latin ones, or a name before an
+/// `@` reads as the site while the site is what comes after it.
+fn look_alike(url: &str) -> Option<&'static str> {
+    let host = link_host(url)?;
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https:")
+        .or_else(|| lower.strip_prefix("http:"))?
+        .trim_start_matches(['/', '\\']);
+    let authority = &rest[..rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        Some("The part before the @ is not the site.")
+    } else if other_scripts(&host) {
+        Some("Its site has letters that can pass for Latin ones.")
+    } else {
+        None
+    }
+}
+
+/// A host with letters other than Latin ones, as typed or as `xn--`.
+fn other_scripts(host: &str) -> bool {
+    !host.is_ascii() || host.split('.').any(|label| label.starts_with("xn--"))
 }
 
 /// What picking from a [`PickMenu`] does.
@@ -491,14 +520,21 @@ impl Prompt {
 
 /// A chat being looked up to open, with `s`: the chat with someone found.
 pub struct Finding {
-    /// Whom it's with, for the status bar and to match the helper's answer.
+    /// Whom it's with, for the status bar.
     pub request: String,
+    /// Who was picked: only the answer about them opens a chat. Names are
+    /// their owners' to choose, so two people can share one, and an answer
+    /// about someone picked before can come after a later pick.
+    pub network: Network,
+    pub user_id: i64,
 }
 
 impl Finding {
-    fn new(request: &str) -> Self {
+    fn new(request: &str, network: Network, user_id: i64) -> Self {
         Self {
             request: request.to_string(),
+            network,
+            user_id,
         }
     }
 }
@@ -531,6 +567,29 @@ impl Command {
     pub fn parse(text: &str) -> Option<Command> {
         Command::ALL.into_iter().find(|c| c.name() == text)
     }
+}
+
+/// What decides which pictures a frame draws: see [`must_clear`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layers {
+    /// The login screen, which draws none.
+    login: bool,
+    /// A popup over the chat, under which the bubbles' pictures are held back.
+    covered: bool,
+    /// The viewer's photo, by file id, and the size it's zoomed to.
+    viewer: Option<(i32, Option<usize>)>,
+}
+
+/// Whether to clear the terminal before drawing a frame with `now` after
+/// one with `before`. Sixel and iTerm2 pictures (`paints_over`) stay on
+/// screen until every cell of them is drawn over, which tmux may skip for
+/// blank ones: so whenever pictures stop being drawn or move (the login
+/// screen, a popup over the chat, the viewer's photo opening, closing,
+/// changing size or making way for another), everything is drawn again,
+/// and no sender's picture shows through the blank cells of a warning or
+/// of the login screen.
+fn must_clear(before: Option<Layers>, now: Layers, paints_over: bool) -> bool {
+    paints_over && before.is_some_and(|before| before != now)
 }
 
 /// Ctrl-r's resize mode: the chat list's width before, in percent of the
@@ -573,6 +632,13 @@ pub struct App {
     pub toast: Option<Toast>,
     /// Shown over everything when Enter or `y` finds several things.
     pub menu: Option<PickMenu>,
+    /// The message of the open chat `menu` is about.
+    menu_message: Option<i64>,
+    /// Messages of the open chat that came in, changed, or came under the
+    /// cursor through someone else's deletion in the last
+    /// [`CONFIRM_GRACE`], and when: an Enter that quick was typed for what
+    /// was there before.
+    changed: HashMap<i64, Instant>,
     pub delete_menu: Option<DeleteMenu>,
     pub react_menu: Option<ReactMenu>,
     /// Enter on a photo: it, as big as the window allows.
@@ -642,9 +708,8 @@ pub struct App {
     notified: HashMap<i64, i64>,
     /// Unmuted chats with unread messages, shown in the window title.
     unread_chats: i32,
-    /// The photo the last frame showed in the viewer, by file id, and the
-    /// size it was zoomed to.
-    shown_in_viewer: Option<(i32, Option<usize>)>,
+    /// What decided which pictures the last frame drew.
+    drawn_layers: Option<Layers>,
     /// The browser a login says tuimeta is (`TM_BROWSER`: Chrome and its full
     /// version), so the session looks like the browser its cookies came
     /// from. `None` leaves it to the helper.
@@ -686,6 +751,8 @@ impl App {
             pasting: false,
             toast: None,
             menu: None,
+            menu_message: None,
+            changed: HashMap::new(),
             delete_menu: None,
             react_menu: None,
             photo_view: None,
@@ -722,7 +789,7 @@ impl App {
             notify_since: i64::MAX,
             notified: HashMap::new(),
             unread_chats: 0,
-            shown_in_viewer: None,
+            drawn_layers: None,
             browser: None,
             login_attempt: 0,
             exit: false,
@@ -771,15 +838,10 @@ impl App {
             {
                 self.selected = self.chats.ids().first().copied();
             }
-            // Sixel and iTerm2 pictures stay on screen until every cell of
-            // them is drawn over, which tmux may skip for blank ones: the
-            // viewer's photo once it closes, changes size or makes way for
-            // another, and the bubbles' under its blank edges once it opens.
-            let in_viewer = self.photo_view.as_ref().map(|v| (v.photo.file_id, v.zoom));
-            if in_viewer != self.shown_in_viewer && self.images.paints_over() {
+            if self.clear_before_drawing(self.images.paints_over()) {
                 let _ = terminal.clear();
             }
-            self.shown_in_viewer = in_viewer;
+            self.confirm_in_view();
             self.mark_seen();
             self.set_unread_chats(self.chats.unread_chats());
             self.send_notification();
@@ -845,6 +907,40 @@ impl App {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// A warning's grace counts from when it can be seen, before the next
+    /// frame: not while the login screen hides it or the window is in the
+    /// background, so one that came up meanwhile (a download finishing, say)
+    /// still ignores a `y` at first.
+    fn confirm_in_view(&mut self) {
+        let visible = matches!(self.screen, Screen::Main) && self.terminal_focused;
+        let Some(confirm) = self.confirm.as_mut() else {
+            return;
+        };
+        if !visible {
+            confirm.in_view = false;
+        } else if !confirm.in_view {
+            confirm.in_view = true;
+            confirm.shown = Instant::now();
+        }
+    }
+
+    /// What decides which pictures the next frame draws.
+    fn layers(&self) -> Layers {
+        Layers {
+            login: matches!(self.screen, Screen::Login(_)),
+            covered: self.popup_over_chat(),
+            viewer: self.photo_view.as_ref().map(|v| (v.photo.file_id, v.zoom)),
+        }
+    }
+
+    /// Whether the terminal is to be cleared before the next frame, which
+    /// is then taken as drawn (see [`must_clear`]).
+    fn clear_before_drawing(&mut self, paints_over: bool) -> bool {
+        let now = self.layers();
+        let before = self.drawn_layers.replace(now);
+        must_clear(before, now, paints_over)
     }
 
     /// The terminal is gone (a closed window, a dropped SSH connection), or
@@ -979,12 +1075,12 @@ impl App {
                     self.on_login_code(network, qr, pairing, expires)
                 }
             }
+            // Not the login's answer, which is `LoggedIn` for its attempt:
+            // it may be about another network or request, and a link goes
+            // on waiting, its codes still shown and Esc still cancelling it.
             MetaEvent::Error(message) => match &mut self.screen {
-                Screen::Login(login) => {
-                    login.busy = false;
-                    login.error = Some(message);
-                }
-                Screen::Main => self.status = Some(message),
+                Screen::Login(login) => login.error = Some(text::clean(&message)),
+                Screen::Main => self.status = Some(text::clean(&message)),
             },
             MetaEvent::Gone(why) => {
                 // Nothing more can come: say so, and leave once the user
@@ -993,7 +1089,10 @@ impl App {
                     self.exit = true;
                     return;
                 }
-                let why = format!("{why}. Quit and start tuimeta again; helper.log says more");
+                let why = format!(
+                    "{}. Quit and start tuimeta again; helper.log says more",
+                    text::clean(&why)
+                );
                 match &mut self.screen {
                     Screen::Login(login) => {
                         login.busy = false;
@@ -1056,7 +1155,7 @@ impl App {
             } => {
                 self.status = Some(match error.is_empty() {
                     true => "Message not sent".into(),
-                    false => format!("Message not sent: {error}"),
+                    false => format!("Message not sent: {}", text::clean(&error)),
                 });
                 if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) {
                     open.set_failed(old_id);
@@ -1065,26 +1164,7 @@ impl App {
             MetaEvent::MessagesDeleted {
                 chat_id,
                 message_ids,
-            } => {
-                self.notifier.remove(chat_id, &message_ids);
-                if self
-                    .photo_view
-                    .as_ref()
-                    .is_some_and(|v| message_ids.iter().any(|&id| v.lost(chat_id, id, None)))
-                {
-                    self.photo_view = None;
-                }
-                if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) {
-                    open.remove(&message_ids);
-                }
-                if self
-                    .delete_menu
-                    .as_ref()
-                    .is_some_and(|m| message_ids.contains(&m.message_id))
-                {
-                    self.delete_menu = None;
-                }
-            }
+            } => self.on_deleted(chat_id, &message_ids),
             MetaEvent::Read {
                 chat_id,
                 inbox,
@@ -1164,9 +1244,19 @@ impl App {
                     picker.set_found(network, &query, found);
                 }
             }
-            MetaEvent::ChatFound { request, found } => {
-                // Dropped if another chat was opened meanwhile.
-                if !self.finding.as_ref().is_some_and(|f| f.request == request) {
+            MetaEvent::ChatFound {
+                network,
+                user_id,
+                request,
+                found,
+            } => {
+                // Dropped if another chat was opened meanwhile, or it's about
+                // someone picked before the one being looked up.
+                if !self
+                    .finding
+                    .as_ref()
+                    .is_some_and(|f| f.network == network && f.user_id == user_id)
+                {
                     return;
                 }
                 self.finding = None;
@@ -1181,7 +1271,7 @@ impl App {
                 }
                 match found {
                     Ok(chat_id) => self.open_chat(chat_id),
-                    Err(why) => self.status = Some(why),
+                    Err(why) => self.status = Some(text::clean(&why)),
                 }
             }
         }
@@ -1280,6 +1370,9 @@ impl App {
                 let mut choose = Login::new(LoginStep::Choose { selected: 0 });
                 choose.error = error;
                 self.screen = Screen::Login(Box::new(choose));
+                // A warning from the chats screen would come back after the
+                // next login, about what's past, perhaps another account.
+                self.confirm = None;
             }
             Screen::Main => {}
         }
@@ -1319,6 +1412,18 @@ impl App {
         self.loading_chats.remove(&network);
         self.loaded_chats.remove(&network);
         self.picker = None;
+        // Its pictures, and where its downloads were, which the helper
+        // deleted with the rest.
+        self.images.forget();
+        // Asking to log out of it is moot, and a `y` would log out of the
+        // account linked next.
+        if self
+            .confirm
+            .as_ref()
+            .is_some_and(|c| matches!(c.action, Confirmed::Logout(n) if n == network))
+        {
+            self.confirm = None;
+        }
     }
 
     fn on_history(
@@ -1365,8 +1470,75 @@ impl App {
             {
                 self.photo_view = None;
             }
+            self.just_changed(message.id);
         }
         self.notify(message);
+    }
+
+    /// Messages were deleted, by their sender, on another device or when
+    /// their time was up. What was about them goes with them: no open, copy
+    /// or menu acts on a file whose message is gone, nor a popup on the
+    /// message.
+    fn on_deleted(&mut self, chat_id: i64, message_ids: &[i64]) {
+        self.notifier.remove(chat_id, message_ids);
+        if self
+            .photo_view
+            .as_ref()
+            .is_some_and(|v| message_ids.iter().any(|&id| v.lost(chat_id, id, None)))
+        {
+            self.photo_view = None;
+        }
+        let Some(open) = self.open.as_mut().filter(|o| o.chat_id == chat_id) else {
+            return;
+        };
+        let files: Vec<i32> = message_ids
+            .iter()
+            .filter_map(|id| open.messages.get(id))
+            .flat_map(|m| {
+                let file = m.file.as_ref().map(|f| f.id);
+                file.into_iter().chain(m.photo.as_ref().map(|p| p.file_id))
+            })
+            .collect();
+        for file in &files {
+            self.opening.remove(file);
+            self.copying.remove(file);
+        }
+        let editing = open
+            .editing
+            .as_ref()
+            .is_some_and(|e| message_ids.contains(&e.id));
+        // A cursor that was on one of them lands on another, which may
+        // never have been on screen: Enter mustn't open it at once.
+        let before = open.cursor_id();
+        open.remove(message_ids);
+        let after = open.cursor_id().filter(|&after| Some(after) != before);
+        if let Some(id) = after {
+            self.just_changed(id);
+        }
+        if editing {
+            self.end_edit();
+            self.status = Some("The message you were editing was deleted".into());
+        }
+        let about = |id: Option<i64>| id.is_some_and(|id| message_ids.contains(&id));
+        if self.menu.is_some() && about(self.menu_message) {
+            self.menu = None;
+        }
+        if about(self.delete_menu.as_ref().map(|m| m.message_id)) {
+            self.delete_menu = None;
+        }
+        if about(self.react_menu.as_ref().map(|m| m.message_id)) {
+            self.react_menu = None;
+        }
+    }
+
+    /// Message `id` of the open chat just came in, changed, or moved under
+    /// the cursor: Enter waits [`CONFIRM_GRACE`] before opening anything in
+    /// it, as a [`Confirm`] does for `y`.
+    fn just_changed(&mut self, id: i64) {
+        let now = Instant::now();
+        self.changed
+            .retain(|_, at| now.duration_since(*at) < CONFIRM_GRACE);
+        self.changed.insert(id, now);
     }
 
     /// Tells the user about someone else's new message, unless the chat is
@@ -1572,7 +1744,11 @@ impl App {
         let from_main = login.from_main;
         match key.code {
             KeyCode::Esc => {
-                if login.busy {
+                // A cancel names its attempt: for a link that already ended
+                // it does nothing, and one still waiting must stop, whatever
+                // the screen shows. On the number step, the `p` that opened
+                // it has cancelled already.
+                if !typing {
                     self.meta.cancel_login(network, self.login_attempt);
                 }
                 self.back_to_choose(network);
@@ -1588,10 +1764,8 @@ impl App {
                 login.input.input(key);
             }
             KeyCode::Char('p') => {
-                if login.busy {
-                    // The codes shown so far stop working.
-                    self.meta.cancel_login(network, self.login_attempt);
-                }
+                // The codes shown so far stop working.
+                self.meta.cancel_login(network, self.login_attempt);
                 let mut ask = Login::new(LoginStep::Link {
                     network,
                     how: Linking::Phone,
@@ -1981,12 +2155,11 @@ impl App {
         if open.attachments.is_empty() {
             self.meta.send_text(open.chat_id, text, reply_to);
         } else {
-            let paths = open
-                .attachments
-                .iter()
-                .map(|a| a.path.to_string_lossy().into_owned())
-                .collect();
-            self.meta.send_files(open.chat_id, paths, text, reply_to);
+            // What was checked, not only where: the helper reads the files
+            // later, in another process, and sends none unless each is still
+            // the one listed.
+            let files = open.attachments.iter().map(Attachment::to_send).collect();
+            self.meta.send_files(open.chat_id, files, text, reply_to);
             open.attachments.clear();
             open.dropped = None;
         }
@@ -2077,6 +2250,12 @@ impl App {
             PromptKind::Attach if !submit || query.is_empty() => {}
             PromptKind::Attach => {
                 let path = attach::expand_home(&query);
+                // Not even looked at, as with a paste: that would hand the
+                // server the user's Windows login hash.
+                if attach::on_another_machine(&path) {
+                    self.status = Some("Files on another machine can't be attached".into());
+                    return;
+                }
                 // A file dropped on the prompt comes quoted.
                 let paths = match attach::pasted_paths(&query) {
                     Some(paths) if !path.exists() => paths,
@@ -2100,6 +2279,12 @@ impl App {
     fn mark_seen(&mut self) {
         let watched = self.open.as_ref().map(|o| o.chat_id);
         if !watched.is_some_and(|id| self.watching(id)) {
+            return;
+        }
+        // A message request isn't accepted yet: a receipt would tell a
+        // stranger the account is here and read them before the user chose
+        // to answer. It goes once the chat is accepted (replying accepts it).
+        if watched.is_some_and(|id| self.chats.get(id).is_some_and(|c| c.request)) {
             return;
         }
         let Some(open) = self.open.as_mut() else {
@@ -2393,6 +2578,7 @@ impl App {
         self.set_typing(false);
         // A paste on its way was for these messages.
         self.pasting = false;
+        self.changed.clear();
         if self.open.take().is_some() {
             self.images.clear();
         }
@@ -2411,17 +2597,32 @@ impl App {
         let file = msg.file.clone().map(|file| file_target(id, msg, file));
         let mut targets: Vec<Target> = file.into_iter().collect();
         targets.extend(msg.links.iter().cloned().map(Target::Link));
+        // A message that came in or changed a moment ago, maybe just as the
+        // key went down, isn't what the user meant to open.
+        let just_changed = self
+            .changed
+            .get(&id)
+            .is_some_and(|at| at.elapsed() < CONFIRM_GRACE);
         match targets.len() {
             0 => self.status = Some("Nothing to open in this message".into()),
-            1 => self.open_target(targets.remove(0)),
-            _ => {
-                self.menu = Some(PickMenu {
-                    action: MenuAction::Open,
-                    targets,
-                    selected: 0,
-                })
+            _ if just_changed => {
+                self.status =
+                    Some("It just came in or changed: press Enter again to open it".into());
             }
+            1 => self.open_target(targets.remove(0)),
+            _ => self.show_menu(id, MenuAction::Open, targets),
         }
+    }
+
+    /// The menu of what to open or copy in message `id`, the first item
+    /// picked.
+    fn show_menu(&mut self, id: i64, action: MenuAction, targets: Vec<Target>) {
+        self.menu = Some(PickMenu {
+            action,
+            targets,
+            selected: 0,
+        });
+        self.menu_message = Some(id);
     }
 
     /// `r`: answer the message under the cursor. Goes straight to Insert mode,
@@ -2734,7 +2935,7 @@ impl App {
                 name,
                 ..
             } => {
-                self.finding = Some(Finding::new(&name));
+                self.finding = Some(Finding::new(&name, network, user_id));
                 self.meta.open_dm(network, user_id, name);
             }
         }
@@ -2919,32 +3120,29 @@ impl App {
     }
 
     /// Opens a link in the browser, asking first if its words say something
-    /// other than where it goes.
+    /// other than where it goes, or its address can pass for another.
     fn open_link_outside(&mut self, link: Link) {
-        match link {
-            Link {
-                url,
-                disguise: Some(shown),
-            } => {
-                // Browsers show other scripts' letters as such, so a look-alike
-                // host can pass for a familiar one.
-                let site = link_host(&url).map(|host| match host.is_ascii() {
-                    true => host,
-                    false => format!("{host} (has non-Latin letters)"),
-                });
-                let mut confirm = Confirm::new(
-                    "Open this link?",
-                    vec![
-                        format!("The text says: {shown}"),
-                        format!("Full address:  {url}"),
-                    ],
-                    Confirmed::OpenLink(url),
-                );
-                confirm.site = site;
-                self.confirm = Some(confirm);
-            }
-            link => self.open_externally(&link.url),
-        }
+        let Link { url, disguise, .. } = link;
+        let why = match disguise {
+            Some(shown) => format!("The text says: {shown}"),
+            None => match look_alike(&url) {
+                Some(why) => why.to_string(),
+                None => return self.open_externally(&url),
+            },
+        };
+        // Browsers show other scripts' letters as such, so a look-alike
+        // host can pass for a familiar one.
+        let site = link_host(&url).map(|host| match other_scripts(&host) {
+            false => host,
+            true => format!("{host} (has non-Latin letters)"),
+        });
+        let mut confirm = Confirm::new(
+            "Open this link?",
+            vec![why, format!("Full address:  {url}")],
+            Confirmed::OpenLink(url),
+        );
+        confirm.site = site;
+        self.confirm = Some(confirm);
     }
 
     /// A file finished downloading for Enter: opened at once if it's a
@@ -2989,9 +3187,16 @@ impl App {
     /// the photo viewer, settings or the resize bar. These cover the view
     /// and take every key, so the user isn't reading the chat behind them —
     /// which is why `watching` (read receipts) must treat them as not seen,
-    /// not just the settings menu.
+    /// not just the settings menu. So does the list of emoji suggestions,
+    /// drawn over the bottom of the messages, where the newest one is.
     fn popup_over_chat(&self) -> bool {
-        self.confirm.is_some()
+        let suggesting = self.focus == Focus::Input
+            && self
+                .completion
+                .as_ref()
+                .is_some_and(|c| !c.items.is_empty());
+        suggesting
+            || self.confirm.is_some()
             || self.settings_menu.is_some()
             || self.delete_menu.is_some()
             || self.react_menu.is_some()
@@ -3039,7 +3244,10 @@ impl App {
         let Some(open) = &self.open else {
             return;
         };
-        let Some(msg) = open.cursor_id().and_then(|id| open.messages.get(&id)) else {
+        let Some((&id, msg)) = open
+            .cursor_id()
+            .and_then(|id| open.messages.get_key_value(&id))
+        else {
             return;
         };
         let mut targets = Vec::new();
@@ -3051,13 +3259,7 @@ impl App {
         match targets.len() {
             0 => self.status = Some("Nothing to copy in this message".into()),
             1 => self.copy_target(targets.remove(0)),
-            _ => {
-                self.menu = Some(PickMenu {
-                    action: MenuAction::Copy,
-                    targets,
-                    selected: 0,
-                })
-            }
+            _ => self.show_menu(id, MenuAction::Copy, targets),
         }
     }
 
@@ -3602,10 +3804,11 @@ fn open_externally(target: &str) -> std::io::Result<()> {
 fn mark_downloaded(path: &str) {
     #[cfg(target_os = "macos")]
     {
+        use std::process::{Command, Stdio};
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let _ = process::Command::new("/usr/bin/xattr")
+        let _ = Command::new("/usr/bin/xattr")
             .args([
                 "-w",
                 "com.apple.quarantine",
@@ -3864,6 +4067,102 @@ mod tests {
     const SUNNY_IN_DEMO: i64 = 1;
 
     #[test]
+    fn nothing_is_marked_read_under_the_emoji_suggestions() {
+        let mut app = test_app("read-suggest");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.focus = Focus::Input;
+        for c in "so :smi".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.completion.as_ref().is_some_and(|c| !c.items.is_empty()));
+        assert!(!app.watching(chat_id), "they cover the newest message");
+        app.on_meta(MetaEvent::Message(Box::new(incoming(&app, 1 << 60, "hi"))));
+        app.mark_seen();
+        assert!(sent_with(&app, "mark_read").is_empty());
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.completion.as_ref().is_none_or(|c| c.items.is_empty()));
+        app.mark_seen();
+        assert_eq!(sent_with(&app, "mark_read").len(), 1, "once they're gone");
+    }
+
+    #[test]
+    fn pictures_that_paint_over_cells_are_cleared_whenever_something_stops_drawing_them() {
+        let mut app = test_app("clear-pictures");
+        let none = KeyModifiers::NONE;
+        app.focus = Focus::Messages;
+        let clears = |app: &mut App| app.clear_before_drawing(true);
+        assert!(!clears(&mut app), "the first frame has nothing to clear");
+        assert!(!clears(&mut app), "nor one like the last");
+
+        let link = || Confirmed::OpenLink("https://example.com".into());
+        for _ in 0..2 {
+            app.confirm = Some(Confirm::new("Open this link?", vec![], link()));
+            assert!(clears(&mut app), "a warning over the chat");
+            assert!(!clears(&mut app));
+            app.confirm = None;
+            assert!(clears(&mut app), "the pictures come back");
+        }
+        press(&mut app, KeyCode::Char('R'), none);
+        assert!(app.react_menu.is_some());
+        assert!(clears(&mut app), "the reaction popup");
+        press(&mut app, KeyCode::Esc, none);
+        assert!(clears(&mut app));
+
+        app.ask_to_log_in();
+        assert!(clears(&mut app), "the login screen");
+        app.screen = Screen::Main;
+        assert!(clears(&mut app));
+
+        let (_, id) = photo_message(&mut app);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(clears(&mut app), "the viewer");
+        press(&mut app, KeyCode::Char('k'), none);
+        assert!(clears(&mut app), "zoomed");
+        assert!(!clears(&mut app));
+        press(&mut app, KeyCode::Esc, none);
+        assert!(clears(&mut app));
+        assert_eq!(app.open.as_ref().unwrap().selected, Some(id));
+
+        // Pictures drawn in cells (half blocks) go with them.
+        app.confirm = Some(Confirm::new("Open this link?", vec![], link()));
+        assert!(!app.clear_before_drawing(false));
+        assert!(!must_clear(None, app.layers(), true));
+    }
+
+    #[test]
+    fn a_message_request_is_read_without_telling_the_sender_until_it_is_accepted() {
+        let mut app = test_app("request-read");
+        let chat = |request: bool| {
+            let info: ChatInfo = serde_json::from_value(serde_json::json!({
+                "id": 900, "network": "messenger", "kind": "dm", "title": "Stranger",
+                "user_id": 901, "request": request,
+            }))
+            .unwrap();
+            MetaEvent::Chat(Box::new(info))
+        };
+        app.on_meta(chat(true));
+        app.open_chat(900);
+        let hello = message(serde_json::json!({"id": 1_i64 << 40, "chat_id": 900,
+            "sender_id": 901, "date": unix_now() - 3600, "text": "hello"}));
+        app.on_meta(MetaEvent::History {
+            chat_id: 900,
+            page: Page::Latest,
+            messages: Some(vec![hello]),
+        });
+        assert!(app.watching(900), "on screen, as any chat");
+        app.mark_seen();
+        assert!(sent_with(&app, "mark_read").is_empty());
+
+        // Accepted (on the phone, or by replying): now it's read.
+        app.on_meta(chat(false));
+        app.mark_seen();
+        assert_eq!(
+            sent_with(&app, "mark_read"),
+            [serde_json::json!({"chat_id": 900, "message_id": 1_i64 << 40})]
+        );
+    }
+
+    #[test]
     fn without_focus_reports_a_minute_without_a_key_counts_as_away() {
         let mut app = test_app("away");
         app.focus = Focus::Messages;
@@ -3978,6 +4277,46 @@ mod tests {
         assert!(app.composer.is_empty());
         assert_eq!(app.open.as_ref().unwrap().selected, None, "following");
         assert!(app.open.as_ref().unwrap().reply.is_none());
+    }
+
+    #[test]
+    fn files_go_to_the_helper_with_what_was_checked_and_not_if_one_was_swapped() {
+        let mut app = test_app("send-files");
+        app.focus = Focus::Messages;
+        let none = KeyModifiers::NONE;
+        let dir = std::env::temp_dir().join(format!("tuimeta-send-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let (notes, report) = (dir.join("notes.txt"), dir.join("report.pdf"));
+        std::fs::write(&notes, b"mine to send").unwrap();
+        std::fs::write(&report, b"%PDF-1.7").unwrap();
+
+        // Swapped after it was listed: refused, and the composer keeps it.
+        assert_eq!(app.attach(vec![report.clone()], None), 1);
+        std::fs::remove_file(&report).unwrap();
+        std::fs::write(&report, b"%PDF-1.7").unwrap();
+        press(&mut app, KeyCode::Enter, none);
+        assert!(sent_with(&app, "send_files").is_empty());
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("report.pdf changed"), "{status}");
+        app.open.as_mut().unwrap().attachments.clear();
+
+        assert_eq!(app.attach(vec![notes.clone()], None), 1);
+        let listed = app.open.as_ref().unwrap().attachments[0].to_send();
+        press(&mut app, KeyCode::Enter, none);
+        let sent = sent_with(&app, "send_files");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].get("paths").is_none(), "not by path alone");
+        assert_eq!(
+            sent[0]["files"],
+            serde_json::json!([serde_json::to_value(&listed).unwrap()])
+        );
+        assert_eq!(
+            sent[0]["files"][0]["path"],
+            notes.to_string_lossy().as_ref()
+        );
+        assert!(app.open.as_ref().unwrap().attachments.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4386,6 +4725,46 @@ mod tests {
     }
 
     #[test]
+    fn an_error_about_something_else_leaves_a_link_waiting_and_esc_or_p_still_cancel_it() {
+        let mut app = test_app("link-error");
+        let none = KeyModifiers::NONE;
+        let other_error = || {
+            MetaEvent::Error(
+                "Encrypted chats couldn't connect;\u{1b}[2J they'll be tried again.".into(),
+            )
+        };
+        for leave in [KeyCode::Esc, KeyCode::Char('p')] {
+            app.meta = Meta::detached(unbounded_channel().0);
+            choosing(&mut app, Network::WhatsApp);
+            press(&mut app, KeyCode::Enter, none);
+            app.on_meta(code_for(Network::WhatsApp, Some("2@code-A"), None));
+            app.on_meta(other_error());
+            let Screen::Login(login) = &app.screen else {
+                panic!("still linking");
+            };
+            assert!(login.busy, "the link still waits");
+            assert_eq!(
+                login.error.as_deref(),
+                Some("Encrypted chats couldn't connect;[2J they'll be tried again."),
+                "said, cleaned"
+            );
+            app.on_meta(code_for(Network::WhatsApp, Some("2@code-B"), None));
+            assert_eq!(
+                link_code(&app).as_deref(),
+                Some("2@code-B"),
+                "its codes show"
+            );
+
+            press(&mut app, leave, none);
+            assert_eq!(
+                sent_with(&app, "cancel_login"),
+                [serde_json::json!({"network": "whatsapp", "attempt": app.login_attempt})],
+                "{leave:?} gives the link up"
+            );
+        }
+    }
+
+    #[test]
     fn a_link_that_ran_out_says_why_and_enter_asks_for_a_fresh_code() {
         let mut app = test_app("link-timeout");
         let none = KeyModifiers::NONE;
@@ -4663,10 +5042,81 @@ mod tests {
         );
         assert_eq!(app.finding.as_ref().map(|f| f.request.as_str()), Some("Jo"));
         app.on_meta(MetaEvent::ChatFound {
+            network: Network::Instagram,
+            user_id: 77,
             request: "Jo".into(),
             found: Ok(201),
         });
         assert_eq!(app.open.as_ref().unwrap().chat_id, 201);
+    }
+
+    /// Searches the picker for `query` and delivers `found` from Instagram.
+    fn search_finds(app: &mut App, query: &str, found: Vec<crate::meta::Found>) {
+        press(app, KeyCode::Char('s'), KeyModifiers::NONE);
+        for c in query.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let picker = app.picker.as_mut().unwrap();
+        picker.due_search(Instant::now() + crate::picker::SEARCH_AFTER);
+        app.on_meta(MetaEvent::ChatsFound {
+            network: Network::Instagram,
+            query: query.into(),
+            found,
+        });
+    }
+
+    #[test]
+    fn a_late_answer_about_someone_picked_before_opens_nothing_even_under_the_same_name() {
+        let mut app = test_app("find-same-name");
+        let none = KeyModifiers::NONE;
+        let person = |user_id, username: &str| crate::meta::Found {
+            chat_id: None,
+            user_id: Some(user_id),
+            title: "Jo".into(),
+            username: Some(username.into()),
+            kind: ChatKind::Dm,
+        };
+        let both = || vec![person(77, "jo.first"), person(78, "jo.second")];
+        let chat = |id, user_id| {
+            let info: ChatInfo = serde_json::from_value(serde_json::json!({
+                "id": id, "network": "instagram", "kind": "dm", "title": "Jo",
+                "user_id": user_id,
+            }))
+            .unwrap();
+            MetaEvent::Chat(Box::new(info))
+        };
+        let answer = |user_id, chat_id| MetaEvent::ChatFound {
+            network: Network::Instagram,
+            user_id,
+            request: "Jo".into(),
+            found: Ok(chat_id),
+        };
+        let before = app.open.as_ref().unwrap().chat_id;
+
+        // Jo the first, then, changing one's mind, Jo the second.
+        search_finds(&mut app, "jo", both());
+        press(&mut app, KeyCode::Enter, none);
+        search_finds(&mut app, "jo", both());
+        press(&mut app, KeyCode::Down, none);
+        press(&mut app, KeyCode::Enter, none);
+        let asked: Vec<_> = sent_with(&app, "open_dm")
+            .iter()
+            .map(|p| p["user_id"].clone())
+            .collect();
+        assert_eq!(asked, [77, 78]);
+
+        // The first lookup answers last but one.
+        app.on_meta(chat(301, 77));
+        app.on_meta(answer(77, 301));
+        assert_eq!(
+            app.open.as_ref().unwrap().chat_id,
+            before,
+            "not Jo the first"
+        );
+        assert!(app.finding.is_some(), "still looking up Jo the second");
+        app.on_meta(chat(302, 78));
+        app.on_meta(answer(78, 302));
+        assert_eq!(app.open.as_ref().unwrap().chat_id, 302);
     }
 
     #[test]
@@ -4675,8 +5125,10 @@ mod tests {
         let chat_id = app.open.as_ref().unwrap().chat_id;
         app.focus = Focus::Input;
         app.composer.insert_str("see you at 5");
-        app.finding = Some(Finding::new("Bob"));
+        app.finding = Some(Finding::new("Bob", Network::Messenger, 5));
         app.on_meta(MetaEvent::ChatFound {
+            network: Network::Messenger,
+            user_id: 5,
             request: "Bob".into(),
             found: Ok(201),
         });
@@ -4691,12 +5143,12 @@ mod tests {
     fn writing_a_popup_or_esc_stops_a_lookup() {
         let mut app = test_app("stop-find");
         app.focus = Focus::Messages;
-        app.finding = Some(Finding::new("Bob"));
+        app.finding = Some(Finding::new("Bob", Network::Messenger, 5));
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.finding.is_none());
         assert!(app.focus == Focus::Messages, "only the lookup stopped");
 
-        app.finding = Some(Finding::new("Bob"));
+        app.finding = Some(Finding::new("Bob", Network::Messenger, 5));
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         assert!(app.finding.is_none(), "writing in this chat instead");
     }
@@ -4993,6 +5445,143 @@ mod tests {
     }
 
     #[test]
+    fn a_warnings_grace_counts_from_when_it_can_be_seen() {
+        let mut app = test_app("grace-in-view");
+        let long_ago = || Instant::now().checked_sub(CONFIRM_GRACE * 2).unwrap();
+        let edit = || Confirmed::Edit {
+            id: -1,
+            text: String::new(),
+        };
+        // Up for a while, but under the login screen.
+        app.confirm = Some(Confirm::new("Edit?", vec![], edit()));
+        app.screen = login_screen(LoginStep::Connecting);
+        app.confirm_in_view();
+        app.confirm.as_mut().unwrap().shown = long_ago();
+        app.screen = Screen::Main;
+        app.confirm_in_view();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirm.is_some(), "only just in view");
+
+        // In a window in the background.
+        app.confirm.as_mut().unwrap().shown = long_ago();
+        app.on_terminal_event(Event::FocusLost);
+        app.confirm_in_view();
+        app.on_terminal_event(Event::FocusGained);
+        app.confirm_in_view();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirm.is_some(), "only just back in view");
+
+        app.confirm.as_mut().unwrap().shown = long_ago();
+        app.confirm_in_view();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirm.is_none(), "seen long enough");
+    }
+
+    #[test]
+    fn a_warning_from_the_chats_does_not_come_back_after_logging_in_again() {
+        let mut app = test_app("confirm-relogin");
+        for network in [Network::Messenger, Network::Instagram] {
+            app.accounts.insert(
+                network,
+                Account {
+                    state: AccountState::LoggedOut,
+                    name: None,
+                    error: None,
+                },
+            );
+        }
+        app.open = None;
+        app.focus = Focus::Chats;
+        app.ask_to_log_out();
+        assert!(app.confirm.is_some());
+        // The phone unlinked tuimeta meanwhile.
+        app.on_meta(MetaEvent::Account {
+            network: Network::WhatsApp,
+            state: AccountState::LoggedOut,
+            user_id: None,
+            name: None,
+            error: None,
+        });
+        assert!(matches!(app.screen, Screen::Login(_)));
+        assert!(app.confirm.is_none(), "its logout is moot");
+
+        // Any other warning goes too when the login screen takes over.
+        app.screen = Screen::Main;
+        app.confirm = Some(Confirm::new(
+            "Open report.pdf.exe?",
+            vec![],
+            Confirmed::OpenFile("/nonexistent/report.pdf.exe".into()),
+        ));
+        app.follow_accounts();
+        assert!(matches!(app.screen, Screen::Login(_)));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn a_written_out_link_that_can_pass_for_another_site_asks_first() {
+        for url in [
+            "https://paypal.com@evil.example/login",
+            "https://xn--pypal-4ve.com/",
+            "https://p\u{0430}ypal.com/",
+        ] {
+            assert!(look_alike(url).is_some(), "{url}");
+        }
+        for url in [
+            "https://example.com/a@b",
+            "https://example.com/?to=x@y",
+            "https://sub.example.com:8443/",
+            "https://example.com/xn--path",
+        ] {
+            assert_eq!(look_alike(url), None, "{url}");
+        }
+
+        let mut app = test_app("look-alike");
+        app.open_link_outside(Link::from("https://paypal.com@evil.example/login"));
+        let confirm = app.confirm.take().expect("asks");
+        assert_eq!(confirm.site.as_deref(), Some("evil.example"));
+        assert_eq!(confirm.lines[0], "The part before the @ is not the site.");
+        app.open_link_outside(Link::from("https://xn--pypal-4ve.com/"));
+        let confirm = app.confirm.take().expect("asks");
+        assert_eq!(
+            confirm.site.as_deref(),
+            Some("xn--pypal-4ve.com (has non-Latin letters)")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_attach_prompt_never_looks_at_a_file_on_another_machine() {
+        let mut app = test_app("attach-unc");
+        app.focus = Focus::Messages;
+        // `//etc/hosts` is /etc/hosts on Unix; on Windows it's a server.
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        for c in "//etc/hosts".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.open.as_ref().unwrap().attachments.is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Files on another machine can't be attached")
+        );
+    }
+
+    #[test]
+    fn what_the_helper_says_is_shown_without_control_characters() {
+        let mut app = test_app("helper-text");
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        app.on_meta(MetaEvent::MessageFailed {
+            chat_id,
+            old_id: 1,
+            error: "Too\u{1b}[2J big\u{202e}".into(),
+        });
+        assert_eq!(app.status.as_deref(), Some("Message not sent: Too[2J big"));
+        app.on_meta(MetaEvent::Gone("stopped\u{7}".into()));
+        let status = app.status.clone().unwrap();
+        assert!(status.starts_with("stopped. Quit"), "{status:?}");
+    }
+
+    #[test]
     fn a_download_finishing_while_you_type_waits_for_enter_instead_of_asking() {
         let mut app = test_app("busy");
         let dir = std::env::temp_dir().join("tuimeta-no-such-folder");
@@ -5021,6 +5610,185 @@ mod tests {
         assert!(
             !title.contains('\u{202e}'),
             "the sender's name is cleaned: {title:?}"
+        );
+    }
+
+    /// A file from someone else, just now, in the open chat.
+    fn incoming_file(app: &App, id: i64, file_id: i32, text: &str) -> Message {
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        message(
+            serde_json::json!({"id": id, "chat_id": chat_id, "sender_id": 2,
+            "date": unix_now(), "text": text, "media": {"kind": "file", "file_id": file_id,
+            "name": "report.pdf", "mime": "application/pdf", "size": 1000}}),
+        )
+    }
+
+    /// A link behind other words, which opens only after a `y`.
+    fn incoming_disguised(app: &App, id: i64, url: &str) -> Message {
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        message(
+            serde_json::json!({"id": id, "chat_id": chat_id, "sender_id": 2,
+            "date": unix_now(), "text": "the doc",
+            "entities": [{"offset": 4, "length": 3, "type": "link", "url": url}]}),
+        )
+    }
+
+    /// As if message `id` had been there, unchanged, for a while.
+    fn settled(app: &mut App, id: i64) {
+        if let Some(at) = app.changed.get_mut(&id) {
+            *at = Instant::now().checked_sub(CONFIRM_GRACE).unwrap();
+        }
+    }
+
+    fn opened_link(app: &App) -> Option<String> {
+        app.confirm.as_ref().and_then(|c| match &c.action {
+            Confirmed::OpenLink(url) => Some(url.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn enter_on_a_message_that_just_came_in_or_changed_waits_for_a_second_enter() {
+        let mut app = test_app("enter-grace");
+        let none = KeyModifiers::NONE;
+        app.focus = Focus::Messages;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let base = app.open.as_ref().unwrap().newest_id().unwrap() + 1_000_000;
+        let wait = "It just came in or changed: press Enter again to open it";
+
+        // A file arrives under the cursor, which follows the newest.
+        app.on_meta(MetaEvent::Message(Box::new(incoming_file(
+            &app, base, 4242, "",
+        ))));
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(app.status.as_deref(), Some(wait));
+        assert!(sent_with(&app, "download").is_empty() && app.opening.is_empty());
+        settled(&mut app, base);
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(sent_with(&app, "download")[0]["file_id"], 4242);
+
+        // A message picked a while ago is edited to another link, and
+        // another message comes right after: the edit still counts.
+        let picked = base + 1;
+        app.on_meta(MetaEvent::Message(Box::new(incoming_disguised(
+            &app,
+            picked,
+            "https://docs.example/a",
+        ))));
+        settled(&mut app, picked);
+        app.open.as_mut().unwrap().selected = Some(picked);
+        app.on_meta(MetaEvent::Message(Box::new(incoming_disguised(
+            &app,
+            picked,
+            "https://evil.example/b",
+        ))));
+        app.on_meta(MetaEvent::Message(Box::new(incoming_file(
+            &app,
+            base + 2,
+            4343,
+            "ok",
+        ))));
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(app.status.as_deref(), Some(wait));
+        assert!(app.confirm.is_none());
+        settled(&mut app, picked);
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(opened_link(&app).as_deref(), Some("https://evil.example/b"));
+        app.confirm = None;
+
+        // The picked message is unsent: the cursor lands on another, which
+        // may never have been on screen.
+        settled(&mut app, base + 2);
+        app.on_meta(MetaEvent::MessagesDeleted {
+            chat_id,
+            message_ids: vec![picked],
+        });
+        let landed = app.open.as_ref().unwrap().cursor_id().unwrap();
+        assert_ne!(landed, picked);
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(app.status.as_deref(), Some(wait));
+        assert!(app.confirm.is_none() && app.menu.is_none());
+        assert_eq!(sent_with(&app, "download").len(), 1, "nothing more");
+    }
+
+    #[test]
+    fn a_deleted_messages_files_popups_and_edit_go_with_it() {
+        let mut app = test_app("deleted-file");
+        let none = KeyModifiers::NONE;
+        app.focus = Focus::Messages;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        let id = app.open.as_ref().unwrap().newest_id().unwrap() + 1_000_000;
+        app.on_meta(MetaEvent::Message(Box::new(incoming_file(
+            &app,
+            id,
+            4601,
+            "the doc https://docs.example/a",
+        ))));
+        settled(&mut app, id);
+
+        // Enter, then the file from its menu; then the copy menu.
+        press(&mut app, KeyCode::Enter, none);
+        press(&mut app, KeyCode::Char('1'), none);
+        assert!(app.opening.contains(&4601));
+        let file = app.open.as_ref().unwrap().messages[&id]
+            .file
+            .clone()
+            .unwrap();
+        app.copying.insert(4601, file);
+        press(&mut app, KeyCode::Char('y'), none);
+        assert!(app.menu.is_some());
+        let downloads = sent_with(&app, "download").len();
+
+        // Another message going leaves them be.
+        app.on_meta(MetaEvent::MessagesDeleted {
+            chat_id,
+            message_ids: vec![SUNNY_IN_DEMO],
+        });
+        assert!(app.menu.is_some() && app.opening.contains(&4601));
+
+        app.on_meta(MetaEvent::MessagesDeleted {
+            chat_id,
+            message_ids: vec![id],
+        });
+        assert!(app.menu.is_none(), "its copy menu");
+        assert!(app.opening.is_empty() && app.copying.is_empty());
+        app.on_meta(MetaEvent::Downloaded {
+            file_id: 4601,
+            path: Some("/nonexistent/report.exe".into()),
+        });
+        assert!(app.confirm.is_none(), "nothing opens");
+        assert_eq!(sent_with(&app, "download").len(), downloads);
+
+        // Its reaction popup and an edit of it close too.
+        let mine = app.open.as_ref().unwrap().newest_id().unwrap();
+        app.open.as_mut().unwrap().selected = Some(mine);
+        press(&mut app, KeyCode::Char('R'), none);
+        assert!(app.react_menu.is_some());
+        app.on_meta(MetaEvent::MessagesDeleted {
+            chat_id,
+            message_ids: vec![mine],
+        });
+        assert!(app.react_menu.is_none());
+        let mine = app
+            .open
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .rev()
+            .find(|(_, m)| m.outgoing);
+        let mine = *mine.expect("another of yours").0;
+        app.composer.insert_str("a draft");
+        app.start_edit(mine, "On my way".into());
+        app.on_meta(MetaEvent::MessagesDeleted {
+            chat_id,
+            message_ids: vec![mine],
+        });
+        assert!(app.open.as_ref().unwrap().editing.is_none());
+        assert_eq!(app.composer.lines(), ["a draft"], "the draft is back");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("The message you were editing was deleted")
         );
     }
 

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	waTypes "go.mau.fi/whatsmeow/types"
 
@@ -134,6 +135,16 @@ func (w *WhatsApp) learn(pn, lid string) {
 			w.moveKept(pn, lid)
 			w.saveChat(c)
 		}
+	} else if w.st != nil {
+		// No chat yet, but deletions of messages in it that haven't come
+		// may be kept: they're the chat's by its WhatsApp id now.
+		ctx, cancel := dbCtx()
+		if err := w.st.renameDeleted(ctx, pn, lid); err != nil {
+			hlog.Error("whatsapp: can't move a chat's deletions to its WhatsApp id", hlog.Kind(err))
+		}
+		cancel()
+		delete(w.deletions, pn)
+		delete(w.deletions, lid)
 	}
 	// Messages and member lists that name the number keep it: resolve
 	// reads it as the WhatsApp id wherever people are compared.
@@ -141,6 +152,9 @@ func (w *WhatsApp) learn(pn, lid string) {
 
 // moveKept moves what's kept of chat from to chat to; w.mu is held.
 func (w *WhatsApp) moveKept(from, to string) {
+	// Read again from the store when next needed, where they're moved.
+	delete(w.deletions, from)
+	delete(w.deletions, to)
 	if w.st == nil {
 		return
 	}
@@ -435,6 +449,28 @@ func (w *WhatsApp) ensureLoaded(c *chat) {
 	c.log.SetComplete(c.Complete && len(msgs) < MaxStoredPerChat)
 }
 
+// notReadIn is c's kept messages that ensureLoaded left out (their time is
+// up, and the sweep hasn't been by yet); w.mu is held and c loaded.
+func (w *WhatsApp) notReadIn(c *chat) []*message {
+	if w.st == nil {
+		return nil
+	}
+	ctx, cancel := dbCtx()
+	kept, err := w.st.messages(ctx, c.key)
+	cancel()
+	if err != nil {
+		hlog.Error("whatsapp: can't read a chat's messages", hlog.Kind(err))
+		return nil
+	}
+	var out []*message
+	for _, m := range kept {
+		if c.msgs[m.ID] == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // touch sends c's chat event if tuimeta has the chat, or if it's new
 // activity tuimeta should see now; w.mu is held.
 func (w *WhatsApp) touch(c *chat) {
@@ -483,7 +519,7 @@ func (w *WhatsApp) chatObject(c *chat) proto.Chat {
 		ID: c.id, Network: net, Kind: c.kind, Title: w.title(c),
 		Order: c.Activity, Unread: c.Unread, Muted: w.muted(c), Archived: c.Archived,
 		// Every WhatsApp chat is end-to-end encrypted.
-		Encrypted: true, CanSend: !c.ReadOnly,
+		Encrypted: true, CanSend: !c.ReadOnly && sendable(c.jid()),
 	}
 	if c.MarkedUnread && out.Unread == 0 {
 		out.Unread = 1
@@ -533,7 +569,9 @@ func (w *WhatsApp) title(c *chat) string {
 		// as on the phone: a name they chose alone doesn't title the chat.
 		p := w.person(c.Other)
 		if !p.contact && p.phone != "" && p.name != "+"+p.phone {
-			return cut(p.name+" · +"+p.phone, 300)
+			// The number shows whole, however long the name.
+			number := " · +" + p.phone
+			return cut(cut(p.name, max(300-utf8.RuneCountInString(number), 1))+number, 300)
 		}
 		return p.name
 	}
@@ -609,11 +647,14 @@ func (w *WhatsApp) LoadChats(ctx context.Context, limit int) (bool, error) {
 // is held.
 func (w *WhatsApp) removeChat(c *chat) {
 	w.ensureLoaded(c)
+	gone := w.notReadIn(c)
 	for _, m := range c.msgs {
-		w.forgetFiles(m)
+		gone = append(gone, m)
 	}
 	delete(w.chats, c.key)
+	w.forgetFiles(gone...)
 	delete(w.byID, c.id)
+	delete(w.deletions, c.key)
 	if w.st != nil {
 		ctx, cancel := dbCtx()
 		if err := w.st.deleteChat(ctx, c.key); err != nil {

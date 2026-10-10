@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -29,6 +30,15 @@ const (
 // package won't give a message more.
 const maxParts = 64
 
+// maxMentions is the most mentions one message keeps, as on WhatsApp: each
+// person mentioned gets an id tuimeta keeps, and each mention is read with
+// the text, so a message can't name any number of people.
+const maxMentions = 256
+
+// maxUnwrap is how many of Meta's link shims, one inside another, are taken
+// off a shared link.
+const maxUnwrap = 4
+
 // netMsg is one Instagram message as the backend keeps it, whatever its
 // parts.
 type netMsg struct {
@@ -47,6 +57,7 @@ type netMsg struct {
 
 	forwarded   bool
 	editCount   int
+	editedMS    int64 // when the text shown was edited, 0 if it wasn't (or Instagram didn't say)
 	service     string
 	unsupported string
 	preview     *proto.LinkPreview
@@ -92,6 +103,9 @@ func (b *Instagram) convertDepth(c *chat, m *slidetypes.Message, depth int) *net
 	}
 	if n.ms == 0 {
 		n.ms = time.Now().UnixMilli() // every message has a time; just in case
+	}
+	for _, e := range m.SlideEditHistory {
+		n.editedMS = max(n.editedMS, millis(e.TimestampMS))
 	}
 	if m.Sender != nil {
 		if p := b.person(&m.Sender.UserDict); p != nil && n.sender == 0 {
@@ -471,17 +485,24 @@ func webURL(raw string) string {
 }
 
 // unwrapRedirect takes the real address out of Meta's link shims
-// (l.facebook.com/l.php?u=…), as the connector does; nothing is fetched.
+// (l.facebook.com/l.php?u=…), as the connector does; nothing is fetched. A
+// shim inside a shim is taken off too, as Messenger's are, up to maxUnwrap
+// deep; past that the link stays a shim.
 func unwrapRedirect(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	switch strings.ToLower(u.Hostname()) {
-	case "l.facebook.com", "l.instagram.com", "lm.facebook.com":
-		if inner := u.Query().Get("u"); inner != "" {
-			return inner
+	for range maxUnwrap {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return raw
 		}
+		inner := ""
+		switch strings.ToLower(u.Hostname()) {
+		case "l.facebook.com", "l.instagram.com", "lm.facebook.com":
+			inner = u.Query().Get("u")
+		}
+		if inner == "" {
+			return raw
+		}
+		raw = inner
 	}
 	return raw
 }
@@ -582,7 +603,10 @@ func (b *Instagram) reactionsOf(n *netMsg) []proto.Reaction {
 // (*bold*, _italic_, ~strike~, `code`, ```blocks```, quotes), and its
 // entities: that formatting, and mentions from Instagram's own ranges, which
 // are of the text with its markers (UTF-16 units). A mention of the whole
-// chat, or of no one, keeps its words without an entity.
+// chat, or of no one, keeps its words without an entity. Only the first
+// maxMentions ranges in the text count; one overlapping the range before it
+// (the same range again, say) is left out, as the parser leaves it, and
+// doesn't count.
 func (b *Instagram) format(text string, mentions slidetypes.MentionList) (string, []proto.Entity) {
 	units := utf16.Encode([]rune(text))
 	// A range must fall on whole characters: one splitting a character in
@@ -597,11 +621,26 @@ func (b *Instagram) format(text string, mentions slidetypes.MentionList) (string
 		high, low := units[at-1], units[at]
 		return !(high >= 0xD800 && high < 0xDC00 && low >= 0xDC00 && low < 0xE000)
 	}
-	var ms []metatext.Mention
+	var ranges []*slidetypes.Mention
 	for _, m := range mentions {
 		if m == nil || m.Length <= 0 || !whole(m.Offset) || !whole(m.Offset+m.Length) {
 			continue
 		}
+		ranges = append(ranges, m)
+	}
+	// The ranges are picked before anyone is given an id, so a mention
+	// that's dropped makes no one.
+	slices.SortStableFunc(ranges, func(x, y *slidetypes.Mention) int { return cmp.Compare(x.Offset, y.Offset) })
+	var ms []metatext.Mention
+	end := 0
+	for _, m := range ranges {
+		if len(ms) == maxMentions {
+			break
+		}
+		if m.Offset < end {
+			continue
+		}
+		end = m.Offset + m.Length
 		var user int64
 		if m.UserFBID != 0 && (m.ProfileRangeType == slidetypes.ProfileRangeTypeProfile || m.ProfileRangeType == "") {
 			user = b.userID(m.UserFBID)

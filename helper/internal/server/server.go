@@ -12,6 +12,7 @@ import (
 	"io"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
@@ -48,7 +49,15 @@ type Server struct {
 	backends map[proto.Network]backend.Backend
 	ctx      context.Context
 
-	loadMu sync.Mutex // load_chats calls run one at a time
+	// loading has one lock per network: its load_chats calls run one at a
+	// time, and a network that's stuck holds back only its own.
+	loading map[proto.Network]*sync.Mutex
+
+	// seq numbers requests in the order they came.
+	seq atomic.Uint64
+
+	typingMu sync.Mutex
+	typingIn map[int64]*typingOrder // by chat
 }
 
 // New sets up a run writing to stdout. The hello line is written first,
@@ -61,6 +70,11 @@ func New(cfg Config, store *ids.Store, stdout io.Writer) *Server {
 		Files:    ids.NewFiles(),
 		backends: map[proto.Network]backend.Backend{},
 		ctx:      context.Background(),
+		loading:  map[proto.Network]*sync.Mutex{},
+		typingIn: map[int64]*typingOrder{},
+	}
+	for _, n := range proto.Networks {
+		s.loading[n] = &sync.Mutex{}
 	}
 	s.out = newWriter(stdout, proto.NewHello(cfg.HelperVersion), func() {
 		if err := store.Flush(); err != nil {
@@ -191,6 +205,9 @@ type call struct {
 	method string
 	params json.RawMessage
 	then   func()
+	// seq is the request's place in the order requests came: each is
+	// served on its own goroutine, so they can reach a network in another.
+	seq uint64
 }
 
 func (s *Server) handle(line []byte) {
@@ -221,7 +238,7 @@ func (s *Server) handle(line []byte) {
 	s.mu.Lock()
 	ctx := s.ctx
 	s.mu.Unlock()
-	c := &call{ctx: ctx, method: req.Method, params: req.Params}
+	c := &call{ctx: ctx, method: req.Method, params: req.Params, seq: s.seq.Add(1)}
 	go s.serve(req.ID, h, c)
 }
 

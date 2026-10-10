@@ -27,6 +27,29 @@ func PrivateDir(path string) error {
 	return os.Chmod(path, 0o700)
 }
 
+// OpenPrivate opens path, one of the helper's own files, creating it 0600
+// if flag says so, and refuses a link in its place or a file that isn't a
+// plain one of this user's: the helper's folder is private, but if someone
+// once planted a link in it, the helper still won't write where it points.
+func OpenPrivate(path string, flag int) (*os.File, error) {
+	f, err := os.OpenFile(path, flag|noFollow, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && (!info.Mode().IsRegular() || !ownedByMe(info)) {
+		err = errors.New("not a private file")
+	}
+	if err == nil {
+		err = f.Chmod(0o600)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 // WriteAtomic replaces path with data, readable by this user only. With
 // durable, the data reaches the disk before the rename, for files whose loss
 // would cost the user something (a login).

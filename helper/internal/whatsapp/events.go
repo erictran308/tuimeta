@@ -13,6 +13,7 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	waTypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
@@ -283,40 +284,41 @@ func (w *WhatsApp) apply(key string, group bool, sender string, ch change) {
 		if group && !c.known {
 			w.askGroup(c, false)
 		}
-		if ch.timer != nil {
-			c.Ephemeral = *ch.timer
+		if !w.arrived(c, ch.msg) {
+			return
 		}
-		w.arrived(c, ch.msg)
+		if ch.timer != nil && ch.msg.MS >= c.EphemeralAt {
+			// A setting older than the one known (sent again, or late)
+			// is shown, but doesn't undo it.
+			c.Ephemeral, c.EphemeralAt = *ch.timer, ch.msg.MS
+			w.saveChat(c)
+		}
 	case edited:
-		c := w.chats[w.resolve(key)]
-		if c == nil {
+		k := w.resolve(key)
+		c := w.chats[k]
+		var msg *message
+		if c != nil {
+			w.ensureLoaded(c)
+			msg = c.msgs[ch.target]
+		}
+		if msg == nil || msg.Placeholder {
+			// Not here yet (the phone's history may bring it, or it's
+			// decrypted at last): the edit waits for it.
+			w.holdEdit(k, ch.target, sender, ch.msg)
 			return
 		}
-		w.ensureLoaded(c)
-		msg := c.msgs[ch.target]
-		if msg == nil || !w.same(msg.Sender, sender) || ch.msg.MS <= msg.EditMS {
-			return // only its sender edits a message, and an older edit never undoes a newer one
+		if w.edit(msg, sender, ch.msg) {
+			w.changed(c, msg)
 		}
-		msg.Text, msg.Mentions, msg.Preview = ch.msg.Text, ch.msg.Mentions, ch.msg.Preview
-		msg.Edited, msg.EditMS = true, ch.msg.MS
-		w.changed(c, msg)
 	case revoked:
-		c := w.chats[w.resolve(key)]
-		if c == nil {
-			return
+		k := w.resolve(key)
+		c := w.chats[k]
+		var msg *message
+		if c != nil {
+			w.ensureLoaded(c)
+			msg = c.msgs[ch.target]
 		}
-		w.ensureLoaded(c)
-		msg := c.msgs[ch.target]
-		if msg == nil {
-			return
-		}
-		// Its sender deletes a message, or in a group one of its admins.
-		// The deletion comes end to end encrypted, so WhatsApp's servers
-		// can't check that: it's checked here, as the official apps do.
-		if !w.same(msg.Sender, sender) && !(group && w.isAdmin(c, sender)) {
-			return
-		}
-		w.deleted(c, msg.ID)
+		w.revoke(c, k, group, sender, ch, msg)
 	case reacted:
 		c := w.chats[w.resolve(key)]
 		if c == nil {
@@ -327,6 +329,34 @@ func (w *WhatsApp) apply(key string, group bool, sender string, ch change) {
 			w.changed(c, msg)
 		}
 	}
+}
+
+// revoke applies sender's deletion for everyone of the message ch names, in
+// the chat with key (c, nil if it isn't here): msg if it's kept (or in the
+// phone's sync being read), else a tombstone for when it comes. Its sender
+// deletes a message, or in a group one of its admins. The deletion comes
+// end to end encrypted, so WhatsApp's servers can't check that: it's
+// checked here, as the official apps do. It reports whether msg goes; w.mu
+// is held.
+func (w *WhatsApp) revoke(c *chat, key string, group bool, sender string, ch change, msg *message) bool {
+	if msg == nil {
+		// Only the sender's own message with that id is kept from coming,
+		// or the one an admin names.
+		owner := sender
+		if group && ch.owner != "" && c != nil && w.isAdmin(c, sender) {
+			owner = ch.owner
+		}
+		w.noteDeleted(key, tombstone{id: ch.target, sender: owner}, false)
+		return false
+	}
+	// An event (a timer set, someone added) isn't anyone's to delete.
+	if msg.Service != nil || (!w.same(msg.Sender, sender) && !(group && w.isAdmin(c, sender))) {
+		return false
+	}
+	if c.msgs[msg.ID] == msg {
+		w.deleted(c, msg.ID)
+	}
+	return true
 }
 
 // isAdmin reports whether key is one of c's admins, as WhatsApp last said;
@@ -525,7 +555,18 @@ func (w *WhatsApp) conversation(cli waAPI, jid waTypes.JID, conv *waHistorySync.
 	slices.SortStableFunc(msgs, func(a, b *waHistorySync.HistorySyncMsg) int {
 		return cmp.Compare(a.GetMessage().GetMessageTimestamp(), b.GetMessage().GetMessageTimestamp())
 	})
+	// What this sync brings, by id: a message is the first with its id here,
+	// whether kept before or earlier in the same sync (as live, where another
+	// with the same id never takes its place).
 	var batch []*message
+	inSync := map[string]*message{}
+	known := func(id string) *message {
+		if m := inSync[id]; m != nil {
+			return m
+		}
+		return c.msgs[id]
+	}
+	var rewritten []*message // kept ones the sync edited, sent again once it's in
 	for _, hm := range msgs {
 		web := hm.GetMessage()
 		if web == nil || web.GetKey().GetID() == "" {
@@ -535,19 +576,33 @@ func (w *WhatsApp) conversation(cli waAPI, jid waTypes.JID, conv *waHistorySync.
 		ms := w.clamp(int64(web.GetMessageTimestamp()) * 1000)
 		if web.GetMessage() == nil {
 			actor := ""
-			if p, err := waTypes.ParseJID(firstNonEmpty(web.GetParticipant(), web.GetKey().GetParticipant())); err == nil && !p.IsEmpty() {
+			// Only a person is someone who did something (the record could
+			// name a group or a broadcast).
+			if p, err := waTypes.ParseJID(firstNonEmpty(web.GetParticipant(), web.GetKey().GetParticipant())); err == nil && personJID(p) {
 				actor = w.canon(p)
 			} else if web.GetKey().GetFromMe() {
 				actor = w.self
 			} else if !group {
 				actor = c.Other // a missed call in a dm is from the other person
 			}
-			m := (reader{canon: w.canon}).stub(web, id, actor, ms)
-			if m != nil && c.msgs[id] == nil {
-				if m.Sender == "" {
-					m.Sender = firstNonEmpty(firstOf(m.Service.Targets), w.self)
+			if web.GetMessageStubType() == waWeb.WebMessageInfo_REVOKE {
+				// A message deleted for everyone, as the phone has it: what
+				// its key names (who sent it) is the phone's word.
+				if actor != "" {
+					w.historyRevoke(c, false, actor, change{kind: revoked, target: id}, known(id), inSync)
 				}
+				continue
+			}
+			m := (reader{canon: w.canon}).stub(web, id, actor, ms)
+			if m == nil || known(id) != nil {
+				continue
+			}
+			if m.Sender == "" {
+				m.Sender = firstNonEmpty(firstOf(m.Service.Targets), w.self)
+			}
+			if !w.wasDeleted(c.key, id, m.Sender) {
 				batch = append(batch, m)
+				inSync[id] = m
 			}
 			continue
 		}
@@ -555,14 +610,36 @@ func (w *WhatsApp) conversation(cli waAPI, jid waTypes.JID, conv *waHistorySync.
 		if err != nil {
 			continue
 		}
+		if pm := protocolIn(web); pm != nil {
+			// whatsmeow reads an edit as the message it edits, under that
+			// message's id and with the editor as its sender: it's read here
+			// as the edit it is, by the rules live edits follow.
+			evt.Message = &waE2E.Message{ProtocolMessage: pm}
+			evt.Info.ID = id
+		}
 		sender := w.senderKey(evt.Info.MessageSource)
 		ch := reader{canon: w.canon}.read(evt, sender)
-		if ch.kind != added {
+		switch ch.kind {
+		case edited:
+			if m := known(ch.target); m == nil || m.Placeholder {
+				w.holdEdit(c.key, ch.target, sender, ch.msg)
+			} else if w.edit(m, sender, ch.msg) && inSync[m.ID] != m {
+				rewritten = append(rewritten, m)
+			}
+			continue
+		case revoked:
+			w.historyRevoke(c, group, sender, ch, known(ch.target), inSync)
+			continue
+		case added:
+		default:
 			continue
 		}
 		msg := ch.msg
 		w.clampMsg(msg)
 		if msg.Expires > 0 && msg.Expires <= now {
+			continue
+		}
+		if inSync[msg.ID] != nil || w.wasDeleted(c.key, msg.ID, msg.Sender) {
 			continue
 		}
 		if old := c.msgs[msg.ID]; old != nil {
@@ -572,6 +649,12 @@ func (w *WhatsApp) conversation(cli waAPI, jid waTypes.JID, conv *waHistorySync.
 			msg.Reactions = old.Reactions
 		}
 		for _, r := range web.GetReactions() {
+			// The phone's record of a reaction holds what its sender sent:
+			// it's taken only as a live one is, an emoji on a message (not
+			// an event) from a person.
+			if msg.Service != nil || !reactionLike(r.GetText()) {
+				continue
+			}
 			actor := w.self
 			if !r.GetKey().GetFromMe() {
 				p, err := waTypes.ParseJID(firstNonEmpty(r.GetKey().GetParticipant(), r.GetKey().GetRemoteJID()))
@@ -581,17 +664,29 @@ func (w *WhatsApp) conversation(cli waAPI, jid waTypes.JID, conv *waHistorySync.
 				if !group {
 					p = jid
 				}
+				if !personJID(p) {
+					continue
+				}
 				actor = w.canon(p)
 			}
 			msg.setReaction(w.resolve(actor), r.GetText())
 		}
 		batch = append(batch, msg)
+		inSync[msg.ID] = msg
 	}
+	// Those the sync itself deleted go.
+	batch = slices.DeleteFunc(batch, func(m *message) bool { return inSync[m.ID] != m })
 	for _, m := range batch {
+		w.settle(c, m)
 		w.keep(c, m)
 		c.Activity = max(c.Activity, m.MS)
 	}
 	w.store(c, batch...)
+	for i, m := range rewritten {
+		if c.msgs[m.ID] == m && !slices.Contains(rewritten[:i], m) {
+			w.changed(c, m)
+		}
+	}
 	if !onDemand {
 		w.syncedState(c, conv)
 	} else if len(batch) == 0 || conv.GetEndOfHistoryTransferType() == waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY {
@@ -607,6 +702,22 @@ func (w *WhatsApp) conversation(cli waAPI, jid waTypes.JID, conv *waHistorySync.
 		w.wake(c.key)
 	}
 	return len(batch)
+}
+
+// historyRevoke applies a deletion the phone's history holds, by the rules
+// live ones follow (see revoke): of msg, kept or in the sync being read
+// (inSync), or a tombstone if it's neither. A deletion the phone keeps in
+// place of the message (a stub) names only who sent it, so group is false
+// for it: no admin's right to delete counts. w.mu is held.
+func (w *WhatsApp) historyRevoke(c *chat, group bool, sender string, ch change, msg *message, inSync map[string]*message) {
+	if !w.revoke(c, c.key, group, sender, ch, msg) || inSync[msg.ID] != msg {
+		return
+	}
+	delete(inSync, msg.ID)
+	w.noteDeleted(c.key, tombstone{id: msg.ID, sender: msg.Sender, sure: true}, false)
+	if c.msgs[msg.ID] != nil {
+		w.deleted(c, msg.ID) // the placeholder it was to replace
+	}
 }
 
 func firstOf(s []string) string {
@@ -652,7 +763,13 @@ func (w *WhatsApp) syncedState(c *chat, conv *waHistorySync.Conversation) {
 	c.Archived = conv.GetArchived()
 	c.Pinned = conv.GetPinned() > 0
 	c.ReadOnly = conv.GetReadOnly()
-	c.Ephemeral = conv.GetEphemeralExpiration()
+	// The timer as it was then, if it's one of WhatsApp's, unless a later
+	// setting came meanwhile (live, or from WhatsApp's own word on a group).
+	if secs := conv.GetEphemeralExpiration(); timerAllowed(secs) {
+		if at := w.clamp(conv.GetEphemeralSettingTimestamp() * 1000); at >= c.EphemeralAt {
+			c.Ephemeral, c.EphemeralAt = secs, at
+		}
+	}
 	switch end := int64(conv.GetMuteEndTime()); {
 	case end == 0:
 		c.MuteUntil = 0
@@ -743,7 +860,7 @@ func (w *WhatsApp) groupInfo(gen int, e *events.GroupInfo) {
 		if e.Ephemeral.IsEphemeral {
 			secs = e.Ephemeral.DisappearingTimer
 		}
-		c.Ephemeral = secs
+		c.Ephemeral, c.EphemeralAt = secs, max(c.EphemeralAt, w.clamp(ts.UnixMilli()))
 		events = append(events, timerService(actor, secs))
 	}
 	for _, j := range e.Promote {
@@ -825,9 +942,14 @@ func (w *WhatsApp) groupDetails(c *chat, info *waTypes.GroupInfo) {
 		}
 	}
 	c.ReadOnly = info.IsAnnounce && !admin
+	// The timer as WhatsApp says it is now, off included: the phone's sync
+	// of how it was when this device was linked, coming after, doesn't undo
+	// it.
+	secs := uint32(0)
 	if info.IsEphemeral {
-		c.Ephemeral = info.DisappearingTimer
+		secs = info.DisappearingTimer
 	}
+	c.Ephemeral, c.EphemeralAt = secs, max(c.EphemeralAt, w.now().UnixMilli())
 }
 
 // askGroup asks WhatsApp for a group's details, once (or again when force);
@@ -964,12 +1086,18 @@ func (w *WhatsApp) clearChat(gen int, j waTypes.JID) {
 	}
 	w.ensureLoaded(c)
 	var gone []int64
+	msgs := w.notReadIn(c)
+	for _, m := range msgs {
+		known, _ := w.d.Messages.Known(c.id, m.ID)
+		gone = append(gone, known...)
+	}
 	for _, m := range c.msgs {
 		gone = append(gone, m.ids...)
-		w.forgetFiles(m)
+		msgs = append(msgs, m)
 	}
 	c.log.Remove(gone...)
 	c.msgs = map[string]*message{}
+	w.forgetFiles(msgs...)
 	if w.st != nil {
 		ctx, cancel := dbCtx()
 		if err := w.st.clearChat(ctx, c.key); err != nil {
@@ -992,10 +1120,33 @@ func (w *WhatsApp) deleteForMe(gen int, e *events.DeleteForMe) {
 	}
 	defer w.mu.Unlock()
 	defer w.scrubbed()
-	if c := w.chatByJID(e.ChatJID); c != nil {
-		w.ensureLoaded(c)
-		w.deleted(c, e.MessageID)
+	if e.MessageID == "" {
+		return
 	}
+	key := e.ChatJID.String()
+	if e.ChatJID.Server != waTypes.GroupServer {
+		key = w.canon(e.ChatJID)
+	}
+	if c := w.chats[key]; c != nil {
+		w.ensureLoaded(c)
+		if w.deleted(c, e.MessageID) != nil {
+			return
+		}
+	}
+	// Not here (yet): your phone deleted it, so when it comes (its history
+	// is sent in blobs, minutes apart), it doesn't stay. Your phone says
+	// whose it was.
+	sender := w.self
+	switch {
+	case e.IsFromMe:
+	case personJID(e.SenderJID):
+		sender = w.canon(e.SenderJID)
+	case e.ChatJID.Server != waTypes.GroupServer:
+		sender = key
+	default:
+		return
+	}
+	w.noteDeleted(key, tombstone{id: e.MessageID, sender: sender, sure: true}, false)
 }
 
 // renamed refreshes what a person is called after their contact, push or

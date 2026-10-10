@@ -16,18 +16,18 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// The longest line read from the helper. A history page of photos is far
-/// below it; anything longer is a broken helper, not a message.
+/// The longest line read from the helper, twice what it writes at most. A
+/// longer one is skipped: only the request it answers fails.
 const MAX_LINE: usize = 16 << 20;
 
 /// One of Meta's networks. One account each.
@@ -339,6 +339,19 @@ pub struct Found {
     pub kind: ChatKind,
 }
 
+/// A file to send, as the composer listed it: where it is, and what it was
+/// then (`send_files` in PROTOCOL.md). The helper sends nothing unless the
+/// file it opens there is still exactly that one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FileToSend {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
 /// Which part of a chat's history to fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -429,8 +442,11 @@ pub enum MetaEvent {
         query: String,
         found: Vec<Found>,
     },
-    /// A chat looked up to open, by what was looked up; or why it can't be.
+    /// The chat with a person looked up to open (`network`, `user_id`, and
+    /// `request`, whom it's with for the status bar); or why it can't be.
     ChatFound {
+        network: Network,
+        user_id: i64,
         request: String,
         found: Result<i64, String>,
     },
@@ -768,18 +784,19 @@ impl Meta {
         );
     }
 
-    /// Sends files, with the caption under the last.
+    /// Sends files, with the caption under the last: each the file the
+    /// composer listed, or nothing at all.
     pub fn send_files(
         &self,
         chat_id: i64,
-        paths: Vec<String>,
+        files: Vec<FileToSend>,
         caption: String,
         reply_to: Option<i64>,
     ) {
         let caption = (!caption.is_empty()).then_some(caption);
         self.spawn(
             "send_files",
-            json!({"chat_id": chat_id, "paths": paths, "caption": caption, "reply_to": reply_to}),
+            json!({"chat_id": chat_id, "files": files, "caption": caption, "reply_to": reply_to}),
         );
     }
 
@@ -878,7 +895,8 @@ impl Meta {
     }
 
     /// Looks up the chat with a person, made if needed, answered by
-    /// [`MetaEvent::ChatFound`] for `request`.
+    /// [`MetaEvent::ChatFound`] for that person. `request` names them in
+    /// the status bar.
     pub fn open_dm(&self, network: Network, user_id: i64, request: String) {
         self.then(
             "open_dm",
@@ -889,7 +907,12 @@ impl Meta {
                         .as_i64()
                         .ok_or_else(|| "The helper gave no chat.".to_string())
                 });
-                Some(MetaEvent::ChatFound { request, found })
+                Some(MetaEvent::ChatFound {
+                    network,
+                    user_id,
+                    request,
+                    found,
+                })
             },
         );
     }
@@ -918,7 +941,7 @@ pub fn helper_path() -> Result<PathBuf> {
     if cfg!(debug_assertions)
         && let Some(path) = config::var("TM_HELPER")
     {
-        return Ok(PathBuf::from(path));
+        return dev_helper(path);
     }
     let name = if cfg!(windows) {
         "tuimeta-helper.exe"
@@ -936,6 +959,17 @@ pub fn helper_path() -> Result<PathBuf> {
              WhatsApp for it; build it with `go build -o ../target/debug/{name} .` in helper/",
             config::shown(&path)
         );
+    }
+    Ok(path)
+}
+
+/// The helper `TM_HELPER` names. Only an absolute path: a relative one
+/// would run whatever program of that name the folder tuimeta was started
+/// in holds.
+fn dev_helper(path: String) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        bail!("TM_HELPER must be an absolute path");
     }
     Ok(path)
 }
@@ -975,35 +1009,136 @@ async fn write_lines(
 }
 
 async fn read_lines(
-    mut lines: BufReader<tokio::process::ChildStdout>,
+    lines: BufReader<tokio::process::ChildStdout>,
     inner: std::sync::Weak<Inner>,
     mut child: tokio::process::Child,
 ) {
-    let mut line = Vec::new();
-    let why = loop {
-        line.clear();
-        match AsyncReadExt::take(&mut lines, MAX_LINE as u64 + 1)
-            .read_until(b'\n', &mut line)
-            .await
-        {
-            Ok(0) => break "tuimeta-helper stopped".to_string(),
-            Ok(_) if line.len() > MAX_LINE => break "tuimeta-helper sent too much".to_string(),
-            Ok(_) => {}
-            Err(_) => break "tuimeta-helper stopped".to_string(),
-        }
-        let Some(inner) = inner.upgrade() else {
-            return;
-        };
-        if let Err(e) = on_line(&inner, &line) {
-            break e;
-        }
+    let Some(stop) = take_lines(lines, &inner).await else {
+        return;
     };
+    // A helper that broke the protocol, or whose output can't be read, may
+    // still run, its writes stuck on the full pipe: it's ended, so the user
+    // is told now rather than at quit. One whose output ended is finishing
+    // by itself.
+    if stop.kill {
+        let _ = child.start_kill();
+    }
     let _ = child.wait().await;
     if let Some(inner) = inner.upgrade() {
         // Whatever was still waiting gets its error now.
         inner.pending.lock().unwrap().clear();
-        let _ = inner.tx.send(MetaEvent::Gone(why));
+        let _ = inner.tx.send(MetaEvent::Gone(stop.why));
     }
+}
+
+/// Why the helper's output stopped being read.
+struct Stop {
+    why: String,
+    /// It may still be running.
+    kill: bool,
+}
+
+/// Hands each line of the helper's output to [`on_line`] until the output
+/// ends or breaks the protocol. `None` once nobody holds the connection.
+async fn take_lines<R: AsyncBufRead + Unpin>(
+    mut lines: R,
+    inner: &std::sync::Weak<Inner>,
+) -> Option<Stop> {
+    let mut line = Vec::new();
+    loop {
+        let read = read_line(&mut lines, &mut line, MAX_LINE).await;
+        let inner = inner.upgrade()?;
+        let stop = |why: &str, kill| {
+            Some(Stop {
+                why: why.to_string(),
+                kill,
+            })
+        };
+        match read {
+            Ok(Read::End) => return stop("tuimeta-helper stopped", false),
+            Err(_) => return stop("tuimeta-helper stopped", true),
+            Ok(Read::TooLong) => too_long(&inner, &line),
+            Ok(Read::Line) => {
+                if let Err(why) = on_line(&inner, &line) {
+                    return stop(&why, true);
+                }
+            }
+        }
+    }
+}
+
+/// What reading one line of the helper's output gave.
+#[derive(Debug, PartialEq, Eq)]
+enum Read {
+    /// A line, whole.
+    Line,
+    /// A line longer than tuimeta reads, skipped to its end: what was kept
+    /// is its start.
+    TooLong,
+    /// The output ended.
+    End,
+}
+
+/// Reads the next line into `line`. One longer than `max` bytes (its newline
+/// aside) keeps only its start there, and the rest is skipped, never held,
+/// so the next read starts at the line after it.
+async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Read> {
+    line.clear();
+    let read = AsyncReadExt::take(&mut *reader, max as u64 + 1)
+        .read_until(b'\n', line)
+        .await?;
+    if read == 0 {
+        return Ok(Read::End);
+    }
+    if line.ends_with(b"\n") || line.len() <= max {
+        return Ok(Read::Line);
+    }
+    loop {
+        let buffered = reader.fill_buf().await?;
+        if buffered.is_empty() {
+            return Ok(Read::TooLong);
+        }
+        match buffered.iter().position(|&b| b == b'\n') {
+            Some(end) => {
+                reader.consume(end + 1);
+                return Ok(Read::TooLong);
+            }
+            None => {
+                let skipped = buffered.len();
+                reader.consume(skipped);
+            }
+        }
+    }
+}
+
+/// A line too long to read: if it's an answer, the request it answers
+/// fails, and nothing else does; an event that long is lost.
+fn too_long(inner: &Inner, start: &[u8]) {
+    let Some(id) = answer_id(start) else {
+        return;
+    };
+    if let Some(waiting) = inner.pending.lock().unwrap().remove(&id) {
+        let _ = waiting.send(Err("tuimeta-helper's answer was too big to read".into()));
+    }
+}
+
+/// The request an answer is for, read from its start, `{"id":7,…`, which
+/// is where the helper puts it.
+fn answer_id(line: &[u8]) -> Option<u64> {
+    let rest = line
+        .trim_ascii_start()
+        .strip_prefix(b"{")?
+        .trim_ascii_start()
+        .strip_prefix(b"\"id\"")?
+        .trim_ascii_start()
+        .strip_prefix(b":")?
+        .trim_ascii_start();
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
 }
 
 /// Handles one line from the helper. `Err` means it broke the protocol.
@@ -1384,11 +1519,30 @@ mod tests {
     }
 
     #[test]
+    fn tm_helper_must_name_the_helper_by_an_absolute_path() {
+        for relative in [
+            "tuimeta-helper",
+            "./tuimeta-helper",
+            "target/debug/tuimeta-helper",
+        ] {
+            let refused = dev_helper(relative.into()).unwrap_err();
+            assert_eq!(refused.to_string(), "TM_HELPER must be an absolute path");
+        }
+        let absolute = std::env::temp_dir().join("tuimeta-helper");
+        assert_eq!(
+            dev_helper(absolute.to_string_lossy().into_owned()).unwrap(),
+            absolute
+        );
+    }
+
+    #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":3,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":4}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":4,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":5}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
-        let older = check_hello(br#"{"event":"hello","version":2}"#).unwrap_err();
+        // Version 3 read `send_files` by path alone, so a file swapped after
+        // the composer checked it would go out.
+        let older = check_hello(br#"{"event":"hello","version":3}"#).unwrap_err();
         assert!(older.to_string().contains("same release"), "{older}");
         assert!(check_hello(b"not json").is_err());
         assert!(check_hello(br#"{"event":"chat","version":1}"#).is_err());
@@ -1410,6 +1564,89 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rx.try_recv().unwrap().unwrap_err(), "No such chat.");
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_limit_is_skipped_to_its_end() {
+        let mut reader = BufReader::with_capacity(4, &b"abc\nabcdefgh\nab"[..]);
+        let mut line = Vec::new();
+        let mut reads = Vec::new();
+        loop {
+            let read = read_line(&mut reader, &mut line, 3).await.unwrap();
+            reads.push((String::from_utf8(line.clone()).unwrap(), read));
+            if reads.last().unwrap().1 == Read::End {
+                break;
+            }
+        }
+        assert_eq!(
+            reads,
+            [
+                ("abc\n".to_string(), Read::Line),
+                ("abcd".to_string(), Read::TooLong),
+                ("ab".to_string(), Read::Line),
+                (String::new(), Read::End),
+            ]
+        );
+        assert_eq!(answer_id(br#"{"id":7,"result":{"#), Some(7));
+        assert_eq!(answer_id(br#" { "id" : 12 , "error""#), Some(12));
+        assert_eq!(answer_id(br#"{"event":"message","id":7"#), None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_too_long_to_read_fails_its_request_and_the_rest_still_arrive() {
+        let (inner, mut rx) = inner();
+        let inner = Arc::new(inner);
+        let (huge_tx, mut huge) = oneshot::channel();
+        let (small_tx, mut small) = oneshot::channel();
+        inner.pending.lock().unwrap().insert(7, huge_tx);
+        inner.pending.lock().unwrap().insert(8, small_tx);
+        let padding = "<".repeat(MAX_LINE);
+        let mut output = Vec::new();
+        output.extend(format!("{{\"id\":7,\"result\":{{\"messages\":\"{padding}\"}}}}\n").bytes());
+        output.extend(format!("{{\"event\":\"error\",\"message\":\"{padding}\"}}\n").bytes());
+        output.extend(br#"{"id":8,"result":{}}"#);
+        output.push(b'\n');
+        output.extend(br#"{"event":"typing","chat_id":1,"user_id":2,"typing":true}"#);
+        output.push(b'\n');
+
+        let stop = take_lines(BufReader::new(&output[..]), &Arc::downgrade(&inner))
+            .await
+            .unwrap();
+        assert_eq!(stop.why, "tuimeta-helper stopped", "at the end, not before");
+        assert!(!stop.kill, "its output ended: it's finishing anyway");
+        let failed = huge.try_recv().unwrap().unwrap_err();
+        assert!(failed.contains("too big"), "{failed}");
+        assert!(small.try_recv().unwrap().is_ok());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(MetaEvent::Typing { typing: true, .. })
+        ));
+        assert!(rx.try_recv().is_err(), "the long event was dropped");
+    }
+
+    /// A helper that broke the protocol is ended at once, so the user
+    /// hears of it now, not once they quit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_breaks_the_protocol_is_stopped_and_said_to_be_gone() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo '{oops'; exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (inner, mut rx) = inner();
+        let inner = Arc::new(inner);
+        let reading = read_lines(BufReader::new(stdout), Arc::downgrade(&inner), child);
+        tokio::time::timeout(Duration::from_secs(10), reading)
+            .await
+            .expect("the helper was left running");
+        let Ok(MetaEvent::Gone(why)) = rx.try_recv() else {
+            panic!("not said");
+        };
+        assert_eq!(why, "tuimeta-helper said something unexpected");
     }
 
     #[test]

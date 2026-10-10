@@ -56,16 +56,20 @@ type WhatsApp struct {
 	// never reach WhatsApp.
 	dial func(gen int, dev *store.Device) error
 
-	mu     sync.Mutex
-	base   context.Context
-	life   context.Context // ends at logout or quit
-	stop   context.CancelFunc
-	gen    int // the current connection; events from older ones are dropped
-	st     *waStore
-	cli    waAPI
-	link   *linkTry
-	ready  bool
-	closed bool
+	mu   sync.Mutex
+	base context.Context
+	life context.Context // ends at logout or quit
+	stop context.CancelFunc
+	gen  int // the current connection; events from older ones are dropped
+	st   *waStore
+	cli  waAPI
+	link *linkTry
+	// cancelled is the newest login attempt cancelled: requests run each on
+	// its own, so a cancel can come before its link has started, which then
+	// doesn't.
+	cancelled uint64
+	ready     bool
+	closed    bool
 	// storeFailed is set when keeping something failed while an event was
 	// handled, so the message isn't acknowledged and comes again.
 	storeFailed bool
@@ -89,6 +93,12 @@ type WhatsApp struct {
 	lookups  []time.Time            // when numbers were asked about lately
 	searches int                    // searches so far: a newer one stops an older one's lookup
 	waiters  map[string][]chan struct{}
+
+	deletions map[string]*deletions // by chat key, read from the store when first needed
+	edits     map[string][]heldEdit // edits of messages not here yet, by editKey
+	editOrder []string              // edits' keys, oldest first
+	trimmed   []trim                // shown messages the store's bound took: their files go at Close
+	keeping   sync.WaitGroup        // an unlinked device's store being opened (sweepKept)
 }
 
 var (
@@ -121,6 +131,9 @@ func (w *WhatsApp) reset() {
 	w.looked = map[string]waTypes.JID{}
 	w.waiters = map[string][]chan struct{}{}
 	w.selves = map[string]bool{}
+	w.deletions = map[string]*deletions{}
+	w.edits, w.editOrder = map[string][]heldEdit{}, nil
+	w.trimmed = nil
 	w.listed = false
 	w.ready = false
 	w.self, w.selfName = "", ""
@@ -140,10 +153,15 @@ func (w *WhatsApp) Start(ctx context.Context) {
 	}
 	if ok && err == nil && s.Device == "" && s.Version > 0 {
 		// The phone unlinked this device: what's kept stays until the user
-		// logs out or links again, less what has disappeared since.
+		// logs out or links again, less what disappears meanwhile.
+		life, gen := w.life, w.gen
+		w.keeping.Add(1)
 		w.mu.Unlock()
 		w.d.Events.Account(net, proto.Errored, 0, "", unlinked)
-		hlog.Go("whatsapp sweep kept", w.sweepKept)
+		hlog.Go("whatsapp sweep kept", func() {
+			defer w.keeping.Done()
+			w.sweepKept(life, gen)
+		})
 		return
 	}
 	if !ok || err != nil || s.Device == "" {
@@ -208,12 +226,28 @@ func (w *WhatsApp) open(ctx context.Context) (*waStore, error) {
 	if err := st.container.LIDMap.FillCache(ctx); err != nil {
 		hlog.Warn("whatsapp: can't read the id map", hlog.Kind(err))
 	}
-	if err := st.prune(ctx); err != nil {
+	// What an older run kept past the bound goes, with what was downloaded
+	// of it.
+	if pruned, err := st.prune(ctx); err != nil {
 		hlog.Warn("whatsapp: can't prune kept messages", hlog.Kind(err))
+	} else {
+		w.dropFiles(pruned...)
 	}
 	// Disappearing messages whose time ran out while tuimeta wasn't running,
-	// and the keys whatsmeow kept for messages that aren't kept.
-	if err := st.deleteExpired(ctx, w.now().UnixMilli()); err != nil {
+	// with what was downloaded of them (one time for both, so none goes
+	// without its files), and the keys whatsmeow kept for messages that
+	// aren't kept.
+	now := w.now().UnixMilli()
+	if gone, err := st.expired(ctx, now); err != nil {
+		hlog.Warn("whatsapp: can't look for disappeared messages", hlog.Kind(err))
+	} else {
+		for _, e := range gone {
+			if e.msg != nil {
+				w.dropFiles(e.msg)
+			}
+		}
+	}
+	if err := st.deleteExpired(ctx, now); err != nil {
 		hlog.Warn("whatsapp: can't delete disappeared messages", hlog.Kind(err))
 	}
 	if err := st.pruneSecrets(ctx); err != nil {
@@ -249,13 +283,25 @@ func (w *WhatsApp) scrubbed() {
 	w.st.checkpoint(ctx)
 }
 
-// sweepKept deletes the disappeared messages of a store no device uses.
-func (w *WhatsApp) sweepKept() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if st, err := w.open(ctx); err == nil {
-		_ = st.Close()
+// sweepKept opens the store of a device the phone unlinked (life and gen
+// are of the run that found it so), deleting what disappeared meanwhile,
+// and keeps it open so what's kept goes on disappearing on time, until the
+// user logs out or links again.
+func (w *WhatsApp) sweepKept(life context.Context, gen int) {
+	ctx, cancel := context.WithTimeout(life, 30*time.Second)
+	st, err := w.open(ctx)
+	cancel()
+	if err != nil {
+		return
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.gen != gen || w.st != nil || life.Err() != nil {
+		_ = st.Close()
+		return
+	}
+	w.st = st
+	w.watch(st)
 }
 
 // setSelf records which keys are you; w.mu is held.
@@ -288,7 +334,7 @@ func (w *WhatsApp) connectDevice(gen int, dev *store.Device) error {
 		w.mu.Unlock()
 		return nil
 	}
-	w.cli = &waConn{cli: cli}
+	w.cli = newConn(cli)
 	w.mu.Unlock()
 	err := cli.Connect()
 	w.mu.Lock()
@@ -364,6 +410,7 @@ func (w *WhatsApp) Close() {
 	if w.link != nil {
 		w.link.end(nil, true)
 	}
+	w.forgetTrimmed()
 	w.scrub = true
 	w.scrubbed()
 	cli, st := w.cli, w.st
@@ -372,6 +419,7 @@ func (w *WhatsApp) Close() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		w.keeping.Wait()
 		if cli != nil {
 			cli.Disconnect()
 		}
@@ -424,6 +472,7 @@ func (w *WhatsApp) Logout(ctx context.Context) error {
 	if st != nil {
 		_ = st.Close()
 	}
+	w.keeping.Wait() // an unlinked device's store being opened is closed first
 	if err := w.d.Session.Wipe(); err != nil {
 		hlog.Error("whatsapp: can't wipe session", hlog.Kind(err))
 	}

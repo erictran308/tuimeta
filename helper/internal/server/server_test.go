@@ -26,12 +26,21 @@ import (
 )
 
 // stub is a backend that's logged in from the start, answers history after
-// a random pause, and panics when asked to search for "panic".
+// a random pause (or with pages, when set), panics when asked to search for
+// "panic", and records what it's asked to send and type. Its LoadChats waits
+// for loads, when set.
 type stub struct {
 	backend.Unavailable
 	deps   backend.Deps
 	chatID int64
 	closed atomic.Bool
+	pages  func(history.Query) history.Page
+	loads  chan struct{}
+	inLoad chan struct{}
+
+	mu    sync.Mutex
+	sent  []*backend.Outgoing
+	typed []bool
 }
 
 func (s *stub) Start(context.Context) {
@@ -41,8 +50,49 @@ func (s *stub) Start(context.Context) {
 func (s *stub) Close() { s.closed.Store(true) }
 
 func (s *stub) History(ctx context.Context, _ backend.ChatRef, q history.Query) (history.Page, error) {
+	if s.pages != nil {
+		return s.pages(q), nil
+	}
 	time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond)
 	return history.Page{Messages: []proto.Message{}}, nil
+}
+
+func (s *stub) LoadChats(ctx context.Context, _ int) (bool, error) {
+	if s.loads != nil {
+		s.inLoad <- struct{}{}
+		select {
+		case <-s.loads:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	return false, nil
+}
+
+func (s *stub) Send(_ context.Context, out *backend.Outgoing) error {
+	s.mu.Lock()
+	s.sent = append(s.sent, out)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *stub) SetTyping(_ context.Context, _ backend.ChatRef, typing bool) error {
+	s.mu.Lock()
+	s.typed = append(s.typed, typing)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *stub) sends() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sent)
+}
+
+func (s *stub) typings() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.typed)
 }
 
 func (s *stub) Search(_ context.Context, q string) ([]proto.SearchResult, error) {
@@ -144,6 +194,13 @@ func (s *syncBuffer) String() string {
 
 func start(t *testing.T) *harness {
 	t.Helper()
+	return startWith(t, nil)
+}
+
+// startWith is start with setup run before the server does (to put other
+// backends in the stand-ins' place, or give the stub pages).
+func startWith(t *testing.T, setup func(*harness)) *harness {
+	t.Helper()
 	dir := t.TempDir()
 	logBuf := &syncBuffer{}
 	hlog.SetOutput(logBuf)
@@ -162,6 +219,9 @@ func start(t *testing.T) *harness {
 	wa := &linkRecorder{Unavailable: backend.Unavailable{Net: proto.WhatsApp, Events: srv.Events}, accepted: make(chan struct{}, 4)}
 	srv.Add(wa)
 	h := &harness{t: t, srv: srv, stdin: inW, done: make(chan struct{}), stub: st, ig: ig, wa: wa, logBuf: logBuf}
+	if setup != nil {
+		setup(h)
+	}
 	h.c = wiretest.New(t, inW, outR)
 	go func() {
 		srv.Run(context.Background(), inR)
@@ -181,7 +241,8 @@ func TestTheFirstLineIsHello(t *testing.T) {
 	if first.Seq != 0 || first.Event != "hello" {
 		t.Fatalf("first line = %s", first.Raw)
 	}
-	if v := wiretest.Field[int](t, first, "version"); v != proto.Version {
+	// Version 4: send_files names what tuimeta checked of each file.
+	if v := wiretest.Field[int](t, first, "version"); v != 4 || proto.Version != 4 {
 		t.Errorf("version = %d", v)
 	}
 	nets := wiretest.Field[[]string](t, first, "networks")
@@ -424,5 +485,86 @@ func TestErrorsFromLibrariesNeverReachTheWire(t *testing.T) {
 	mine := proto.Err(proto.NotFound, "No.")
 	if got := s.wireError("x", mine); got != mine {
 		t.Errorf("got %+v", got)
+	}
+}
+
+// readyNet is a network logged in from the start whose chats load at once.
+type readyNet struct {
+	backend.Unavailable
+	deps backend.Deps
+}
+
+func (r *readyNet) Start(context.Context) {
+	r.Events.Account(r.Net, proto.Ready, r.deps.IDs.User(r.Net, "me"), "Me", "")
+}
+
+func (r *readyNet) LoadChats(context.Context, int) (bool, error) { return false, nil }
+
+func TestOneNetworksStuckChatListDoesntHoldBackAnothers(t *testing.T) {
+	h := startWith(t, func(h *harness) {
+		h.stub.loads = make(chan struct{})
+		h.stub.inLoad = make(chan struct{}, 1)
+		h.srv.Add(&readyNet{Unavailable: backend.Unavailable{Net: proto.Instagram, Events: h.srv.Events}, deps: h.srv.Deps(proto.Instagram)})
+	})
+	h.c.Event("account", 0, func(l wiretest.Line) bool {
+		return wiretest.Field[string](t, l, "network") == "instagram" && wiretest.Field[string](t, l, "state") == "ready"
+	})
+	stuck := h.c.Request("load_chats", map[string]any{"network": "messenger", "limit": 10})
+	<-h.stub.inLoad // Messenger's load is under way, and stays stuck
+	from := h.c.Mark()
+	ig := h.c.Request("load_chats", map[string]any{"network": "instagram", "limit": 10})
+	l, ok := h.c.WaitFor(2*time.Second, from, func(l wiretest.Line) bool { return l.IsResponse && l.ID != nil && *l.ID == ig })
+	if !ok {
+		t.Fatal("Instagram's chats waited for Messenger's")
+	}
+	if l.Error != nil {
+		t.Fatalf("got %s", l.Raw)
+	}
+	// Messenger's own next load waits its turn.
+	second := h.c.Request("load_chats", map[string]any{"network": "messenger", "limit": 10})
+	if _, ok := h.c.WaitFor(100*time.Millisecond, from, func(l wiretest.Line) bool { return l.IsResponse && l.ID != nil && *l.ID == second }); ok {
+		t.Error("two of Messenger's loads ran at once")
+	}
+	h.stub.loads <- struct{}{}
+	<-h.stub.inLoad
+	h.stub.loads <- struct{}{}
+	for _, id := range []uint64{stuck, second} {
+		if r := h.c.Response(id); r.Error != nil {
+			t.Fatalf("got %s", r.Raw)
+		}
+	}
+}
+
+func TestATypingStartThatArrivesAfterItsStopIsDropped(t *testing.T) {
+	h := start(t)
+	h.c.Event("account", 0, func(l wiretest.Line) bool {
+		return wiretest.Field[string](t, l, "network") == "messenger" && wiretest.Field[string](t, l, "state") == "ready"
+	})
+	typing := func(seq uint64, on bool) *call {
+		params, _ := json.Marshal(map[string]any{"chat_id": h.stub.chatID, "typing": on})
+		return &call{ctx: context.Background(), method: "typing", params: params, seq: seq}
+	}
+	// Numbered as they came: one letter typed and deleted (a start, then a
+	// stop), then another.
+	var seq [4]uint64
+	for i := range seq {
+		seq[i] = h.srv.seq.Add(1)
+	}
+	// Each is served on its own goroutine, and the first stop got there
+	// before its start.
+	for _, c := range []*call{typing(seq[1], false), typing(seq[0], true), typing(seq[2], true), typing(seq[3], false)} {
+		if _, err := h.srv.typing(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := h.stub.typings(); !slices.Equal(got, []bool{false, true, false}) {
+		t.Errorf("the network was told %v", got)
+	}
+	// Over the wire, in order.
+	if l := h.c.Call("typing", map[string]any{"chat_id": h.stub.chatID, "typing": true}); l.Error != nil {
+		t.Fatalf("got %s", l.Raw)
+	}
+	if got := h.stub.typings(); len(got) != 4 || !got[3] {
+		t.Errorf("the network was told %v", got)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -41,11 +42,37 @@ type fbSource struct {
 	Legacy       bool
 }
 
-// waSource is an encrypted chat's attachment: where it is and its keys.
+// waSource is an encrypted chat's attachment: where it is, its keys, and
+// what kind of attachment the message says it is, which bounds how much of
+// it is downloaded (waLimit).
 type waSource struct {
 	Integral  *waMediaTransport.WAMediaTransport_Integral
 	MediaType whatsmeow.MediaType
+	Kind      proto.MediaKind
 }
+
+// Encrypted photos and stickers are drawn from the file itself, downloaded
+// as soon as they're on screen: what a sender can make you fetch by
+// scrolling past is bounded, whatever size their message claims.
+const (
+	MaxPhoto   = 16 << 20
+	MaxSticker = 2 << 20
+)
+
+// waLimit is the most of an encrypted attachment of kind (with the type
+// mime) that's downloaded.
+func waLimit(kind proto.MediaKind, mime string) int64 {
+	switch {
+	case kind == proto.Sticker:
+		return MaxSticker
+	case kind == proto.Photo, kind == proto.GIF && strings.HasPrefix(mime, "image/"):
+		return MaxPhoto
+	}
+	return download.MaxSize
+}
+
+// errTooBigHere is a file over its kind's limit.
+var errTooBigHere = proto.Err(proto.Unsupported, "That file is too big for tuimeta to download; open it in Messenger's app.")
 
 // inlineSource is a file already here: a thumbnail that came in a message,
 // or a file you sent.
@@ -108,18 +135,29 @@ func (m *Messenger) Fetch(ctx context.Context, ref ids.FileRef, w io.Writer) err
 		_, err := w.Write(src.Data)
 		return err
 	case *waSource:
+		limit := waLimit(src.Kind, ref.Mime)
+		if ref.Size > limit {
+			return errTooBigHere
+		}
 		e2ee, err := m.encrypted()
 		if err != nil {
 			return err
 		}
-		data, err := e2ee.DownloadFB(ctx, src.Integral, src.MediaType)
+		dir, err := m.d.Session.Dir()
 		if err != nil {
-			hlog.Info("messenger: encrypted download failed", hlog.Kind(err))
-			return proto.Err(proto.NetworkError, "The encrypted file couldn't be downloaded; try again.")
+			return err
 		}
-		download.SetSize(w, int64(len(data)))
-		_, err = w.Write(data)
-		return err
+		return downloadCapped(dir, limit, w, func(f whatsmeow.File) error {
+			err := e2ee.DownloadFBToFile(ctx, src.Integral, src.MediaType, f)
+			if err == nil {
+				return nil
+			}
+			hlog.Info("messenger: encrypted download failed", hlog.Kind(err))
+			if errors.Is(err, errTooBig) {
+				return errTooBigHere
+			}
+			return proto.Err(proto.NetworkError, "The encrypted file couldn't be downloaded; try again.")
+		})
 	case *fbSource:
 		m.mu.Lock()
 		as := m.as
@@ -165,15 +203,82 @@ func (m *Messenger) refreshURL(ctx context.Context, ref ids.FileRef) string {
 		hlog.Info("messenger: refreshing a file's address failed", hlog.Kind(err))
 		return ""
 	}
-	m.mu.Lock()
-	m.applyTable(tbl, fromResponse)
-	m.mu.Unlock()
+	m.applyAnswer(tbl)
 	if now, ok := m.d.Files.Get(ref.ID); ok {
 		if s, ok := now.Source.(*fbSource); ok {
 			return s.URL
 		}
 	}
 	return ""
+}
+
+// downloadCapped has get write an encrypted attachment into a temporary file
+// in dir that refuses to grow past limit, then copies it to w. The size a
+// message states can be anything: what the server sends is what's capped,
+// on disk, not in memory. 64 bytes more are allowed for the encryption's
+// padding and checksum.
+func downloadCapped(dir string, limit int64, w io.Writer, get func(whatsmeow.File) error) error {
+	f, err := os.CreateTemp(dir, "download-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		f.Close()
+		os.Remove(f.Name())
+	}()
+	if err := get(&cappedFile{File: f, limit: limit + 64}); err != nil {
+		return err
+	}
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	download.SetSize(w, size)
+	_, err = io.Copy(w, f)
+	return err
+}
+
+// errTooBig stops a download that grew past the limit.
+var errTooBig = errors.New("download over the size limit")
+
+// cappedFile is a file that refuses to grow past limit bytes.
+type cappedFile struct {
+	*os.File
+	limit int64
+}
+
+func (f *cappedFile) Write(p []byte) (int, error) {
+	pos, err := f.File.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	if pos+int64(len(p)) > f.limit {
+		return 0, errTooBig
+	}
+	return f.File.Write(p)
+}
+
+func (f *cappedFile) WriteAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) > f.limit {
+		return 0, errTooBig
+	}
+	return f.File.WriteAt(p, off)
+}
+
+// ReadFrom goes through Write, so io.Copy into the file is capped too
+// (*os.File's own ReadFrom would bypass it).
+func (f *cappedFile) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(struct{ io.Writer }{f}, r)
+}
+
+func (f *cappedFile) Truncate(size int64) error {
+	if size > f.limit {
+		return errTooBig
+	}
+	return f.File.Truncate(size)
 }
 
 // fetchURL downloads a file from Meta's servers into w, with the headers a

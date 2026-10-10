@@ -166,7 +166,8 @@ The helper, tuimeta-helper, must be next to tuimeta: it's the separate
 program (under the AGPL) that speaks Meta's protocols.
 
 Environment:
-  TM_DATA_DIR    keep them somewhere else
+  TM_DATA_DIR    keep them somewhere else, in a folder only you can change
+                 (on Windows, inside your user folder)
   TM_BROWSER     the Chrome you copy cookies from, as chrome://version names
                  it (\"Chrome 150.0.7712.45\"): logins then say tuimeta is
                  that Chrome on this computer, for as long as they last

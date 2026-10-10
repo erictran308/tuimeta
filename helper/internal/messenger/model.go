@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	waTypes "go.mau.fi/whatsmeow/types"
 
@@ -20,6 +22,11 @@ import (
 
 // EditWindow is how long (seconds) Messenger lets you edit a text message.
 const EditWindow = 15 * 60
+
+// maxParts is the most attachments one message is shown with: ids.Messages
+// gives one message at most this many ids, and a message with more media
+// than ids is shown with none.
+const maxParts = 64
 
 // chat is a conversation as the backend keeps it. key is the network's id
 // for it: a Facebook thread key, or for an encrypted chat the user part of
@@ -44,9 +51,12 @@ type chat struct {
 	archived  bool
 	request   bool
 	cantReply bool
-	muteUntil int64 // ms; -1 for good
-	activity  int64 // ms of the last activity
-	readUpTo  int64 // ms: you've read everything up to here
+	// receiptsOff is set once Messenger's thread tables said your read
+	// receipts are off in this chat (either of their two flags).
+	receiptsOff bool
+	muteUntil   int64 // ms; -1 for good
+	activity    int64 // ms of the last activity
+	readUpTo    int64 // ms: you've read everything up to here
 	// receipted is how far read receipts for the encrypted messages went
 	// out (from here or another device). Your own messages move readUpTo
 	// but not this: replying isn't a receipt for what you didn't open.
@@ -57,15 +67,39 @@ type chat struct {
 	unread     int   // others' messages after readUpTo
 	known      bool  // the server described it (not just a message seen)
 	fbHistory  bool  // Messenger may have older (unencrypted) messages
+	// timer is the encrypted chat's disappearing-messages timer in seconds
+	// (0: off), as set at timerAt (unix seconds); what you send carries it.
+	timer, timerAt int64
 
 	log  *history.Log
 	msgs map[string]*message
+	// waIDs finds the encrypted messages by their own ids, which are all a
+	// receipt names; several senders may have used one id.
+	waIDs map[string][]string
 }
 
 func newChat(key int64) *chat {
 	return &chat{
 		key: key, kind: proto.DM, other: key, serverSaid: -1, fbHistory: true,
 		log: history.New(), msgs: map[string]*message{}, theirRead: map[int64]int64{}, nicknames: map[int64]string{},
+		waIDs: map[string][]string{},
+	}
+}
+
+// indexWA records an encrypted message under its own id.
+func (c *chat) indexWA(msg *message) {
+	if id := msg.wa.id; !slices.Contains(c.waIDs[id], msg.netID) {
+		c.waIDs[id] = append(c.waIDs[id], msg.netID)
+	}
+}
+
+// unindexWA forgets an encrypted message gone from c.
+func (c *chat) unindexWA(msg *message) {
+	id := msg.wa.id
+	if rest := slices.DeleteFunc(c.waIDs[id], func(n string) bool { return n == msg.netID }); len(rest) > 0 {
+		c.waIDs[id] = rest
+	} else {
+		delete(c.waIDs, id)
 	}
 }
 
@@ -126,13 +160,46 @@ type message struct {
 	reactions   []reaction
 	canUnsend   bool
 	wa          *waRef // set on an encrypted message
-	ids         []int64
+	// placeholder marks an encrypted message that couldn't be decrypted
+	// yet: the only one another message with its id replaces.
+	placeholder bool
+	// expires is when a disappearing message goes, in unix ms (0: never).
+	// seenTimer is how long (seconds) one that disappears once seen lasts
+	// from then, while it hasn't been.
+	expires   int64
+	seenTimer int64
+	ids       []int64
 }
 
 // mention is a stretch of the text naming someone, in UTF-16 units.
 type mention struct {
 	offset, length int
 	fbid           int64
+}
+
+// MaxMentions is how many mentions one message may have, as on WhatsApp:
+// each person named is one to look up, and to keep an id for.
+const MaxMentions = 256
+
+// mentionSet collects a message's mentions: each once, at most MaxMentions.
+type mentionSet struct {
+	list []mention
+	seen map[mention]bool
+}
+
+// add adds mn unless it's there already; false once the set is full.
+func (s *mentionSet) add(mn mention) bool {
+	if len(s.list) >= MaxMentions {
+		return false
+	}
+	if s.seen == nil {
+		s.seen = map[mention]bool{}
+	}
+	if !s.seen[mn] {
+		s.seen[mn] = true
+		s.list = append(s.list, mn)
+	}
+	return len(s.list) < MaxMentions
 }
 
 type replyRef struct {
@@ -173,6 +240,36 @@ func (m *message) setReaction(actor int64, emoji string) bool {
 		return false
 	default:
 		m.reactions = append(m.reactions, reaction{actor, emoji})
+	}
+	return true
+}
+
+// maxReaction is the longest reaction, in bytes: one emoji, however it's
+// composed.
+const maxReaction = 32
+
+// reactionLike reports whether s can be a reaction, as the WhatsApp backend
+// has it: "" (taken back), or a short emoji, not words, numbers or spaces
+// made to look like part of the message (a count, a time, ticks). Digits and
+// punctuation pass only as emoji: with the keycap or the emoji-style
+// selector ("1️⃣", "‼️"), or as one of the four emoji that are punctuation
+// characters, since Messenger sends reactions without that selector.
+func reactionLike(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > maxReaction || !utf8.ValidString(s) {
+		return false
+	}
+	emojiStyle := strings.ContainsAny(s, "⃣️")
+	for _, r := range s {
+		switch {
+		case unicode.IsLetter(r), unicode.IsSpace(r), unicode.IsControl(r):
+			return false
+		case r == '‼' || r == '⁉' || r == '〰' || r == '〽':
+		case (unicode.IsNumber(r) || unicode.IsPunct(r)) && !emojiStyle:
+			return false
+		}
 	}
 	return true
 }

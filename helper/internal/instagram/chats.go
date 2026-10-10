@@ -401,42 +401,64 @@ func (b *Instagram) LoadChats(ctx context.Context, limit int) (bool, error) {
 		return false, err
 	}
 	limit = max(limit, 1)
+	// Each step that takes b.mu unlocks it deferred: they apply Instagram's
+	// data and render chats' last messages, and a panic on something
+	// unforeseen there mustn't leave b.mu held, and the backend stuck, for
+	// the rest of the run.
 	for page := 0; ; page++ {
-		b.mu.Lock()
-		if b.conn != conn {
-			b.mu.Unlock()
-			return false, errNotConnected
+		req, more, err := b.nextChats(conn, limit, page)
+		if req == nil {
+			return more, err
 		}
-		unsent := b.unsentChats()
-		if len(unsent) >= limit || !b.inboxMore || page >= maxInboxPages {
-			more := b.sendChats(unsent, limit)
-			b.mu.Unlock()
-			return more, nil
-		}
-		req := slidetypes.MakePaginateMailboxRequest(b.selfFBID, b.inboxCursor, "INBOX", nil)
-		b.mu.Unlock()
-
 		resp, err := conn.cli.PaginateMailbox(withQuietLog(ctx), req)
 		if err != nil || resp == nil || resp.Mailbox == nil {
 			hlog.Warn("instagram: inbox page failed", hlog.Kind(err))
-			b.mu.Lock()
-			unsent = b.unsentChats()
-			if len(unsent) > 0 && b.conn == conn {
-				more := b.sendChats(unsent, limit)
-				b.mu.Unlock()
+			if more, sent := b.sendKnownChats(conn, limit); sent {
 				return more, nil
 			}
-			b.mu.Unlock()
 			if err == nil {
 				err = errUnreachable
 			}
 			return false, requestError(err, "Couldn't load more Instagram chats; try again.")
 		}
-		b.mu.Lock()
-		if b.conn == conn {
-			b.addInbox(resp.Mailbox.ThreadsByFolder)
-		}
-		b.mu.Unlock()
+		b.inboxPage(conn, resp.Mailbox.ThreadsByFolder)
+	}
+}
+
+// nextChats sends the next chats if enough are known, or no more can be
+// fetched (answering whether more remain), else names the inbox page to
+// fetch.
+func (b *Instagram) nextChats(conn *connection, limit, page int) (*slidetypes.PaginateMailboxRequest, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.conn != conn {
+		return nil, false, errNotConnected
+	}
+	unsent := b.unsentChats()
+	if len(unsent) >= limit || !b.inboxMore || page >= maxInboxPages {
+		return nil, b.sendChats(unsent, limit), nil
+	}
+	return slidetypes.MakePaginateMailboxRequest(b.selfFBID, b.inboxCursor, "INBOX", nil), false, nil
+}
+
+// sendKnownChats sends what chats are known when no more of the inbox could
+// be fetched, and says whether it had any to send.
+func (b *Instagram) sendKnownChats(conn *connection, limit int) (more, sent bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	unsent := b.unsentChats()
+	if len(unsent) == 0 || b.conn != conn {
+		return false, false
+	}
+	return b.sendChats(unsent, limit), true
+}
+
+// inboxPage keeps a page of the inbox, if conn is still the connection.
+func (b *Instagram) inboxPage(conn *connection, threads slidetypes.Edged[slidetypes.Node[slidetypes.WrappedThreadInfo]]) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.conn == conn {
+		b.addInbox(threads)
 	}
 }
 

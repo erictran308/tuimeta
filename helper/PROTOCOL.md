@@ -1,4 +1,4 @@
-# tuimeta helper protocol, version 3
+# tuimeta helper protocol, version 4
 
 `tuimeta-helper` is a separate program (Go, AGPL-3.0-or-later) that speaks
 Messenger, Instagram and WhatsApp for tuimeta (Rust, MIT). tuimeta starts it as a child
@@ -41,12 +41,21 @@ raw newline (JSON escapes them).
   `timeout`, `cancelled`, `internal`. `message` is one sentence a person can act on; tuimeta may show
   it in its status bar.
 - The helper's first line is always:
-  `{"event":"hello","version":3,"helper":"<semver>","networks":["messenger","instagram","whatsapp"]}`.
+  `{"event":"hello","version":4,"helper":"<semver>","networks":["messenger","instagram","whatsapp"]}`.
   tuimeta refuses to go on if `version` isn't one it knows. (Version 2 added
   `login_cookies`' `browser`: a helper that ignored it would log in as
   another browser than the user asked for. Version 3 added WhatsApp, which
   logs in by linking a device: `login_link`, `cancel_login` and the
-  `login_code` event.)
+  `login_code` event. Version 4 changed `send_files` to name each file with
+  what tuimeta checked when it was listed: a helper that read only paths
+  would upload a file swapped since.)
+- No line the helper writes is longer than 8 MiB. An answer that would be
+  is sent as an `internal` error for its `id` instead, and an event that would
+  be is dropped; `history` stops a page short to fit (see `history`).
+  tuimeta reads lines of up to 16 MiB, and skips a longer one rather than
+  stopping: only the request it answers fails. An answer line starts with
+  its `id` (`{"id":7,…`), which is how tuimeta tells which request a line it
+  skips answers.
 - When stdin closes (tuimeta quit or crashed), the helper disconnects every
   account, without marking anything read or setting any presence, and exits
   within two seconds.
@@ -71,6 +80,9 @@ ids.
   message sent later has a larger id. The helper derives it from the server
   timestamp in milliseconds, `ms << 8 | slot`, using the next free slot when
   two messages share a millisecond, and remembers the mapping for the run.
+  Ids are chronological, but `message` events aren't in id order: a message
+  can arrive after a newer one (one that crossed yours, one the network held
+  back, a retried decryption), and goes in at its place.
   - A message with several attachments (photos sent together) is reported as
     that many messages with consecutive ids, the same `album` (the first
     part's id), the media one per part, and the text on the last part. A
@@ -82,7 +94,10 @@ ids.
   - A message you're sending gets a temporary id until the network confirms
     it; `message_sent` then gives the final one.
 - `file_id` (i32 > 0): anything downloadable (a photo, a video, a thumbnail, a
-  profile picture, a file). Stable for the run.
+  profile picture, a file). Stable for the run, but a file whose message
+  was deleted can be forgotten, and `logout` forgets all of the network's
+  files: `download` then answers `not_found`, and the same file seen again
+  gets a new id.
 
 ## Objects
 
@@ -210,20 +225,20 @@ message.
 
 | method | params | result |
 |---|---|---|
-| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version; WhatsApp, which logs in with `login_link`), `bad_cookies`, `checkpoint`, `network`. |
+| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version; WhatsApp, which logs in with `login_link`), `bad_cookies`, `checkpoint`, `network`, `cancelled` (a newer `login_cookies` or a `logout` for the network came before it was done; nothing of it is saved). |
 | `login_link` | `network`, `phone?`, `attempt?` | `{}` once linked and connected (account `ready`): WhatsApp, which logs in by linking tuimeta as a new device of the account (on the phone: Settings → Linked devices → Link a device). Without `phone`, `login_code` events with `qr` follow: the first at once and good for a minute, then a fresh one about every 20 seconds, for about 2½ minutes in all. With `phone` (the account's number in international form: digits, with an optional leading `+`, spaces and dashes), one `login_code` with `pairing` follows, to type on the phone under "Link with phone number instead". `attempt` is a number tuimeta picks for this login, given back in its `login_code` events and named by `cancel_login`. A newer `login_link`, `cancel_login` or `logout` for the network ends a waiting one, until the phone has confirmed the link: from then on it completes (only `logout` ends it), rather than leaving a device in the phone's list that nothing here can use. Errors: `bad_request` (not a linking network, `phone` isn't a number, or a device that still works is linked: log out first), `timeout` (nothing was scanned or typed in time), `cancelled`, `network`, `unsupported` (WhatsApp asked for something tuimeta can't do, like a passkey). |
-| `cancel_login` | `network`, `attempt?` | `{}`: ends the waiting `login_link` of that attempt (any, without one), so no code shown for it works any more; it answers `cancelled`. A link of another attempt, or one the phone has already confirmed, goes on. |
+| `cancel_login` | `network`, `attempt?` | `{}`: ends the waiting `login_link` of that attempt (any, without one), so no code shown for it works any more; it answers `cancelled`. A `login_link` of that attempt, or an older one, that comes after it isn't started, and answers `cancelled` too. A link of another attempt, or one the phone has already confirmed, goes on. |
 | `logout` | `network` | `{}`. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). For Messenger and Instagram it's local: it never ends the session on Meta's side, and the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). For WhatsApp, where tuimeta is a linked device of its own, it also unlinks that device, as "Log out" in the phone's list of linked devices does; the phone and any other linked devices stay logged in. |
-| `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. |
-| `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). WhatsApp keeps no history on its servers: a chat has what this device received since it was linked and what the phone sent it then, and older messages are asked of the phone, which must be online (a page may take up to 20 s; without an answer, what's here is the answer). |
+| `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. A network's loads run one at a time, and one network's don't wait for another's. |
+| `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). WhatsApp keeps no history on its servers: a chat has what this device received since it was linked and what the phone sent it then, and older messages are asked of the phone, which must be online (a page may take up to 20 s; without an answer, what's here is the answer). A page whose messages would come to more than 6 MiB is cut short to fit a line, whole albums at a time and never below one message: from its far end (the oldest, or the newest for `after`; for `around`, the end farther from its message, which stays), and `has_more` is then true (for `around`, only when the older end was cut). |
 | `get_message` | `chat_id`, `message_id` | `{"message": Message}` (e.g. one a reply answers that isn't loaded) |
 | `send_text` | `chat_id`, `text`, `reply_to?` | `{"message_id": i64}` (temporary). The text goes as typed: all three networks read `*bold*`-style formatting themselves. |
-| `send_files` | `chat_id`, `paths`, `caption?`, `reply_to?` | `{"message_ids": [i64]}` (temporary). Paths are absolute; the helper reads them once, now. |
+| `send_files` | `chat_id`, `files`, `caption?`, `reply_to?` | `{"message_ids": [i64]}` (temporary). `files` are what tuimeta listed in the composer and checked on Enter: `[{"path", "dev", "ino", "size", "mtime_ns", "ctime_ns"}]`, the absolute path and the file's identity from its metadata, not following links (`dev`, `ino` and `ctime_ns` are 0 where the system has none, as on Windows). The helper opens each path without following a link, reads it once, now, from that open file, and sends nothing (`bad_request`: "A file changed since it was attached; attach it again.") unless every file is a regular file with exactly that identity (the zeros aside) and gives exactly `size` bytes. |
 | `edit_text` | `chat_id`, `message_id`, `text` | `{}` |
 | `delete` | `chat_id`, `message_id` | `{}`: unsends your message for everyone. |
 | `react` | `chat_id`, `message_id`, `emoji?` | `{}`: sets your one reaction; `null` removes it. |
-| `mark_read` | `chat_id`, `message_id` | `{}`: marks the chat read up to that message. |
-| `typing` | `chat_id`, `typing` | `{}` |
+| `mark_read` | `chat_id`, `message_id` | `{}`: marks the chat read up to that message. tuimeta doesn't ask it for a chat with `request: true` (a receipt would tell a stranger you read them before you chose to answer); Messenger and Instagram answer `{}` for one and mark and send nothing, so it stays unread until it's accepted. |
+| `typing` | `chat_id`, `typing` | `{}`. A chat's changes go out one at a time, in the order they were requested: one whose turn comes after a later-requested one went out is dropped (answered `{}`), so a start can't overtake its stop. |
 | `download` | `file_id`, `priority` (`high`/`low`) | `{}`, then `file` events. |
 | `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. On WhatsApp: the contacts and groups this device knows, and, for a query that is a phone number written with `+` and its country code, that number if it's on WhatsApp. |
 | `open_dm` | `network`, `user_id` | `{"chat_id": i64}`: the chat with that person, made if needed. |

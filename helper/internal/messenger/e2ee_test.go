@@ -4,6 +4,8 @@ package messenger
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"slices"
 	"strconv"
 	"testing"
@@ -159,7 +161,7 @@ func TestEncryptedMediaQuotesAndDownloads(t *testing.T) {
 		t.Fatalf("media %+v", md)
 	}
 	ref, _ := h.deps.Files.Get(md.FileID)
-	if ref.Key != "wa:abcd" {
+	if sum := sha256.Sum256([]byte{0xab, 0xcd, 2}); ref.Key != "wa:"+hex.EncodeToString(sum[:]) { // the hash, then the media key
 		t.Errorf("key %q", ref.Key)
 	}
 	h.e2ee.files["/v/photo"] = []byte("JPEG!")

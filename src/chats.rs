@@ -586,11 +586,15 @@ impl Chat {
 
 /// A name or title from someone else on one clean line, capped like a
 /// preview: a chat title is drawn (and so re-measured) every frame, and a
-/// sender can make it any length.
+/// sender can make it any length. Cut, it ends with `…`, so a name padded
+/// with blank characters can't pass for one that ends where it seems to.
 fn one_line(text: &str) -> String {
     let clean = text::clean(text);
     let line = clean.split_whitespace().collect::<Vec<_>>().join(" ");
-    text::first_chars(&line, PREVIEW_CHARS).to_string()
+    match text::first_chars(&line, PREVIEW_CHARS) {
+        start if start.len() < line.len() => format!("{start}…"),
+        start => start.to_string(),
+    }
 }
 
 /// How much of the last message a chat list row keeps.
@@ -699,6 +703,21 @@ mod tests {
             "id": date << 18, "chat_id": chat_id, "date": date, "text": text, "outgoing": true,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_name_cut_short_ends_with_an_ellipsis() {
+        // A title pushed on far past what a row shows, to hide its end.
+        let padded = format!("Bank support{}evil", "\u{2800}".repeat(400));
+        let cut = one_line(&padded);
+        assert!(cut.starts_with("Bank support"), "{cut}");
+        assert!(cut.ends_with('…'), "{cut}");
+        assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+        let long = "a".repeat(PREVIEW_CHARS + 1);
+        assert_eq!(one_line(&long), format!("{}…", &long[..PREVIEW_CHARS]));
+        let fits = "a".repeat(PREVIEW_CHARS);
+        assert_eq!(one_line(&fits), fits, "nothing cut, nothing added");
+        assert_eq!(one_line("  Jo\n  Smith "), "Jo Smith");
     }
 
     #[test]

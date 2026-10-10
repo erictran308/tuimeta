@@ -472,7 +472,10 @@ func (b *Instagram) React(ctx context.Context, ref backend.MessageRef, emoji str
 }
 
 // MarkRead sends a read receipt up to the message: the only place one goes
-// out. Like the web client, it marks the thread read, then confirms it.
+// out. Like the web client, it marks the thread read, then confirms it. A
+// message request (a chat in your requests or spam) gets none: its sender
+// learns nothing of your reading it until you accept it by answering, and
+// it stays unread here.
 func (b *Instagram) MarkRead(ctx context.Context, ref backend.MessageRef) error {
 	conn, err := b.current()
 	if err != nil {
@@ -482,13 +485,13 @@ func (b *Instagram) MarkRead(ctx context.Context, ref backend.MessageRef) error 
 	c, n, err := b.message(ref)
 	var netID string
 	var ms int64
-	already := false
+	quiet := false
 	if err == nil {
 		netID, ms = n.netID, n.ms
-		already = ms <= c.readInbox && !c.markedUnread
+		quiet = (ms <= c.readInbox && !c.markedUnread) || c.request
 	}
 	b.mu.Unlock()
-	if err != nil || already {
+	if err != nil || quiet {
 		return err
 	}
 	long, err := b.longID(ctx, conn, c)

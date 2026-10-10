@@ -209,8 +209,8 @@ func TestViewOnceMediaKeepsNothingThatCouldFetchIt(t *testing.T) {
 	h := newHarness(t)
 	h.load()
 	evt := &events.Message{Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Mimetype: gproto.String("image/jpeg"), DirectPath: gproto.String("/v/secret"), MediaKey: []byte("k"),
-		FileSHA256: []byte("s"), FileEncSHA256: []byte("e"), JPEGThumbnail: []byte("thumb"), Caption: gproto.String("only once"),
+		Mimetype: gproto.String("image/jpeg"), DirectPath: gproto.String("/v/secret"), MediaKey: key32("k"),
+		FileSHA256: key32("s"), FileEncSHA256: []byte("e"), JPEGThumbnail: []byte("thumb"), Caption: gproto.String("only once"),
 	}}, IsViewOnce: true}
 	evt.Info.Chat, evt.Info.Sender, evt.Info.ID, evt.Info.Timestamp = benLID, benLID, "V1", at(-1)
 	h.event(evt)
@@ -230,8 +230,8 @@ func TestAttachmentsAreFilesFetchedOnlyWhenAskedAndThumbnailsComeFromTheMessage(
 	h := newHarness(t)
 	h.load()
 	evt := &events.Message{Message: &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
-		Mimetype: gproto.String("video/mp4"), DirectPath: gproto.String("/v/clip"), MediaKey: []byte("k"),
-		FileSHA256: []byte{1, 2, 3}, FileEncSHA256: []byte("e"), FileLength: gproto.Uint64(2048), Seconds: gproto.Uint32(9),
+		Mimetype: gproto.String("video/mp4"), DirectPath: gproto.String("/v/clip"), MediaKey: key32("k"),
+		FileSHA256: key32("clip"), FileEncSHA256: []byte("e"), FileLength: gproto.Uint64(2048), Seconds: gproto.Uint32(9),
 		Width: gproto.Uint32(640), Height: gproto.Uint32(360), JPEGThumbnail: []byte("JPEG"), Caption: gproto.String("look"),
 	}}}
 	evt.Info.Chat, evt.Info.Sender, evt.Info.ID, evt.Info.Timestamp = benLID, benLID, "M1", at(-1)

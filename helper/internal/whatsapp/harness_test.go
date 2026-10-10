@@ -4,6 +4,7 @@ package whatsapp
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"path/filepath"
@@ -237,7 +238,7 @@ func (f *fakeWA) Upload(_ context.Context, data []byte, _ whatsmeow.MediaType) (
 	n := strconv.Itoa(len(f.uploads))
 	return whatsmeow.UploadResponse{
 		URL: "https://mmg.whatsapp.net/up/" + n, DirectPath: "/up/" + n,
-		MediaKey: []byte("key" + n), FileSHA256: []byte("sha" + n), FileEncSHA256: []byte("enc" + n), FileLength: uint64(len(data)),
+		MediaKey: key32("key" + n), FileSHA256: key32("sha" + n), FileEncSHA256: []byte("enc" + n), FileLength: uint64(len(data)),
 	}, nil
 }
 
@@ -366,6 +367,13 @@ func newHarness(t *testing.T) *harness {
 
 func newHarnessIn(t *testing.T, dir string) *harness {
 	t.Helper()
+	return newHarnessAt(t, dir, base, nil)
+}
+
+// newHarnessAt is newHarnessIn whose clock says now, and whose downloads
+// are dl's (none if nil), from the moment the store opens.
+func newHarnessAt(t *testing.T, dir string, now time.Time, dl backend.Downloads) *harness {
+	t.Helper()
 	HistoryWait = 50 * time.Millisecond
 	lookupSettle = time.Millisecond
 	rec := &recorder{}
@@ -377,10 +385,10 @@ func newHarnessIn(t *testing.T, dir string) *harness {
 	msgs := ids.NewMessages()
 	deps := backend.Deps{
 		Events: events, IDs: idStore, Messages: msgs, Files: ids.NewFiles(),
-		Outbox: backend.NewOutbox(events, msgs), Session: session.New(dir, proto.WhatsApp),
+		Outbox: backend.NewOutbox(events, msgs), Session: session.New(dir, proto.WhatsApp), Downloads: dl,
 	}
 	w := newWhatsApp(deps)
-	w.now = func() time.Time { return base }
+	w.now = func() time.Time { return now }
 	w.dial = func(int, *wastore.Device) error {
 		t.Error("the test tried to connect to WhatsApp")
 		return errNotConnected
@@ -453,6 +461,13 @@ func text(chat, sender waTypes.JID, id string, min int, body string) *events.Mes
 func withAlt(evt *events.Message, alt waTypes.JID) *events.Message {
 	evt.Info.SenderAlt = alt
 	return evt
+}
+
+// key32 is 32 bytes made from s: a file's hash or media key as WhatsApp
+// makes them.
+func key32(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
 }
 
 // chat is the backend's chat with key.

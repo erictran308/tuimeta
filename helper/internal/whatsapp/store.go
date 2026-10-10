@@ -13,6 +13,8 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/erictran308/tuimeta/helper/internal/fsutil"
+
 	// A SQLite written in Go, so the helper still builds with CGO_ENABLED=0.
 	// It registers the "sqlite" driver; mautrix's dbutil reads any driver
 	// name starting with "sqlite" as the SQLite dialect.
@@ -36,16 +38,16 @@ type waStore struct {
 
 // openStore opens the database at path, made 0600 before SQLite ever opens
 // it: SQLite gives its -wal and -shm files the database file's mode, so they
-// are private too.
+// are private too. It must be this user's own plain file: a link planted in
+// its place is refused, not followed.
 func openStore(ctx context.Context, path string) (*waStore, error) {
 	if strings.ContainsRune(path, '?') {
 		return nil, errors.New("store path contains '?'")
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := fsutil.OpenPrivate(path, os.O_RDWR|os.O_CREATE)
 	if err != nil {
 		return nil, err
 	}
-	_ = f.Chmod(0o600)
 	f.Close()
 	// Foreign keys are on, as whatsmeow requires; secure_delete overwrites
 	// deleted rows (old keys, deleted and disappearing messages) instead of
@@ -92,8 +94,32 @@ func (s *waStore) upgrade(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS tuimeta_message_ts ON tuimeta_message (chat, ts);
 		CREATE INDEX IF NOT EXISTS tuimeta_message_expires ON tuimeta_message (expires) WHERE expires > 0;
+		CREATE TABLE IF NOT EXISTS tuimeta_deleted (
+			chat   TEXT    NOT NULL,
+			id     TEXT    NOT NULL,
+			sender TEXT    NOT NULL,
+			sure   INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (chat, id, sender)
+		);
 	`)
 	return err
+}
+
+// tombstone says a message was deleted (for everyone, for you, or its time
+// up), so another copy of it (the phone's history, a late decryption) never
+// brings it back. It names the message's sender: only that sender's message
+// with the id is kept out, unless sure, when the id was certainly that
+// sender's (the message was kept here, or your phone deleted it) and so is
+// nobody else's either.
+type tombstone struct {
+	id, sender string
+	sure       bool
+}
+
+// bars reports whether t keeps out a message with id from sender; same
+// compares people.
+func (t tombstone) bars(id, sender string, same func(a, b string) bool) bool {
+	return t.id == id && (t.sure || same(t.sender, sender))
 }
 
 func (s *waStore) Close() error { return s.db.Close() }
@@ -130,14 +156,19 @@ func (s *waStore) putChat(ctx context.Context, jid string, row chatRow) error {
 	return err
 }
 
-// deleteChat forgets a chat and its messages.
+// deleteChat forgets a chat, its messages and who had sent its deleted ones.
 func (s *waStore) deleteChat(ctx context.Context, jid string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM tuimeta_message WHERE chat=?`, jid); err != nil {
-			return err
+		for _, q := range []string{
+			`DELETE FROM tuimeta_message WHERE chat=?`,
+			`DELETE FROM tuimeta_deleted WHERE chat=?`,
+			`DELETE FROM tuimeta_chat WHERE jid=?`,
+		} {
+			if _, err := tx.ExecContext(ctx, q, jid); err != nil {
+				return err
+			}
 		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM tuimeta_chat WHERE jid=?`, jid)
-		return err
+		return nil
 	})
 }
 
@@ -158,12 +189,38 @@ func (s *waStore) renameChat(ctx context.Context, from, to string) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tuimeta_message WHERE chat=?`, from); err != nil {
 			return err
 		}
+		if err := moveDeleted(ctx, tx, from, to); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE OR IGNORE tuimeta_chat SET jid=? WHERE jid=?`, to, from); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `DELETE FROM tuimeta_chat WHERE jid=?`, from)
 		return err
 	})
+}
+
+// renameDeleted moves what's kept of a chat's deleted messages to another
+// JID, for a chat that isn't here (yet) whose person turned out to have a
+// WhatsApp id.
+func (s *waStore) renameDeleted(ctx context.Context, from, to string) error {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM tuimeta_deleted WHERE chat=? LIMIT 1`, from).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // nothing to move, and no write for it
+	}
+	if err != nil {
+		return err
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error { return moveDeleted(ctx, tx, from, to) })
+}
+
+func moveDeleted(ctx context.Context, tx *sql.Tx, from, to string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE OR IGNORE tuimeta_deleted SET chat=? WHERE chat=?`, to, from); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM tuimeta_deleted WHERE chat=?`, from)
+	return err
 }
 
 // messages is a chat's kept messages, oldest first.
@@ -213,44 +270,151 @@ func (s *waStore) newest(ctx context.Context) (map[string]*message, error) {
 	return out, rows.Err()
 }
 
-// putMessages keeps messages of a chat, replacing ones with the same id,
-// then trims the chat to MaxStoredPerChat.
-func (s *waStore) putMessages(ctx context.Context, chat string, ms ...*message) error {
-	if len(ms) == 0 {
+// message is one kept message of a chat, nil if there's none.
+func (s *waStore) message(ctx context.Context, chat, id string) (*message, error) {
+	var data string
+	err := s.db.QueryRowContext(ctx, `SELECT data FROM tuimeta_message WHERE chat=? AND id=?`, chat, id).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decode(data), nil
+}
+
+// decode is a message row's data, nil if it can't be read.
+func decode(data string) *message {
+	var m message
+	if json.Unmarshal([]byte(data), &m) != nil || m.ID == "" {
 		return nil
 	}
-	return s.tx(ctx, func(tx *sql.Tx) error {
+	return &m
+}
+
+// putMessages keeps messages of a chat, replacing ones with the same id,
+// then trims the chat to MaxStoredPerChat; it returns what the trim took. A
+// message a tombstone keeps out is never kept, whatever asks.
+func (s *waStore) putMessages(ctx context.Context, chat string, ms ...*message) ([]*message, error) {
+	if len(ms) == 0 {
+		return nil, nil
+	}
+	var trimmed []*message
+	err := s.tx(ctx, func(tx *sql.Tx) error {
 		for _, m := range ms {
 			data, err := json.Marshal(m)
 			if err != nil {
 				return err
 			}
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO tuimeta_message (chat, id, ts, expires, data) VALUES (?, ?, ?, ?, ?)
+				INSERT INTO tuimeta_message (chat, id, ts, expires, data)
+				SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (
+					SELECT 1 FROM tuimeta_deleted WHERE chat=? AND id=? AND (sure=1 OR sender=?)
+				)
 				ON CONFLICT (chat, id) DO UPDATE SET ts=excluded.ts, expires=excluded.expires, data=excluded.data`,
-				chat, m.ID, m.MS, m.Expires, string(data)); err != nil {
+				chat, m.ID, m.MS, m.Expires, string(data), chat, m.ID, m.Sender); err != nil {
 				return err
 			}
 		}
-		_, err := tx.ExecContext(ctx, `
-			DELETE FROM tuimeta_message WHERE chat=? AND rowid NOT IN (
-				SELECT rowid FROM tuimeta_message WHERE chat=? ORDER BY ts DESC LIMIT ?
-			)`, chat, chat, MaxStoredPerChat)
+		const beyond = `chat=? AND rowid NOT IN (SELECT rowid FROM tuimeta_message WHERE chat=? ORDER BY ts DESC LIMIT ?)`
+		rows, err := tx.QueryContext(ctx, `SELECT data FROM tuimeta_message WHERE `+beyond, chat, chat, MaxStoredPerChat)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var data string
+			if err := rows.Scan(&data); err != nil {
+				rows.Close()
+				return err
+			}
+			if m := decode(data); m != nil {
+				trimmed = append(trimmed, m)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(trimmed) == 0 {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM tuimeta_message WHERE `+beyond, chat, chat, MaxStoredPerChat)
 		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return trimmed, nil
+}
+
+// deleteMessage deletes a kept message, and keeps gone (if any) so it never
+// comes back.
+func (s *waStore) deleteMessage(ctx context.Context, chat, id string, gone *tombstone) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tuimeta_message WHERE chat=? AND id=?`, chat, id); err != nil {
+			return err
+		}
+		if gone == nil {
+			return nil
+		}
+		return putDeleted(ctx, tx, chat, *gone)
 	})
 }
 
-func (s *waStore) deleteMessage(ctx context.Context, chat, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM tuimeta_message WHERE chat=? AND id=?`, chat, id)
+// MaxDeletedPerChat bounds the deleted messages remembered per chat: those
+// certainly their sender's first, then the latest deleted.
+const MaxDeletedPerChat = MaxStoredPerChat
+
+// putDeleted keeps a chat's tombstone.
+func (s *waStore) putDeleted(ctx context.Context, chat string, t tombstone) error {
+	return s.tx(ctx, func(tx *sql.Tx) error { return putDeleted(ctx, tx, chat, t) })
+}
+
+func putDeleted(ctx context.Context, tx *sql.Tx, chat string, t tombstone) error {
+	sure := 0
+	if t.sure {
+		sure = 1
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tuimeta_deleted (chat, id, sender, sure) VALUES (?, ?, ?, ?)
+		ON CONFLICT (chat, id, sender) DO UPDATE SET sure=MAX(sure, excluded.sure)`,
+		chat, t.id, t.sender, sure); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `
+		DELETE FROM tuimeta_deleted WHERE chat=? AND rowid NOT IN (
+			SELECT rowid FROM tuimeta_deleted WHERE chat=? ORDER BY sure DESC, rowid DESC LIMIT ?
+		)`, chat, chat, MaxDeletedPerChat)
 	return err
 }
 
-// expiry is a kept message whose time ran out.
-type expiry struct{ chat, id string }
+// deletedIn is a chat's tombstones.
+func (s *waStore) deletedIn(ctx context.Context, chat string) ([]tombstone, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, sender, sure FROM tuimeta_deleted WHERE chat=?`, chat)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []tombstone
+	for rows.Next() {
+		var t tombstone
+		if err := rows.Scan(&t.id, &t.sender, &t.sure); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// expiry is a kept message whose time ran out, with what's kept of it.
+type expiry struct {
+	chat, id string
+	msg      *message // nil if it can't be read
+}
 
 // expired lists messages that disappear by ms.
 func (s *waStore) expired(ctx context.Context, ms int64) ([]expiry, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT chat, id FROM tuimeta_message WHERE expires > 0 AND expires <= ?`, ms)
+	rows, err := s.db.QueryContext(ctx, `SELECT chat, id, data FROM tuimeta_message WHERE expires > 0 AND expires <= ?`, ms)
 	if err != nil {
 		return nil, err
 	}
@@ -258,9 +422,11 @@ func (s *waStore) expired(ctx context.Context, ms int64) ([]expiry, error) {
 	var out []expiry
 	for rows.Next() {
 		var e expiry
-		if err := rows.Scan(&e.chat, &e.id); err != nil {
+		var data string
+		if err := rows.Scan(&e.chat, &e.id, &data); err != nil {
 			return nil, err
 		}
+		e.msg = decode(data)
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -289,15 +455,41 @@ func (s *waStore) checkpoint(ctx context.Context) {
 }
 
 // prune keeps the newest MaxStoredPerChat messages of every chat, once at
-// startup, so what's read back stays bounded whatever an older run kept.
-func (s *waStore) prune(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM tuimeta_message WHERE rowid IN (
-			SELECT rowid FROM (
-				SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat ORDER BY ts DESC) AS n FROM tuimeta_message
-			) WHERE n > ?
-		)`, MaxStoredPerChat)
-	return err
+// startup, so what's read back stays bounded whatever an older run kept. It
+// returns what it took.
+func (s *waStore) prune(ctx context.Context) ([]*message, error) {
+	const beyond = `rowid IN (
+		SELECT rowid FROM (
+			SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat ORDER BY ts DESC) AS n FROM tuimeta_message
+		) WHERE n > ?
+	)`
+	var pruned []*message
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT data FROM tuimeta_message WHERE `+beyond, MaxStoredPerChat)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var data string
+			if err := rows.Scan(&data); err != nil {
+				rows.Close()
+				return err
+			}
+			if m := decode(data); m != nil {
+				pruned = append(pruned, m)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM tuimeta_message WHERE `+beyond, MaxStoredPerChat)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pruned, nil
 }
 
 func (s *waStore) tx(ctx context.Context, f func(*sql.Tx) error) error {

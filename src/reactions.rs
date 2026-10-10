@@ -57,11 +57,13 @@ pub fn from_meta(reactions: &[ReactionInfo]) -> Vec<Reaction> {
 }
 
 /// An emoji from someone else without anything that could upset the layout:
-/// [`text::is_hidden`] characters and white space. `None` if nothing is left.
+/// what [`text::clean`] leaves out, and white space. `None` if nothing is
+/// left.
 fn clean(emoji: &str) -> Option<String> {
+    let mut keep = text::Keep::default();
     let clean: String = emoji
         .chars()
-        .filter(|&c| !text::is_hidden(c) && !c.is_whitespace())
+        .filter(|&c| !c.is_whitespace() && keep.keeps(c))
         .collect();
     (!clean.is_empty()).then_some(clean)
 }

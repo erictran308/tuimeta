@@ -38,6 +38,9 @@ type change struct {
 	emoji  string
 	// timer is set when the message turned disappearing messages on or off.
 	timer *uint32
+	// owner is whose message a deletion says it deletes (a person key), when
+	// it names someone: a group's admin may delete anyone's.
+	owner string
 }
 
 // reader reads WhatsApp's messages. canon gives a person's key (their
@@ -65,8 +68,10 @@ func (r reader) read(evt *events.Message, sender string) change {
 	case msg.GetPollUpdateMessage() != nil, msg.GetEncEventResponseMessage() != nil, msg.GetEncCommentMessage() != nil,
 		msg.GetKeepInChatMessage() != nil, msg.GetPinInChatMessage() != nil, msg.GetAlbumMessage() != nil,
 		msg.GetStickerSyncRmrMessage() != nil, msg.GetMessageHistoryBundle() != nil, msg.GetMessageHistoryNotice() != nil,
-		msg.GetPlaceholderMessage() != nil:
-		// Votes, pins, album headers and bookkeeping: nothing to show.
+		msg.GetPlaceholderMessage() != nil, msg.GetEncReactionMessage() != nil:
+		// Votes, pins, album headers and bookkeeping: nothing to show. An
+		// encrypted reaction is decrypted before it's read (receive); one
+		// still encrypted (in the phone's history) can't be.
 		return change{}
 	}
 	switch msg.GetMessageContextInfo().GetMessageAssociation().GetAssociationType() {
@@ -85,6 +90,14 @@ func (r reader) read(evt *events.Message, sender string) change {
 	return change{kind: added, msg: out}
 }
 
+// protocolIn is the protocol message (an edit, a deletion, a timer change)
+// a history entry holds, unwrapped as whatsmeow unwraps messages; nil if
+// it holds none.
+func protocolIn(web *waWeb.WebMessageInfo) *waE2E.ProtocolMessage {
+	e := &events.Message{RawMessage: web.GetMessage()}
+	return e.UnwrapRaw().Message.GetProtocolMessage()
+}
+
 // protocol reads an edit, a deletion or a timer change.
 func (r reader) protocol(pm *waE2E.ProtocolMessage, info waTypes.MessageInfo, sender string) change {
 	switch pm.GetType() {
@@ -92,7 +105,11 @@ func (r reader) protocol(pm *waE2E.ProtocolMessage, info waTypes.MessageInfo, se
 		if pm.GetKey().GetID() == "" {
 			return change{}
 		}
-		return change{kind: revoked, target: pm.GetKey().GetID()}
+		ch := change{kind: revoked, target: pm.GetKey().GetID()}
+		if p, err := waTypes.ParseJID(pm.GetKey().GetParticipant()); err == nil && personJID(p) {
+			ch.owner = r.canon(p)
+		}
+		return ch
 	case waE2E.ProtocolMessage_MESSAGE_EDIT:
 		out := &message{ID: pm.GetKey().GetID(), Sender: sender, MS: pm.GetTimestampMS()}
 		if out.MS == 0 {
@@ -141,6 +158,14 @@ const (
 	// maxReaction is the longest reaction, in bytes: one emoji, however
 	// it's composed.
 	maxReaction = 32
+	// MaxField is the longest name, title or description kept of a message
+	// (a file's name, a link card's title, a group's name in an event), in
+	// bytes.
+	MaxField = 1 << 10
+	// maxMime is the longest file type kept, in bytes.
+	maxMime = 255
+	// maxLink is the longest link a card is kept for, in bytes.
+	maxLink = 4 << 10
 )
 
 // reactionLike reports whether s can be a reaction: "" (taken back), or a
@@ -327,6 +352,8 @@ func (r reader) content(msg *waE2E.Message, out *message, viewOnce bool) {
 	out.Text = cutText(out.Text, MaxText)
 	if out.Media != nil {
 		out.Media.Thumb = thumb(out.Media.Thumb)
+		out.Media.Name = cutText(out.Media.Name, MaxField)
+		out.Media.Mime = cutText(out.Media.Mime, maxMime)
 	}
 	if out.Preview != nil {
 		out.Preview.Thumb = thumb(out.Preview.Thumb)
@@ -356,10 +383,13 @@ func viewOnceKind(k proto.MediaKind) proto.MediaKind {
 // http(s) links get one.
 func linkPreview(x *waE2E.ExtendedTextMessage) *preview {
 	link := webLink(x.GetMatchedText())
-	if link == "" || (x.GetTitle() == "" && x.GetDescription() == "") {
+	if link == "" || len(link) > maxLink || (x.GetTitle() == "" && x.GetDescription() == "") {
 		return nil
 	}
-	return &preview{URL: link, Title: oneLine(x.GetTitle()), Description: oneLine(x.GetDescription()), Thumb: x.GetJPEGThumbnail()}
+	return &preview{
+		URL: link, Title: oneLine(cutText(x.GetTitle(), MaxField)), Description: oneLine(cutText(x.GetDescription(), MaxField)),
+		Thumb: x.GetJPEGThumbnail(),
+	}
 }
 
 // context reads what a message's context says: the reply, forwarding,
@@ -391,8 +421,22 @@ func (r reader) context(ci *waE2E.ContextInfo, out *message) {
 	}
 }
 
-// quoteOf is a one-line snippet of a quoted message.
+// quoteOf is a one-line snippet of a quoted message. A photo or video seen
+// only once is quoted without its caption, as its own message keeps none.
 func quoteOf(q *waE2E.Message) string {
+	viewOnce := false
+	for _, wrapped := range []*waE2E.FutureProofMessage{q.GetViewOnceMessage(), q.GetViewOnceMessageV2(), q.GetViewOnceMessageV2Extension()} {
+		if wrapped.GetMessage() != nil {
+			q, viewOnce = wrapped.GetMessage(), true
+			break
+		}
+	}
+	caption := func(text string, once bool) string {
+		if viewOnce || once {
+			return ""
+		}
+		return snippet(text)
+	}
 	switch {
 	case q == nil:
 		return ""
@@ -401,16 +445,16 @@ func quoteOf(q *waE2E.Message) string {
 	case q.GetExtendedTextMessage().GetText() != "":
 		return snippet(q.GetExtendedTextMessage().GetText())
 	case q.GetImageMessage() != nil:
-		return firstNonEmpty(snippet(q.GetImageMessage().GetCaption()), "Photo")
+		return firstNonEmpty(caption(q.GetImageMessage().GetCaption(), q.GetImageMessage().GetViewOnce()), "Photo")
 	case q.GetVideoMessage() != nil:
-		return firstNonEmpty(snippet(q.GetVideoMessage().GetCaption()), "Video")
+		return firstNonEmpty(caption(q.GetVideoMessage().GetCaption(), q.GetVideoMessage().GetViewOnce()), "Video")
 	case q.GetAudioMessage() != nil:
 		if q.GetAudioMessage().GetPTT() {
 			return "Voice message"
 		}
 		return "Audio"
 	case q.GetDocumentMessage() != nil:
-		return firstNonEmpty(oneLine(q.GetDocumentMessage().GetFileName()), "File")
+		return firstNonEmpty(proto.Snippet(cutText(q.GetDocumentMessage().GetFileName(), MaxField), 100), "File")
 	case q.GetStickerMessage() != nil:
 		return "Sticker"
 	}
@@ -425,7 +469,7 @@ func (r reader) stub(web *waWeb.WebMessageInfo, id, actor string, ms int64) *mes
 	people := func() []string {
 		var out []string
 		for _, p := range params {
-			if j, err := waTypes.ParseJID(p); err == nil && !j.IsEmpty() {
+			if j, err := waTypes.ParseJID(p); err == nil && personJID(j) {
 				out = append(out, r.canon(j))
 			}
 		}
@@ -433,7 +477,7 @@ func (r reader) stub(web *waWeb.WebMessageInfo, id, actor string, ms int64) *mes
 	}
 	first := ""
 	if len(params) > 0 {
-		first = params[0]
+		first = cutText(params[0], MaxField)
 	}
 	var s *service
 	switch web.GetMessageStubType() {
@@ -458,7 +502,12 @@ func (r reader) stub(web *waWeb.WebMessageInfo, id, actor string, ms int64) *mes
 	case waWeb.WebMessageInfo_CALL_MISSED_VIDEO, waWeb.WebMessageInfo_CALL_MISSED_GROUP_VIDEO:
 		s = &service{Kind: "missed_video", Actor: actor}
 	case waWeb.WebMessageInfo_CHANGE_EPHEMERAL_SETTING:
-		secs, _ := strconv.ParseUint(first, 10, 32)
+		// Only one of WhatsApp's timers: what isn't would read as a timer
+		// it isn't (or, unreadable, as turned off).
+		secs, err := strconv.ParseUint(first, 10, 32)
+		if err != nil || !timerAllowed(uint32(secs)) {
+			return nil
+		}
 		s = timerService(actor, uint32(secs))
 	default:
 		return nil

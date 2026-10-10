@@ -88,9 +88,8 @@ pub struct Alert {
 /// tmux, codes other than the bell must be passed through to the terminal
 /// (which needs `set -g allow-passthrough on`).
 pub fn escape(method: Notifications, alert: &Alert, id: u64, tmux: bool) -> Option<String> {
-    // The codes end at a control character, and a `;` separates fields.
-    let title = plain(&alert.title).replace(';', ",");
-    let body = plain(&alert.body).replace(';', ",");
+    let title = field(&alert.title);
+    let body = field(&alert.body);
     let code = match method {
         Notifications::Auto | Notifications::Off => return None,
         Notifications::Bell if alert.silent => return None,
@@ -137,6 +136,24 @@ pub const SAVE_TITLE: &str = "\x1b[22;0t";
 /// Puts back the title [`SAVE_TITLE`] saved. Terminals that can't clear it
 /// instead, so it doesn't stay "tuimeta".
 pub const RESTORE_TITLE: &str = "\x1b]2;\x07\x1b[23;0t";
+
+/// Text from others as a field of a notification code. The codes end at a
+/// control character, and a `;` separates fields. Some terminals hand the
+/// text on to a notification server that reads markup, which would make a
+/// sender's `<a href="…">` a link that opens outside tuimeta, or their name
+/// bold: so no `<`, `>` or `&` either, but look-alikes.
+fn field(text: &str) -> String {
+    plain(text)
+        .chars()
+        .map(|c| match c {
+            ';' => ',',
+            '<' => '‹',
+            '>' => '›',
+            '&' => '＆',
+            c => c,
+        })
+        .collect()
+}
 
 /// `text` on one line, without control characters.
 fn plain(text: &str) -> String {
@@ -355,6 +372,39 @@ mod tests {
         assert_eq!(
             escape(Notifications::Osc777, &sneaky, 1, false).unwrap(),
             "\x1b]777;notify;Eve,x;ab]0,pwned\\c d,e\x07"
+        );
+    }
+
+    #[test]
+    fn markup_from_others_reaches_no_notification_as_markup() {
+        let sneaky = alert(
+            "Eve <b>Bank</b>",
+            "<a href=\"https://evil.example/\">https://bank.example/</a> &amp; <img src=x>",
+        );
+        let decode = |code: &str, from: &str| {
+            let start = code.find(from).unwrap() + from.len();
+            let end = start + code[start..].find('\x1b').unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&code[start..end])
+                .unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let osc99 = escape(Notifications::Osc99, &sneaky, 1, false).unwrap();
+        let shown = [
+            escape(Notifications::Osc777, &sneaky, 1, false).unwrap(),
+            escape(Notifications::Osc777, &sneaky, 1, true).unwrap(),
+            escape(Notifications::Osc9, &sneaky, 1, false).unwrap(),
+            decode(&osc99, "e=1;"),
+            decode(&osc99, "p=body:e=1;"),
+        ];
+        for text in shown {
+            assert!(!text.contains(['<', '>', '&']), "{text:?}");
+        }
+        assert_eq!(
+            escape(Notifications::Osc777, &sneaky, 1, false).unwrap(),
+            "\x1b]777;notify;Eve ‹b›Bank‹/b›;‹a href=\"https://evil.example/\"›\
+             https://bank.example/‹/a› ＆amp, ‹img src=x›\x07",
+            "still readable"
         );
     }
 

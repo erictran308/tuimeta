@@ -113,6 +113,14 @@ type Messenger struct {
 	replaying bool
 	waiters   map[int64][]chan struct{}
 	edits     map[string]chan string
+
+	// Asking Messenger who people are (askContact): those waiting their
+	// turn, when the latest lookups went out (kept across logins: the
+	// budget is the helper's), and the life the worker asking serves.
+	contactQueue   []int64
+	contactTimes   []time.Time
+	contactLife    context.Context
+	contactRecheck time.Duration // ContactRecheck
 }
 
 var _ backend.Backend = (*Messenger)(nil)
@@ -122,7 +130,7 @@ func New(deps backend.Deps) backend.Backend { return newMessenger(deps) }
 
 func newMessenger(deps backend.Deps) *Messenger {
 	silenceLibraries()
-	m := &Messenger{d: deps, now: time.Now, base: context.Background()}
+	m := &Messenger{d: deps, now: time.Now, base: context.Background(), contactRecheck: ContactRecheck}
 	m.dial = m.connectWith
 	m.life, m.stop = context.WithCancel(m.base)
 	m.reset()
@@ -140,6 +148,7 @@ func (m *Messenger) reset() {
 	m.asked = map[int64]bool{}
 	m.waiters = map[int64][]chan struct{}{}
 	m.edits = map[string]chan string{}
+	m.contactQueue = nil
 	m.dirty = nil
 	m.more = true
 	m.minKey = 0
@@ -187,7 +196,7 @@ func (m *Messenger) resume(life context.Context, l login) {
 	wait := retryWait
 	for {
 		err := m.connect(life, l)
-		if err == nil || life.Err() != nil {
+		if err == nil || life.Err() != nil || errors.Is(err, errReplaced) {
 			return
 		}
 		var pe *proto.Error
@@ -236,15 +245,25 @@ func (m *Messenger) LoginCookies(ctx context.Context, c cookies.Set, as browser.
 	defer stopLife()
 	err := m.dial(ctx, life, login{c.Values(), as})
 	if err != nil {
+		// Only while this is still the login: one given up for a newer
+		// login, or a logout, mustn't disconnect or log out what replaced it.
 		m.mu.Lock()
-		m.teardownLocked()
-		m.reset()
+		current := m.life == life
+		if current {
+			m.teardownLocked()
+			m.reset()
+		}
 		m.mu.Unlock()
-		m.d.Events.Account(net, proto.LoggedOut, 0, "", "")
+		if current {
+			m.d.Events.Account(net, proto.LoggedOut, 0, "", "")
+		}
 		return err
 	}
 	return nil
 }
+
+// errReplaced is a login that gave way before it was done.
+var errReplaced = proto.Err(proto.Cancelled, "This login gave way to a newer one, or to logging out.")
 
 // connect is a resumed session's connection.
 func (m *Messenger) connect(life context.Context, l login) error {
@@ -316,23 +335,36 @@ func (m *Messenger) connectWith(ctx, life context.Context, l login) error {
 		m.mu.Unlock()
 		return err
 	}
+	if !m.keepSession(gen, fbid, cookieValues(cli), l.as) {
+		return errReplaced
+	}
+	m.becameReady(gen)
+	hlog.Go("messenger e2ee", func() { m.connectE2EE(gen) })
+	return nil
+}
+
+// keepSession records and saves the login of the connection gen, which has
+// synced, and reports whether it's still the connection. It's saved under
+// the lock, and only then, so a logout can't wipe the folder in between and
+// find the session back at the next start.
+func (m *Messenger) keepSession(gen int, fbid int64, values map[string]string, as browser.Identity) bool {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen != gen || m.closed {
+		return false
+	}
 	if m.sess == nil || m.sess.UserID != fbid {
 		// A new account: the old one's encrypted-chat device isn't reused.
 		m.sess = &savedSession{Version: 1}
 	}
 	m.sess.UserID = fbid
-	m.sess.Cookies = cookieValues(cli)
-	m.sess.Browser = l.as.Name()
+	m.sess.Cookies = values
+	m.sess.Browser = as.Name()
 	m.upGen = gen
-	sess := *m.sess
-	m.mu.Unlock()
-	if err := m.d.Session.SaveJSON(sessionFile, sess); err != nil {
+	if err := m.d.Session.SaveJSON(sessionFile, *m.sess); err != nil {
 		hlog.Error("messenger: can't save session", hlog.Kind(err))
 	}
-	m.becameReady(gen)
-	hlog.Go("messenger e2ee", func() { m.connectE2EE(gen) })
-	return nil
+	return true
 }
 
 func cookieValues(cli *messagix.Client) map[string]string {
@@ -343,21 +375,10 @@ func cookieValues(cli *messagix.Client) map[string]string {
 func (m *Messenger) onMetaEvent(gen int, evt any, initial *table.LSTable, signal func(error)) {
 	switch e := evt.(type) {
 	case *table.LSTable:
-		m.mu.Lock()
-		if m.gen == gen && !m.closed {
-			m.applyTable(e, fromSocket)
-			if m.meta != nil {
-				m.meta.PostHandle(e)
-			}
-		}
-		m.mu.Unlock()
+		m.applySocketTable(gen, e)
 	case *messagix.ConnectedEvent:
 		hlog.Info("messenger: connected")
-		m.mu.Lock()
-		if m.gen == gen && initial != nil {
-			m.applyTable(initial, fromInitial)
-		}
-		m.mu.Unlock()
+		m.applyInitialPage(gen, initial)
 		m.openStore(gen)
 		signal(nil)
 	case *messagix.ReconnectedEvent:
@@ -392,6 +413,39 @@ func (m *Messenger) onMetaEvent(gen int, evt any, initial *table.LSTable, signal
 		if current {
 			m.d.Events.Account(net, proto.Errored, 0, "", msg)
 		}
+	}
+}
+
+// applySocketTable applies a table pushed on the socket of connection gen.
+// A panic while applying is recovered by the socket's event handler, so
+// m.mu is let go of by defer, and messagix is told the table was handled
+// even then: its sync cursors move past a table that can't be applied,
+// rather than have it sent again at every reconnect.
+func (m *Messenger) applySocketTable(gen int, tbl *table.LSTable) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen != gen || m.closed {
+		return
+	}
+	if meta := m.meta; meta != nil {
+		defer meta.PostHandle(tbl)
+	}
+	m.applyTable(tbl, fromSocket)
+}
+
+// applyInitialPage applies the data the Messenger page came with. A row in
+// it that can't be applied gives up the rest of the page, but the account
+// still connects: the same page would fail again at every try.
+func (m *Messenger) applyInitialPage(gen int, initial *table.LSTable) {
+	defer func() {
+		if v := recover(); v != nil {
+			hlog.Recovered("messenger initial page", v)
+		}
+	}()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen == gen && initial != nil {
+		m.applyTable(initial, fromInitial)
 	}
 }
 
@@ -465,20 +519,16 @@ func (m *Messenger) Close() {
 	m.stop()
 	meta, wa, store := m.meta, m.wa, m.store
 	m.meta, m.msgx, m.e2ee, m.wa, m.store = nil, nil, nil, nil, nil
-	var sess *savedSession
 	if meta != nil && m.sess != nil {
 		// Keep the cookies as messagix last updated them, so the next run
-		// starts with what Facebook expects.
+		// starts with what Facebook expects. Under the lock, so a logout
+		// can't wipe the folder in between and find them back.
 		m.sess.Cookies = meta.Cookies()
-		s := *m.sess
-		sess = &s
-	}
-	m.mu.Unlock()
-	if sess != nil {
-		if err := m.d.Session.SaveJSON(sessionFile, sess); err != nil {
+		if err := m.d.Session.SaveJSON(sessionFile, *m.sess); err != nil {
 			hlog.Warn("messenger: can't save session", hlog.Kind(err))
 		}
 	}
+	m.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

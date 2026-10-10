@@ -80,8 +80,7 @@ func (b *Instagram) History(ctx context.Context, ref backend.ChatRef, q history.
 			if err != nil {
 				return history.Page{}, requestError(err, errHistory)
 			}
-			b.mu.Lock()
-			if c.histGen == gen && b.conn == conn {
+			b.applyPage(conn, c, gen, func() {
 				if t := resp.ThreadInfo.AsIGDirectThread; t != nil {
 					b.threadPage(t)
 				}
@@ -91,8 +90,7 @@ func (b *Instagram) History(ctx context.Context, ref backend.ChatRef, q history.
 					c.log.SetComplete(true)
 				}
 				b.changed(c)
-			}
-			b.mu.Unlock()
+			})
 			continue
 		}
 		req := &slidetypes.PaginateMessagesRequest{ThreadID: igid, FirstN: pageSize, InitialMessagePageCount: pageSize}
@@ -117,16 +115,25 @@ func (b *Instagram) History(ctx context.Context, ref backend.ChatRef, q history.
 			}
 			return history.Page{}, requestError(err, errHistory)
 		}
-		b.mu.Lock()
-		if c.histGen == gen && b.conn == conn {
-			b.olderPage(c, resp.ThreadInfo.AsIGDirectThread)
-		}
-		b.mu.Unlock()
+		b.applyPage(conn, c, gen, func() { b.olderPage(c, resp.ThreadInfo.AsIGDirectThread) })
 	}
 	b.mu.Lock()
 	page := c.log.Page(q)
 	b.mu.Unlock()
 	return page, nil
+}
+
+// applyPage applies a page of history Instagram sent, with b.mu held, if the
+// history it was fetched for is still the chat's (gen) on the same
+// connection. The unlock is deferred: a panic on something unforeseen in
+// Instagram's data mustn't leave b.mu held, and the backend stuck, for the
+// rest of the run.
+func (b *Instagram) applyPage(conn *connection, c *chat, gen int, apply func()) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if c.histGen == gen && b.conn == conn {
+		apply()
+	}
 }
 
 // hasHistory says whether any of the chat's history is loaded.

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::attach::{Attachment, Dropped, size_label};
@@ -233,16 +233,14 @@ impl Format {
 
 /// The formatting in a text, as byte ranges. Entities can nest (bold inside
 /// italic) and overlap, so they're cut into stretches that each look one way.
-fn styles(text: &str, entities: &[meta::Entity]) -> Vec<Styled> {
+fn styles(entities: &[meta::Entity], offsets: &Utf16Offsets) -> Vec<Styled> {
     // Where each entity starts (+1) and ends (-1).
     let mut edges = Vec::new();
     for entity in entities {
         let Some(mark) = Mark::of(entity.kind) else {
             continue;
         };
-        // Entity offsets count UTF-16 code units, not bytes or chars.
-        let start = byte_offset(text, entity.offset);
-        let end = byte_offset(text, entity.offset.saturating_add(entity.length));
+        let (start, end) = offsets.range(entity);
         if start < end {
             edges.push((start, true, mark));
             edges.push((end, false, mark));
@@ -316,13 +314,17 @@ impl Card {
 
 /// The text on one line, at most [`SNIPPET_CHARS`] long: a quote or a popup
 /// shows only its start, and a sender's 20000 characters would be measured
-/// again on every frame.
+/// again on every frame. Cut, it ends with `…`, so a name padded with blank
+/// characters can't pass for one that ends where it seems to.
 pub fn one_line(text: &str) -> String {
     let line = text::clean(text)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    text::first_chars(&line, SNIPPET_CHARS).to_string()
+    match text::first_chars(&line, SNIPPET_CHARS) {
+        start if start.len() < line.len() => format!("{start}…"),
+        start => start.to_string(),
+    }
 }
 
 /// How much of a message a one-line snippet keeps.
@@ -512,21 +514,22 @@ fn shown_media(media: &meta::Media) -> Shown {
     }
 }
 
-/// Tabs become spaces and hidden characters ([`text::is_hidden`], `\r`
-/// among them) go, so terminal widths add up. Link and formatting ranges
-/// move along with the text.
+/// Tabs become spaces and what [`text::clean`] leaves out goes (hidden
+/// characters, `\r` among them, and joiners that join nothing), so terminal
+/// widths add up. Link and formatting ranges move along with the text.
 fn normalize<'a>(text: &str, ranges: impl IntoIterator<Item = &'a mut Range<usize>>) -> String {
-    if !text.contains(|c| c == '\t' || text::is_hidden(c)) {
+    if !text.contains(|c| c == '\t' || text::is_hidden(c) || text::is_joining(c)) {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
     // Old byte offset -> new byte offset.
     let mut map = vec![0; text.len() + 1];
+    let mut keep = text::Keep::default();
     for (i, c) in text.char_indices() {
         map[i..i + c.len_utf8()].fill(out.len());
         match c {
+            _ if !keep.keeps(c) => {}
             '\t' => out.push_str("    "),
-            c if text::is_hidden(c) => {}
             c => out.push(c),
         }
     }
@@ -541,12 +544,14 @@ fn normalize<'a>(text: &str, ranges: impl IntoIterator<Item = &'a mut Range<usiz
 /// entities (links hidden behind words among them), and addresses written
 /// out in the text. Only http(s), so a crafted link can't get the OS to
 /// open a local file or app.
-fn links(text: &str, entities: &[meta::Entity]) -> Vec<(Link, Range<usize>)> {
+fn links(
+    text: &str,
+    entities: &[meta::Entity],
+    offsets: &Utf16Offsets,
+) -> Vec<(Link, Range<usize>)> {
     let mut out: Vec<(Link, Range<usize>)> = Vec::new();
     for entity in entities.iter().filter(|e| e.kind == EntityKind::Link) {
-        // Entity offsets count UTF-16 code units, not bytes or chars.
-        let start = byte_offset(text, entity.offset);
-        let end = byte_offset(text, entity.offset.saturating_add(entity.length));
+        let (start, end) = offsets.range(entity);
         // A bad entity mustn't crash the app.
         let Some(shown) = text.get(start..end).filter(|s| !s.is_empty()) else {
             continue;
@@ -557,11 +562,23 @@ fn links(text: &str, entities: &[meta::Entity]) -> Vec<(Link, Range<usize>)> {
             out.push((Link { url, disguise }, start..end));
         }
     }
+    // A written-out address inside a link entity is that link. Found by
+    // the entities sorted by start, with the furthest end so far, so a
+    // message with thousands of either takes no longer than its length.
+    let mut taken: Vec<Range<usize>> = out.iter().map(|(_, r)| r.clone()).collect();
+    taken.sort_by_key(|r| r.start);
+    let reach: Vec<usize> = taken
+        .iter()
+        .scan(0, |end, r| {
+            *end = r.end.max(*end);
+            Some(*end)
+        })
+        .collect();
     for range in written_urls(text) {
-        if out
-            .iter()
-            .any(|(_, r)| r.start < range.end && range.start < r.end)
-        {
+        // The entities starting before this address ends, and whether one
+        // of them runs past its start.
+        let before = taken.partition_point(|r| r.start < range.end);
+        if before > 0 && reach[before - 1] > range.start {
             continue;
         }
         if let Some(url) = web_url(&text[range.clone()]) {
@@ -606,34 +623,78 @@ fn written_urls(text: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// Whether link text spells out the URL it leads to, give or take the
-/// scheme, `www.`, a trailing slash and case.
+/// Whether link text spells out the URL it leads to, give or take `www.`,
+/// a trailing slash, the host's case and a scheme the text leaves out. A
+/// path's case counts (`bit.ly/AbC` isn't `bit.ly/abc`), and so does a
+/// scheme the text names: `https://` mustn't lead to `http://`.
 pub fn same_place(shown: &str, url: &str) -> bool {
-    let bare = |s: &str| {
-        let s = s.trim().to_lowercase();
-        let s = s
-            .strip_prefix("https://")
-            .or(s.strip_prefix("http://"))
-            .unwrap_or(&s);
-        let s = s.strip_prefix("www.").unwrap_or(s);
-        s.trim_end_matches('/').to_string()
+    let parts = |s: &str| {
+        let s = s.trim();
+        let lower = s.to_ascii_lowercase();
+        let (scheme, rest) = match () {
+            _ if lower.starts_with("https://") => (Some("https"), &s[8..]),
+            _ if lower.starts_with("http://") => (Some("http"), &s[7..]),
+            _ => (None, s),
+        };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let host = rest[..end].to_lowercase();
+        let host = host.strip_prefix("www.").unwrap_or(&host);
+        let path = rest[end..].trim_end_matches('/');
+        (scheme, format!("{host}{path}"))
     };
-    bare(shown) == bare(url)
+    let (shown_scheme, shown) = parts(shown);
+    let (url_scheme, url) = parts(url);
+    shown == url && shown_scheme.is_none_or(|scheme| Some(scheme) == url_scheme)
 }
 
-/// Byte offset of a UTF-16 offset, clamped to the text.
-pub fn byte_offset(text: &str, utf16: i32) -> usize {
-    let mut units = 0;
-    for (i, c) in text.char_indices() {
-        if units >= utf16.max(0) as usize {
-            return i;
-        }
-        units += c.len_utf16();
-    }
-    text.len()
+/// Where a text's UTF-16 offsets are in its bytes: entity offsets count
+/// UTF-16 code units, not bytes or chars. Worked out once per message, so
+/// converting one takes time in step with its size, however many entities
+/// a sender gives it.
+struct Utf16Offsets {
+    /// The byte offset of each UTF-16 offset.
+    at: Vec<usize>,
+    len: usize,
 }
+
+impl Utf16Offsets {
+    fn new(text: &str) -> Self {
+        let mut at = Vec::with_capacity(text.len() + 1);
+        for (i, c) in text.char_indices() {
+            at.push(i);
+            // An offset inside a surrogate pair moves on to the next character.
+            for _ in 1..c.len_utf16() {
+                at.push(i + c.len_utf8());
+            }
+        }
+        Self {
+            at,
+            len: text.len(),
+        }
+    }
+
+    /// The byte offset of a UTF-16 offset, clamped to the text.
+    fn byte(&self, utf16: i32) -> usize {
+        self.at
+            .get(utf16.max(0) as usize)
+            .copied()
+            .unwrap_or(self.len)
+    }
+
+    /// The bytes an entity covers, clamped to the text.
+    fn range(&self, entity: &meta::Entity) -> (usize, usize) {
+        let start = self.byte(entity.offset);
+        let end = self.byte(entity.offset.saturating_add(entity.length));
+        (start, end)
+    }
+}
+
+/// More entities than any message written by hand has: the rest are left
+/// out, so their text shows plain and a link among them isn't one.
+const MAX_ENTITIES: usize = 2000;
 
 /// `example.com/x` becomes `https://example.com/x`; other schemes are dropped.
+/// A `\` before the query is written as the `/` browsers read it as.
 pub fn web_url(url: &str) -> Option<String> {
     let url = text::clean(url);
     let url = url.trim();
@@ -642,6 +703,13 @@ pub fn web_url(url: &str) -> Option<String> {
     if url.contains(char::is_whitespace) {
         return None;
     }
+    // Browsers read `https://bank.com\@evil.example` as going to bank.com,
+    // like `link_host`, but the system's opener may not: macOS reads it as
+    // going to evil.example. Written the browser way, every reader agrees,
+    // and the host tuimeta shows is where it goes.
+    let query = url.find(['?', '#']).unwrap_or(url.len());
+    let url = format!("{}{}", url[..query].replace('\\', "/"), &url[query..]);
+    let url = url.as_str();
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") {
         Some(url.to_string())
@@ -656,12 +724,19 @@ pub fn web_url(url: &str) -> Option<String> {
 /// scheme and any slashes, up to the first `/`, `\\`, `?` or `#`, after the
 /// last `@` and without the port. Lowercased.
 pub fn link_host(url: &str) -> Option<String> {
+    link_parts(url).map(|(host, _)| host)
+}
+
+/// A web link's host, as [`link_host`] reads it, and what comes after it:
+/// the path, query and fragment, as written.
+pub fn link_parts(url: &str) -> Option<(String, &str)> {
     let lower = url.to_ascii_lowercase();
     let rest = lower
         .strip_prefix("https:")
         .or_else(|| lower.strip_prefix("http:"))?;
     let rest = rest.trim_start_matches(['/', '\\']);
-    let authority = &rest[..rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len())];
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
@@ -669,7 +744,9 @@ pub fn link_host(url: &str) -> Option<String> {
         Some(end) if host.starts_with('[') => &host[..=end],
         _ => host.rsplit_once(':').map_or(host, |(host, _)| host),
     };
-    (!host.is_empty()).then(|| host.to_string())
+    // Lowercasing ASCII keeps every byte where it was.
+    let after = &url[url.len() - (rest.len() - end)..];
+    (!host.is_empty()).then(|| (host.to_string(), after))
 }
 
 /// `1:05`, or `1:02:05` past an hour.
@@ -707,30 +784,42 @@ impl From<&meta::Message> for Msg {
                 false => text = format!("{what}\n{text}"),
             }
         }
-        let found = links(&message.text, &message.entities);
+        let entities = &message.entities[..message.entities.len().min(MAX_ENTITIES)];
+        let offsets = Utf16Offsets::new(&message.text);
+        let found = links(&message.text, entities, &offsets);
         let mut link_ranges = Vec::new();
         let mut style_ranges = Vec::new();
-        if let Some(shift) = shift.filter(|_| message.unsupported.is_none() || shown.is_some()) {
+        // The ranges are of the text as sent, which shows under a media
+        // label but not under a label for what can't be shown, nor in place
+        // of a service message's sentence.
+        if let Some(shift) = shift
+            .filter(|_| (message.unsupported.is_none() || shown.is_some()) && service.is_none())
+        {
             link_ranges = found
                 .iter()
                 .map(|(_, r)| r.start + shift..r.end + shift)
                 .collect();
-            style_ranges = styles(&message.text, &message.entities);
+            style_ranges = styles(entities, &offsets);
             for styled in &mut style_ranges {
                 styled.range = styled.range.start + shift..styled.range.end + shift;
             }
         }
         let mut link_list: Vec<Link> = Vec::new();
+        let mut listed: HashMap<String, usize> = HashMap::new();
         for (link, _) in found {
-            match link_list.iter_mut().find(|l| l.url == link.url) {
+            match listed.get(&link.url) {
                 // The same URL also behind other words keeps its warning,
                 // whichever came first.
-                Some(seen) => {
+                Some(&at) => {
+                    let seen = &mut link_list[at];
                     if seen.disguise.is_none() {
                         seen.disguise = link.disguise;
                     }
                 }
-                None => link_list.push(link),
+                None => {
+                    listed.insert(link.url.clone(), link_list.len());
+                    link_list.push(link);
+                }
             }
         }
         // A sender may attach a preview of another page than the links in
@@ -1019,8 +1108,10 @@ impl OpenChat {
     }
 
     /// A message the helper sent: a new one, or a new copy of one that's
-    /// loaded (edited, reacted to, sent). A new one joins only while the
-    /// newest messages are loaded; older ones load with their page.
+    /// loaded (edited, reacted to, sent). A new one joins while the newest
+    /// messages are loaded. One that arrives late, older than the newest
+    /// loaded, joins at its place among the loaded ones; anything older
+    /// loads with its page.
     pub fn upsert(&mut self, message: &meta::Message) {
         if let Some(msg) = self.messages.get_mut(&message.id) {
             msg.set_body(Msg::from(message));
@@ -1030,7 +1121,14 @@ impl OpenChat {
             return;
         }
         let newer = self.newest_id().is_none_or(|newest| message.id > newest);
-        if self.at_newest && newer {
+        // Messages don't arrive in id order: one can cross yours in flight
+        // (yours is reported first, under an id from this computer's clock)
+        // or be held back by the network. The loaded messages are one
+        // unbroken stretch, so a late one belongs among them, and shown
+        // there: the next read receipt covers everything up to the newest.
+        let inside = !newer
+            && (self.all_loaded || self.oldest_id().is_some_and(|oldest| message.id > oldest));
+        if (self.at_newest && newer) || inside {
             self.add_new(message.id, Msg::from(message));
         }
     }
@@ -1142,14 +1240,42 @@ impl OpenChat {
         }
     }
 
+    /// Messages that were unsent or deleted. The cursor on one of them moves
+    /// to the message next to it, and replies to them say it was deleted.
     pub fn remove(&mut self, message_ids: &[i64]) {
-        for id in message_ids {
-            self.messages.remove(id);
-            if self.selected == Some(*id) {
-                self.selected = None;
+        for &id in message_ids {
+            self.messages.remove(&id);
+            // The cursor stays about where you left it, on the next message
+            // up (or down). Following the newest again marks read what
+            // arrived below meanwhile, unseen: that's your move (`j` onto
+            // the newest, `G`), not the sender's.
+            if self.selected == Some(id) {
+                self.selected = self
+                    .messages
+                    .range(..id)
+                    .next_back()
+                    .or_else(|| self.messages.range(id..).next())
+                    .map(|(&id, _)| id);
             }
-            if self.reply.as_ref().is_some_and(|r| r.id == *id) {
+            if self.reply.as_ref().is_some_and(|r| r.id == id) {
                 self.reply = None;
+            }
+        }
+        // What replies quoted of them goes too: it was taken back.
+        let gone: HashSet<i64> = message_ids.iter().copied().collect();
+        for (&reply_id, msg) in &mut self.messages {
+            if let Some(reply) = msg.reply_to.as_mut()
+                && reply
+                    .message_id
+                    .is_some_and(|answered| gone.contains(&answered))
+            {
+                reply.quoted = None;
+                self.replied.insert(reply_id, Fetched::Missing);
+            }
+        }
+        for fetched in self.replied.values_mut() {
+            if matches!(fetched, Fetched::Found(replied) if gone.contains(&replied.id)) {
+                *fetched = Fetched::Missing;
             }
         }
     }
@@ -1434,6 +1560,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_backslash_before_the_query_is_written_as_the_slash_browsers_read() {
+        let tricky = "https://paypal.com\\@evil.example/signin";
+        assert_eq!(
+            web_url(tricky).as_deref(),
+            Some("https://paypal.com/@evil.example/signin"),
+            "what the system's opener gets goes where the card says"
+        );
+        assert_eq!(
+            web_url("https://a.example/x?q=a\\b#c\\d").as_deref(),
+            Some("https://a.example/x?q=a\\b#c\\d"),
+            "the query is left alone"
+        );
+        let msg = msg(serde_json::json!({"text": format!("see {tricky}"),
+            "link_preview": {"url": "https://paypal.com", "title": "PayPal"}}));
+        assert_eq!(
+            msg.links,
+            [Link::from("https://paypal.com/@evil.example/signin")]
+        );
+        assert_eq!(msg.card.unwrap().host, "paypal.com");
+    }
+
+    #[test]
+    fn link_text_names_the_same_place_only_with_the_paths_case_and_its_scheme() {
+        assert!(same_place("Example.com/", "https://www.example.com"));
+        assert!(same_place("HTTPS://Bit.ly/AbC", "https://bit.ly/AbC"));
+        assert!(
+            same_place("bit.ly/AbC", "http://bit.ly/AbC"),
+            "no scheme named"
+        );
+        assert!(!same_place("https://bit.ly/AbC", "https://bit.ly/abc"));
+        assert!(!same_place("https://bank.example", "http://bank.example"));
+    }
+
+    #[test]
+    fn a_links_parts_are_its_real_host_and_what_follows() {
+        assert_eq!(
+            link_parts("https://Bank.com@Evil.example:443/A?b#c"),
+            Some(("evil.example".to_string(), "/A?b#c"))
+        );
+        assert_eq!(
+            link_parts("http://a.example"),
+            Some(("a.example".to_string(), ""))
+        );
+        assert_eq!(link_parts("ftp://a.example/x"), None);
+    }
+
+    #[test]
     fn urls_with_spaces_or_line_breaks_are_not_links() {
         assert_eq!(web_url("https://a.example/x y"), None);
         assert_eq!(web_url("a.example/\nx"), None);
@@ -1511,6 +1684,73 @@ pub(crate) mod tests {
         assert_eq!(msg.text, "Alice named the group Trip");
         assert!(msg.service.is_some());
         assert_eq!(msg.editable, Editable::No);
+
+        // Text sent along with it, against the protocol, has no say in how
+        // the sentence is drawn: its ranges would cut the sentence anywhere.
+        let odd = super::tests::msg(serde_json::json!({"service": "Zoë left",
+            "text": "🎉🎉 https://a.example", "entities": [entity(1, 2, "bold")]}));
+        assert_eq!(odd.text, "Zoë left");
+        assert!(odd.styles.is_empty() && odd.link_ranges.is_empty());
+    }
+
+    /// The byte offset of a UTF-16 offset, found by walking the text from
+    /// its start: what [`Utf16Offsets`] must agree with.
+    fn walked(text: &str, utf16: i32) -> usize {
+        let mut units = 0;
+        for (i, c) in text.char_indices() {
+            if units >= utf16.max(0) as usize {
+                return i;
+            }
+            units += c.len_utf16();
+        }
+        text.len()
+    }
+
+    #[test]
+    fn utf16_offsets_land_where_walking_the_text_does() {
+        let texts = [
+            "",
+            "plain",
+            "héllo wörld",
+            "日本語のテキスト",
+            "a🎉b😀",
+            "👨\u{200D}👩\u{200D}👧!",
+        ];
+        for text in texts {
+            let offsets = Utf16Offsets::new(text);
+            let units = text.encode_utf16().count() as i32;
+            for utf16 in -3..units + 4 {
+                assert_eq!(
+                    offsets.byte(utf16),
+                    walked(text, utf16),
+                    "{text:?} at {utf16}"
+                );
+            }
+        }
+        assert_eq!(Utf16Offsets::new("ab").byte(i32::MAX), 2);
+    }
+
+    #[test]
+    fn a_message_with_thousands_of_formatting_runs_converts_quickly() {
+        // What a sender's `*a* _b_ ` repeated to WhatsApp's length becomes.
+        let runs = 8192;
+        let text = "a b ".repeat(runs);
+        let entities: Vec<serde_json::Value> = (0..runs as i32)
+            .flat_map(|i| [entity(i * 4, 1, "bold"), entity(i * 4 + 2, 1, "italic")])
+            .collect();
+        let message = meta_message(serde_json::json!({"text": text, "entities": entities}));
+        let started = std::time::Instant::now();
+        let msg = Msg::from(&message);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "took {took:?}: the text was walked again for every entity"
+        );
+        assert_eq!(
+            msg.styles.len(),
+            MAX_ENTITIES,
+            "entities past the most a message keeps are left out"
+        );
     }
 
     #[test]
@@ -1585,6 +1825,38 @@ pub(crate) mod tests {
             ids(&open),
             [10, 11, 12, 20],
             "not while an old stretch is loaded"
+        );
+        open.upsert(&meta_message(serde_json::json!({"id": 15, "text": "late"})));
+        assert_eq!(
+            ids(&open),
+            [10, 11, 12, 15, 20],
+            "but inside it, at its place"
+        );
+
+        open.all_loaded = true;
+        open.upsert(&meta_message(serde_json::json!({"id": 5, "text": "older"})));
+        assert_eq!(
+            ids(&open),
+            [5, 10, 11, 12, 15, 20],
+            "the whole chat is loaded, so it's the first"
+        );
+    }
+
+    #[test]
+    fn a_message_that_crossed_yours_in_flight_is_shown_at_its_place() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(10..13));
+        // Yours is reported first, under an id from this computer's clock…
+        open.upsert(&meta_message(serde_json::json!({"id": 50, "text": "mine",
+            "outgoing": true, "state": "pending"})));
+        // …then theirs, which the network stamped a moment before.
+        open.upsert(&meta_message(
+            serde_json::json!({"id": 40, "text": "theirs"}),
+        ));
+        assert_eq!(
+            ids(&open),
+            [10, 11, 12, 40, 50],
+            "a read receipt for anything newer covers it, so it's on screen"
         );
     }
 
@@ -1689,6 +1961,36 @@ pub(crate) mod tests {
         let msg = &mut msgs[0].1;
         msg.text = "first line\n\nsecond\tline ".into();
         assert_eq!(msg.snippet(), "first line second line");
+    }
+
+    #[test]
+    fn a_one_line_cut_short_says_so() {
+        // Braille blanks look like nothing but take room.
+        let name = format!("invoice.pdf{}.exe", "\u{2800}".repeat(SNIPPET_CHARS));
+        let line = one_line(&name);
+        assert!(
+            line.starts_with("invoice.pdf") && line.ends_with('…'),
+            "{line}"
+        );
+        assert_eq!(line.chars().count(), SNIPPET_CHARS + 1);
+        assert_eq!(one_line("short"), "short");
+    }
+
+    #[test]
+    fn a_message_padded_with_joiners_shows_what_they_hide() {
+        let text = format!("pay\u{200D}{} now", "\u{200D}".repeat(500));
+        let msg = msg(serde_json::json!({"text": text, "entities": [entity(0, 3, "bold")]}));
+        assert_eq!(msg.text, "pay\u{200D} now");
+        assert_eq!(
+            styled(&msg),
+            [(
+                "pay",
+                Format {
+                    bold: true,
+                    ..Format::default()
+                }
+            )]
+        );
     }
 
     fn album(open: &mut OpenChat, parts: &[i64]) {
@@ -1799,9 +2101,63 @@ pub(crate) mod tests {
         open.set_replied(12, None);
         assert!(matches!(open.replied[&12], Fetched::Missing));
 
-        // Once it's gone from the loaded messages, it has to be asked for.
+        // Once it's deleted, the reply says so without asking.
         open.remove(&[10]);
-        assert_eq!(open.missing_replied(), [(11, 10)]);
+        assert!(open.missing_replied().is_empty());
+        assert!(matches!(open.replied[&11], Fetched::Missing));
+    }
+
+    #[test]
+    fn a_deleted_messages_quote_goes_from_the_replies_to_it() {
+        let mut open = OpenChat::new(1);
+        let mut messages = page(10..15);
+        reply(&mut messages, 1, Some(3), true); // 11 quotes 3, not loaded
+        reply(&mut messages, 2, Some(4), false); // 12 answers 4, fetched
+        reply(&mut messages, 3, Some(5), true); // 13 quotes 5, which stays
+        open.add_page(Page::Latest, messages);
+        assert_eq!(open.missing_replied(), [(12, 4)]);
+        let found = meta_message(serde_json::json!({"id": 4, "text": "secret"}));
+        open.set_replied(12, Some(&found));
+
+        open.remove(&[3, 4]);
+        assert!(
+            open.messages[&11]
+                .reply_to
+                .as_ref()
+                .unwrap()
+                .quoted
+                .is_none()
+        );
+        assert!(matches!(open.replied[&11], Fetched::Missing));
+        assert!(matches!(open.replied[&12], Fetched::Missing));
+        assert!(
+            open.messages[&13]
+                .reply_to
+                .as_ref()
+                .unwrap()
+                .quoted
+                .is_some()
+        );
+        assert!(!open.replied.contains_key(&13));
+    }
+
+    #[test]
+    fn deleting_the_message_under_the_cursor_moves_it_next_door_not_to_the_newest() {
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(1..6));
+        // Reading up the chat, or looking at a photo there.
+        open.selected = Some(3);
+        open.remove(&[3]);
+        assert_eq!(open.selected, Some(2), "the one above, which you've seen");
+        open.remove(&[1, 2]);
+        assert_eq!(open.selected, Some(4), "else the one below");
+        open.remove(&[4, 5]);
+        assert_eq!(open.selected, None, "nothing left");
+
+        let mut open = OpenChat::new(1);
+        open.add_page(Page::Latest, page(1..6));
+        open.remove(&[5]);
+        assert_eq!(open.selected, None, "still following the newest");
     }
 
     #[test]

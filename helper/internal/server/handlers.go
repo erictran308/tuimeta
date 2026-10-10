@@ -5,6 +5,7 @@ package server
 import (
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -268,8 +269,6 @@ func (s *Server) loadChats(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.loadMu.Lock()
-	defer s.loadMu.Unlock()
 	lim := limit(p.Limit)
 	if p.Network != nil {
 		n, b, err := s.network(*p.Network)
@@ -279,7 +278,7 @@ func (s *Server) loadChats(c *call) (any, error) {
 		if err := s.ready(n); err != nil {
 			return nil, err
 		}
-		more, err := b.LoadChats(c.ctx, lim)
+		more, err := s.loadChatsOf(c, n, b, lim)
 		if err != nil {
 			return nil, err
 		}
@@ -295,7 +294,7 @@ func (s *Server) loadChats(c *call) (any, error) {
 			continue
 		}
 		tried++
-		m, err := b.LoadChats(c.ctx, lim)
+		m, err := s.loadChatsOf(c, n, b, lim)
 		if err != nil {
 			failed++
 			if firstErr == nil {
@@ -310,6 +309,16 @@ func (s *Server) loadChats(c *call) (any, error) {
 		return nil, firstErr
 	}
 	return map[string]any{"has_more": more}, nil
+}
+
+// loadChatsOf asks network n for more chats, one load at a time per
+// network: a backend that's stuck (waiting on its own lock, or on the
+// network) holds back only its own chat list.
+func (s *Server) loadChatsOf(c *call, n proto.Network, b backend.Backend, lim int) (bool, error) {
+	mu := s.loading[n]
+	mu.Lock()
+	defer mu.Unlock()
+	return b.LoadChats(c.ctx, lim)
 }
 
 func (s *Server) history(c *call) (any, error) {
@@ -336,14 +345,16 @@ func (s *Server) history(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	page, err := b.History(c.ctx, chat, history.Query{Before: p.Before, After: p.After, Around: p.Around, Limit: limit(p.Limit)})
+	q := history.Query{Before: p.Before, After: p.After, Around: p.Around, Limit: limit(p.Limit)}
+	page, err := b.History(c.ctx, chat, q)
 	if err != nil {
 		return nil, err
 	}
-	if page.Messages == nil {
-		page.Messages = []proto.Message{}
+	messages, more, err := fitPage(page, q, PageBudget)
+	if err != nil {
+		return nil, err
 	}
-	return map[string]any{"messages": page.Messages, "has_more": page.HasMore}, nil
+	return map[string]any{"messages": messages, "has_more": more}, nil
 }
 
 type messageParams struct {
@@ -461,10 +472,10 @@ func (s *Server) sendText(c *call) (any, error) {
 
 func (s *Server) sendFiles(c *call) (any, error) {
 	p, err := decode[struct {
-		ChatID  int64    `json:"chat_id"`
-		Paths   []string `json:"paths"`
-		Caption *string  `json:"caption"`
-		ReplyTo *int64   `json:"reply_to"`
+		ChatID  int64        `json:"chat_id"`
+		Files   []UploadFile `json:"files"`
+		Caption *string      `json:"caption"`
+		ReplyTo *int64       `json:"reply_to"`
 	}](c.params)
 	if err != nil {
 		return nil, err
@@ -484,7 +495,7 @@ func (s *Server) sendFiles(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	uploads, err := readUploads(p.Paths)
+	uploads, err := readUploads(p.Files)
 	if err != nil {
 		return nil, err
 	}
@@ -563,6 +574,17 @@ func (s *Server) markRead(c *call) (any, error) {
 	return nil, b.MarkRead(c.ctx, ref)
 }
 
+// typingOrder is where a chat's typing changes stand: the last one that
+// went to the network.
+type typingOrder struct {
+	mu   sync.Mutex
+	last uint64
+}
+
+// typing tells the network you're typing in a chat, or stopped. Changes go
+// out in the order tuimeta asked, one at a time per chat: a start that
+// comes after the stop that followed it (one letter typed and deleted) is
+// dropped, rather than leave you shown typing until the network gives up.
 func (s *Server) typing(c *call) (any, error) {
 	p, err := decode[struct {
 		ChatID int64 `json:"chat_id"`
@@ -575,6 +597,19 @@ func (s *Server) typing(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.typingMu.Lock()
+	order := s.typingIn[chat.ID]
+	if order == nil {
+		order = &typingOrder{}
+		s.typingIn[chat.ID] = order
+	}
+	s.typingMu.Unlock()
+	order.mu.Lock()
+	defer order.mu.Unlock()
+	if c.seq < order.last {
+		return nil, nil
+	}
+	order.last = c.seq
 	return nil, b.SetTyping(c.ctx, chat, p.Typing)
 }
 

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -53,8 +54,7 @@ func (m *Messenger) tellUser(p *person, again bool) {
 		return
 	}
 	if !p.known && !p.asked && p.fbid != m.self {
-		p.asked = true
-		m.askContact(p.fbid)
+		p.asked = m.askContact(p.fbid)
 	}
 	if p.told && !again {
 		return
@@ -97,25 +97,106 @@ func (m *Messenger) updatePerson(fbid int64, name, username, avatar string) {
 	}
 }
 
-// askContact asks Messenger who fbid is, in the background.
-func (m *Messenger) askContact(fbid int64) {
-	meta := m.meta
-	if meta == nil {
-		return
+// Asking Messenger who someone is goes out from the account like anything
+// else it does, and whoever writes decides whom a message names: lookups
+// wait their turn, ContactsAtOnce at a time and at most MaxContactLookups in
+// any ContactWindow.
+const (
+	MaxContactLookups = 30
+	ContactWindow     = 5 * time.Minute
+	ContactsAtOnce    = 2
+	// MaxContactQueue is how many people may wait to be asked about; past
+	// it, someone is asked about the next time they're seen instead.
+	MaxContactQueue = 256
+)
+
+// ContactRecheck is the longest the lookups wait before looking at the
+// budget again (Messenger.contactRecheck; tests shorten it).
+const ContactRecheck = 10 * time.Second
+
+// askContact puts fbid in line to be asked about, in the background, and
+// reports whether it is; m.mu is held.
+func (m *Messenger) askContact(fbid int64) bool {
+	if m.meta == nil || len(m.contactQueue) >= MaxContactQueue {
+		return false
 	}
-	life, gen := m.life, m.gen
-	hlog.Go("messenger contact", func() {
-		tbl, err := meta.ExecuteTasks(life, &socket.GetContactsFullTask{ContactID: fbid})
-		if err != nil {
-			hlog.Info("messenger: contact lookup failed", hlog.Kind(err))
+	m.contactQueue = append(m.contactQueue, fbid)
+	if m.contactLife != m.life {
+		life := m.life
+		m.contactLife = life
+		hlog.Go("messenger contacts", func() { m.askContacts(life) })
+	}
+	return true
+}
+
+// askContacts asks Messenger about the people in line until it's empty, or
+// life or the connection ends.
+func (m *Messenger) askContacts(life context.Context) {
+	slots := make(chan struct{}, ContactsAtOnce)
+	for {
+		select {
+		case slots <- struct{}{}:
+		case <-life.Done():
+			m.nextContact(life) // gives the line up
 			return
 		}
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.gen == gen {
-			m.applyTable(tbl, fromResponse)
+		fbid, meta, gen, wait, ok := m.nextContact(life)
+		if !ok {
+			return
 		}
-	})
+		if wait > 0 {
+			<-slots
+			select {
+			case <-time.After(wait):
+			case <-life.Done():
+			}
+			continue
+		}
+		hlog.Go("messenger contact", func() {
+			defer func() { <-slots }()
+			tbl, err := meta.ExecuteTasks(life, &socket.GetContactsFullTask{ContactID: fbid})
+			if err != nil {
+				hlog.Info("messenger: contact lookup failed", hlog.Kind(err))
+				return
+			}
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if m.gen == gen {
+				m.applyTable(tbl, fromResponse)
+			}
+		})
+	}
+}
+
+// nextContact is whom to ask about next, with the connection to ask on, or
+// how long to wait for the budget; ok is false once there's nobody to ask
+// about or no way to, and then the people still in line are let go of, to
+// be asked about when they're seen again.
+func (m *Messenger) nextContact(life context.Context) (fbid int64, meta metaAPI, gen int, wait time.Duration, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if life.Err() != nil || m.life != life || m.meta == nil || len(m.contactQueue) == 0 {
+		if m.contactLife == life {
+			m.contactLife = nil
+			if m.life == life {
+				for _, id := range m.contactQueue {
+					if p := m.people[id]; p != nil {
+						p.asked = false
+					}
+				}
+				m.contactQueue = nil
+			}
+		}
+		return 0, nil, 0, 0, false
+	}
+	now := m.now()
+	m.contactTimes = slices.DeleteFunc(m.contactTimes, func(t time.Time) bool { return now.Sub(t) >= ContactWindow })
+	if len(m.contactTimes) >= MaxContactLookups {
+		return 0, nil, 0, max(min(m.contactTimes[0].Add(ContactWindow).Sub(now), m.contactRecheck), time.Millisecond), true
+	}
+	m.contactTimes = append(m.contactTimes, now)
+	fbid, m.contactQueue = m.contactQueue[0], m.contactQueue[1:]
+	return fbid, m.meta, m.gen, 0, true
 }
 
 // askThread asks Messenger for a thread's details once, in the background
@@ -398,45 +479,60 @@ func (m *Messenger) recount(c *chat) {
 func (m *Messenger) LoadChats(ctx context.Context, limit int) (bool, error) {
 	limit = max(limit, 1)
 	for page := 0; ; page++ {
-		m.mu.Lock()
-		if !m.ready && len(m.chats) == 0 {
-			m.mu.Unlock()
-			return false, errNotConnected
+		meta, gen, more, err := m.sendChatsPage(limit, page)
+		if meta == nil {
+			return more, err
 		}
-		batch, rest := m.unsent(limit)
-		if len(batch) == limit || !m.more || page >= MaxThreadPages || m.meta == nil {
-			for _, c := range batch {
-				m.sent[c.id] = true
-				m.sendChat(c)
-			}
-			more := rest > 0 || (m.more && m.meta != nil)
-			m.listed = !more
-			m.mu.Unlock()
-			return more, nil
-		}
-		meta, gen := m.meta, m.gen
-		m.mu.Unlock()
-
 		keys, tbl, err := meta.FetchMoreThreads(ctx, 1)
 		if err != nil {
 			hlog.Info("messenger: fetching threads failed", hlog.Kind(err))
 			return false, requestError(err)
 		}
-		m.mu.Lock()
-		if m.gen == gen {
-			if tbl != nil {
-				m.applyTable(tbl, fromResponse)
-			}
-			switch {
-			case tbl == nil || keys == nil || !keys.HasMoreBefore:
-				m.more = false
-			case keys.MinThreadKey == m.minKey:
-				m.more = false // paging stopped moving
-			default:
-				m.minKey = keys.MinThreadKey
-			}
+		m.applyThreadPage(gen, keys, tbl)
+	}
+}
+
+// sendChatsPage sends the next limit chats load_chats hasn't sent, and
+// whether more remain; or, while there are too few and Messenger may have
+// older threads, the connection to ask for them on. m.mu is let go of by
+// defer, as in applyAnswer.
+func (m *Messenger) sendChatsPage(limit, page int) (metaAPI, int, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.ready && len(m.chats) == 0 {
+		return nil, 0, false, errNotConnected
+	}
+	batch, rest := m.unsent(limit)
+	if len(batch) == limit || !m.more || page >= MaxThreadPages || m.meta == nil {
+		for _, c := range batch {
+			m.sent[c.id] = true
+			m.sendChat(c)
 		}
-		m.mu.Unlock()
+		more := rest > 0 || (m.more && m.meta != nil)
+		m.listed = !more
+		return nil, 0, more, nil
+	}
+	return m.meta, m.gen, false, nil
+}
+
+// applyThreadPage applies a page of older threads, and notes how far paging
+// got; m.mu is let go of by defer, as in applyAnswer.
+func (m *Messenger) applyThreadPage(gen int, keys *socket.KeyStoreData, tbl *table.LSTable) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen != gen {
+		return
+	}
+	if tbl != nil {
+		m.applyTable(tbl, fromResponse)
+	}
+	switch {
+	case tbl == nil || keys == nil || !keys.HasMoreBefore:
+		m.more = false
+	case keys.MinThreadKey == m.minKey:
+		m.more = false // paging stopped moving
+	default:
+		m.minKey = keys.MinThreadKey
 	}
 }
 

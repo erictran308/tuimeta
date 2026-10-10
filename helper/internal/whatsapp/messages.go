@@ -35,10 +35,54 @@ func (w *WhatsApp) store(c *chat, msgs ...*message) {
 	}
 	ctx, cancel := dbCtx()
 	defer cancel()
-	if err := w.st.putMessages(ctx, c.key, msgs...); err != nil {
+	trimmed, err := w.st.putMessages(ctx, c.key, msgs...)
+	if err != nil {
 		w.storeFailed = true
 		hlog.Error("whatsapp: can't keep messages", hlog.Kind(err))
+		return
 	}
+	if len(trimmed) == 0 {
+		return
+	}
+	// The oldest, past what's kept of a chat: what was downloaded of them
+	// goes, but not while they're still shown this run; then it goes when
+	// the helper stops.
+	w.forgetFiles(trimmed...)
+	for _, t := range trimmed {
+		if m := c.msgs[t.ID]; m != nil && len(fileRefs(m)) > 0 && len(w.trimmed) < MaxTrimmedShown {
+			w.trimmed = append(w.trimmed, trim{chat: c.key, msg: m})
+		}
+	}
+}
+
+// trim is a message the store's bound took while it was shown.
+type trim struct {
+	chat string
+	msg  *message
+}
+
+// MaxTrimmedShown bounds the messages a run remembers deleting the files of
+// when it stops.
+const MaxTrimmedShown = 10000
+
+// forgetTrimmed deletes what was downloaded of the messages the store's
+// bound took while they were shown, unless they were kept again since; w.mu
+// is held.
+func (w *WhatsApp) forgetTrimmed() {
+	if w.st == nil || len(w.trimmed) == 0 {
+		return
+	}
+	var gone []*message
+	for _, t := range w.trimmed {
+		ctx, cancel := dbCtx()
+		kept, err := w.st.message(ctx, t.chat, t.msg.ID)
+		cancel()
+		if err == nil && kept == nil {
+			gone = append(gone, t.msg)
+		}
+	}
+	w.trimmed = nil
+	w.forgetFiles(gone...)
 }
 
 // render is msg as tuimeta sees it; w.mu is held.
@@ -71,24 +115,32 @@ func (w *WhatsApp) render(c *chat, msg *message) proto.Message {
 		out.EditableUntil = msg.MS/1000 + EditWindow
 	}
 	if r := msg.Reply; r != nil {
+		// Who said what's quoted, and what it said, are only the reply's
+		// sender's word: they're taken as said only from a kept message.
 		rt := &proto.ReplyTo{Text: r.Text}
-		if r.Sender != "" {
-			rt.SenderID = w.person(r.Sender).id
-		}
-		if replied := c.msgs[r.ID]; replied != nil && len(replied.ids) > 0 {
+		replied := c.msgs[r.ID]
+		switch {
+		case replied != nil && len(replied.ids) > 0 && r.Sender != "" && w.same(r.Sender, replied.Sender):
+			// The message it answers is kept here: the one with its id and
+			// its sender (a WhatsApp message is both, and another sender
+			// may use the same id). It's quoted as it is here, never with
+			// words only the reply gave it: an event by its sentence.
 			rt.MessageID = replied.ids[0]
 			rt.SenderID = w.person(replied.Sender).id
-			if q := quoteFor(replied); q != "" {
-				rt.Text = q
+			rt.Text = quoteFor(replied)
+			if rt.Text == "" && replied.Service != nil {
+				rt.Text = proto.Snippet(w.sentence(replied.Service), 100)
 			}
-		} else {
-			// Not a message kept here: who said it is only the sender's
-			// word, so it isn't put in anyone's mouth.
-			rt.SenderID = 0
+		case replied == nil:
+			// Not a message kept here: the quote is shown, but isn't put
+			// in anyone's mouth.
 			if known, ok := w.d.Messages.Known(c.id, r.ID); ok && len(known) > 0 {
 				rt.MessageID = known[0]
 			}
 		}
+		// A kept message by someone else than the reply names isn't what it
+		// answers: the quote is shown as the reply gave it, linked to
+		// nothing and nobody's.
 		out.ReplyTo = rt
 	}
 	if msg.Media != nil {
@@ -169,7 +221,14 @@ func (w *WhatsApp) textOf(msg *message) (string, []proto.Entity) {
 		prev = s.end
 	}
 	b.WriteString(text[prev:])
-	return metatext.ParseWithMentions(b.String(), mentions)
+	in := b.String()
+	sum := sha256.Sum256([]byte(in))
+	if p := msg.parsed; p == nil || p.sum != sum || !slices.Equal(p.mentions, mentions) {
+		plain, ents := metatext.ParseWithMentions(in, mentions)
+		msg.parsed = &parse{sum: sum, mentions: mentions, text: plain, ents: ents}
+	}
+	// Each render has its own entities: what's sent of one isn't another's.
+	return msg.parsed.text, slices.Clone(msg.parsed.ents)
 }
 
 // sentence is a service event in words, with the names known now; w.mu is
@@ -281,25 +340,34 @@ func duration(secs uint64) string {
 // fetched from), while the media key is the secret only the file's own
 // messages hold. A thumbnail is named by its own bytes.
 func mediaRefs(md *media) (full, thumbnail *ids.FileRef) {
-	if md.ViewOnce {
-		return nil, nil
-	}
+	return fullRef(md), thumbRef(md)
+}
+
+// fullRef is an attachment's file, nil when there's nothing to download.
+func fullRef(md *media) *ids.FileRef {
 	// Both hashes, or whatsmeow can't check what it downloads (and refuses).
-	if len(md.FileSHA256) > 0 && len(md.FileEncSHA256) > 0 && md.DirectPath != "" && len(md.MediaKey) > 0 {
-		h := sha256.New()
-		h.Write(md.FileSHA256)
-		h.Write(md.MediaKey)
-		full = &ids.FileRef{
-			Network: net, Key: "wa:" + hex.EncodeToString(h.Sum(nil)), Size: md.Size, Mime: md.Mime, Name: md.Name, Source: md,
-		}
+	// The hash and the key are each 32 bytes as WhatsApp makes them, and
+	// only then is the name made of them one way only.
+	if md.ViewOnce || len(md.FileSHA256) != 32 || len(md.MediaKey) != 32 || len(md.FileEncSHA256) == 0 || md.DirectPath == "" {
+		return nil
 	}
-	if len(md.Thumb) > 0 {
-		thumbnail = &ids.FileRef{
-			Network: net, Key: "wa:thumb:" + contentKey(md.Thumb), Size: int64(len(md.Thumb)), Mime: "image/jpeg", Name: "thumbnail.jpg",
-			Source: inlineSource(md.Thumb),
-		}
+	h := sha256.New()
+	h.Write(md.FileSHA256)
+	h.Write(md.MediaKey)
+	return &ids.FileRef{
+		Network: net, Key: "wa:" + hex.EncodeToString(h.Sum(nil)), Size: md.Size, Mime: md.Mime, Name: md.Name, Source: md,
 	}
-	return full, thumbnail
+}
+
+// thumbRef is the thumbnail an attachment carried, nil if none.
+func thumbRef(md *media) *ids.FileRef {
+	if md.ViewOnce || len(md.Thumb) == 0 {
+		return nil
+	}
+	return &ids.FileRef{
+		Network: net, Key: "wa:thumb:" + contentKey(md.Thumb), Size: int64(len(md.Thumb)), Mime: "image/jpeg", Name: "thumbnail.jpg",
+		Source: inlineSource(md.Thumb),
+	}
 }
 
 // previewRef is a link card's picture, carried in the message.
@@ -353,25 +421,107 @@ func (w *WhatsApp) previewOf(p *preview) *proto.LinkPreview {
 	return out
 }
 
-// forgetFiles deletes what was downloaded of msg (its file, its thumbnail,
-// its link's picture), once msg is gone; w.mu is held.
-func (w *WhatsApp) forgetFiles(msg *message) {
-	if w.d.Downloads == nil {
-		return
-	}
+// fileRefs are msg's files: its attachment, its thumbnail and its link's
+// picture.
+func fileRefs(msg *message) []ids.FileRef {
+	var out []ids.FileRef
 	var refs []*ids.FileRef
 	if msg.Media != nil {
-		full, thumbnail := mediaRefs(msg.Media)
-		refs = append(refs, full, thumbnail)
+		refs = append(refs, fullRef(msg.Media), thumbRef(msg.Media))
 	}
 	if msg.Preview != nil {
 		refs = append(refs, previewRef(msg.Preview))
 	}
-	for _, ref := range refs {
-		if ref != nil {
-			w.d.Downloads.Remove(*ref)
+	for _, r := range refs {
+		if r != nil {
+			out = append(out, *r)
 		}
 	}
+	return out
+}
+
+// forgetFiles deletes what was downloaded of msgs (their files, thumbnails
+// and links' pictures) once they're gone, and ends what's being downloaded
+// of them; w.mu is held. A file another message here still shows (a
+// forward of the same photo, the same thumbnail) stays, and so does its
+// file id: only the messages gone are out of their chats.
+func (w *WhatsApp) forgetFiles(msgs ...*message) {
+	if w.d.Downloads == nil {
+		return
+	}
+	want := map[string]ids.FileRef{}
+	for _, m := range msgs {
+		for _, r := range fileRefs(m) {
+			want[r.Key] = r
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	for _, key := range w.stillShown(want, msgs) {
+		delete(want, key)
+	}
+	for _, r := range want {
+		w.d.Downloads.Remove(r)
+	}
+}
+
+// dropFiles deletes what was downloaded of msgs, for when nothing is shown
+// yet (the store opening): w.mu needn't be held.
+func (w *WhatsApp) dropFiles(msgs ...*message) {
+	if w.d.Downloads == nil {
+		return
+	}
+	for _, m := range msgs {
+		for _, r := range fileRefs(m) {
+			w.d.Downloads.Remove(r)
+		}
+	}
+}
+
+// stillShown is the keys, of those in want, of files a message here (other
+// than gone) has; w.mu is held. Only pictures of a size wanted are hashed
+// to compare them.
+func (w *WhatsApp) stillShown(want map[string]ids.FileRef, gone []*message) []string {
+	skip := make(map[*message]bool, len(gone))
+	for _, m := range gone {
+		skip[m] = true
+	}
+	sizes := map[int]bool{}
+	for _, r := range want {
+		if src, ok := r.Source.(inlineSource); ok {
+			sizes[len(src)] = true
+		}
+	}
+	var out []string
+	has := func(r *ids.FileRef) {
+		if r != nil {
+			if _, ok := want[r.Key]; ok {
+				out = append(out, r.Key)
+			}
+		}
+	}
+	look := func(m *message) {
+		if m == nil || skip[m] {
+			return
+		}
+		if md := m.Media; md != nil {
+			has(fullRef(md))
+			if sizes[len(md.Thumb)] {
+				has(thumbRef(md))
+			}
+		}
+		if p := m.Preview; p != nil && sizes[len(p.Thumb)] {
+			has(previewRef(p))
+		}
+	}
+	for _, c := range w.chats {
+		look(c.last)
+		for _, m := range c.msgs {
+			look(m)
+		}
+	}
+	return out
 }
 
 // contentKey names bytes by their hash, for a file the message carries.
@@ -417,22 +567,28 @@ func (w *WhatsApp) tellPeople(msg *message) {
 }
 
 // arrived records a message that just came (or was sent from another of
-// your devices), stores it and reports it; w.mu is held.
-func (w *WhatsApp) arrived(c *chat, msg *message) {
+// your devices), stores it and reports it; w.mu is held. It's false when
+// the message isn't taken.
+func (w *WhatsApp) arrived(c *chat, msg *message) bool {
 	w.ensureLoaded(c)
+	if w.wasDeleted(c.key, msg.ID, msg.Sender) {
+		// Deleted here already: another copy of it doesn't bring it back.
+		return false
+	}
 	old, seen := c.msgs[msg.ID]
 	if seen && (!w.same(old.Sender, msg.Sender) || !old.Placeholder) {
 		// A message is replaced only by its decryption, once that comes:
 		// another with the same id (someone else's, or its sender's again,
 		// which would rewrite it unmarked) is dropped. Changes go through
 		// edits, which say so.
-		return
+		return false
 	}
 	if seen && len(msg.Reactions) == 0 {
 		// The same message again (decrypted at last, or sent twice): the
 		// reactions it had stay.
 		msg.Reactions = old.Reactions
 	}
+	w.settle(c, msg)
 	part := w.keep(c, msg)
 	w.store(c, msg)
 	c.Activity = max(c.Activity, msg.MS)
@@ -443,6 +599,7 @@ func (w *WhatsApp) arrived(c *chat, msg *message) {
 	w.tellPeople(msg)
 	w.d.Events.Message(part)
 	w.touch(c)
+	return true
 }
 
 // changed reports a known message after an edit or a reaction; w.mu is
@@ -457,31 +614,50 @@ func (w *WhatsApp) changed(c *chat, msg *message) {
 	}
 }
 
-// deleted reports a message gone (deleted for everyone, deleted on your
-// phone, or its time up); w.mu is held.
-func (w *WhatsApp) deleted(c *chat, id string) {
+// deleted deletes a message (deleted for everyone, deleted on your phone,
+// or its time up) here and from tuimeta, with what was downloaded of it, and
+// leaves a tombstone so it never comes back; w.mu is held and c loaded. It
+// returns the message, nil if it wasn't kept.
+func (w *WhatsApp) deleted(c *chat, id string) *message {
 	msg := c.msgs[id]
+	if msg == nil && w.st != nil {
+		// Kept but not read in: one whose time is up is left out when a
+		// chat's messages are read back (ensureLoaded).
+		ctx, cancel := dbCtx()
+		msg, _ = w.st.message(ctx, c.key, id)
+		cancel()
+	}
+	if msg == nil {
+		return nil
+	}
+	gone := tombstone{id: id, sender: w.resolve(msg.Sender), sure: true}
 	if w.st != nil {
 		ctx, cancel := dbCtx()
-		if err := w.st.deleteMessage(ctx, c.key, id); err != nil {
+		if err := w.st.deleteMessage(ctx, c.key, id, &gone); err != nil {
 			w.storeFailed = true
 			hlog.Error("whatsapp: can't delete a message", hlog.Kind(err))
 		}
 		cancel()
 		w.scrub = true
 	}
-	if msg == nil {
-		return
-	}
-	w.forgetFiles(msg)
+	w.noteDeleted(c.key, gone, true)
 	delete(c.msgs, id)
-	c.log.Remove(msg.ids...)
-	w.d.Events.MessageDeleted(c.id, msg.ids)
-	if !w.isSelf(msg.Sender) && msg.MS > c.ReadUpTo && c.Unread > 0 {
+	w.forgetFiles(msg)
+	shown := msg.ids
+	if len(shown) == 0 {
+		// Not read in, but maybe shown this run (an unopened chat's newest).
+		shown, _ = w.d.Messages.Known(c.id, id)
+	}
+	if len(shown) > 0 {
+		c.log.Remove(shown...)
+		w.d.Events.MessageDeleted(c.id, shown)
+	}
+	if !w.isSelf(msg.Sender) && msg.Service == nil && msg.MS > c.ReadUpTo && c.Unread > 0 {
 		c.Unread--
 		w.saveChat(c)
 	}
 	w.touch(c)
+	return msg
 }
 
 // messageOf is the message a request names; w.mu is held.

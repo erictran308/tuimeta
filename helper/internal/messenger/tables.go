@@ -9,6 +9,7 @@ import (
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
+	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
@@ -93,6 +94,7 @@ func (m *Messenger) applyTable(tbl *table.LSTable, src tableSource) {
 			return
 		}
 		if c := m.lookupChat(key); c != nil {
+			m.forgetKept(c)
 			m.removeChat(c)
 		}
 	}
@@ -211,7 +213,7 @@ func (m *Messenger) applyTable(tbl *table.LSTable, src tableSource) {
 	}
 	slices.SortStableFunc(inserts, func(a, b *table.WrappedMessage) int { return cmp.Compare(a.TimestampMs, b.TimestampMs) })
 	for _, wm := range inserts {
-		m.applyInsert(wm, src)
+		m.applyRow(func() { m.applyInsert(wm, src) })
 	}
 	for _, r := range tbl.LSUpdateExistingMessageRange {
 		m.wake(r.ThreadKey)
@@ -276,16 +278,23 @@ func (m *Messenger) thread(t threadInfo) *chat {
 		c.picture = t.GetThreadPictureUrl()
 	}
 	var activity, read int64
-	var cantReply bool
+	var cantReply, receiptsOff bool
 	switch tt := t.(type) {
 	case *table.LSDeleteThenInsertThread:
 		activity, read = tt.LastActivityTimestampMs, tt.LastReadWatermarkTimestampMs
 		cantReply = tt.DisableComposerInput || (tt.CannotReplyReason != nil && tt.CannotReplyReason != int64(0) && tt.CannotReplyReason != float64(0))
+		receiptsOff = flagOn(tt.ReadReceiptsDisabledV2)
 	case *table.LSUpdateOrInsertThread:
 		activity, read = tt.LastActivityTimestampMs, tt.LastReadWatermarkTimestampMs
 		cantReply = tt.DisableComposerInput || tt.CannotReplyReason != 0
+		receiptsOff = tt.IsReadReceiptsDisabled || tt.ReadReceiptsDisabledV2 != 0
 	}
 	c.cantReply = cantReply
+	// Once Messenger says your read receipts are off in a chat they stay off
+	// for the run: a later row that leaves the flag out can't be told from
+	// one turning them back on, and a receipt sent can't be taken back. The
+	// next start reads them afresh.
+	c.receiptsOff = c.receiptsOff || receiptsOff
 	c.activity = max(c.activity, activity)
 	if read > c.readUpTo {
 		c.readUpTo = read
@@ -294,6 +303,23 @@ func (m *Messenger) thread(t threadInfo) *chat {
 	m.recount(c)
 	m.touch(c)
 	return c
+}
+
+// flagOn reports whether a loosely typed table flag is set.
+func flagOn(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case int64:
+		return x != 0
+	case int:
+		return x != 0
+	case float64:
+		return x != 0
+	case string:
+		return x != "" && x != "0" && x != "false"
+	}
+	return false
 }
 
 // setType records what kind of thread c is; m.mu is held.
@@ -415,17 +441,19 @@ func (m *Messenger) applyHistory(u *table.UpsertMessages) {
 	newest, hasNewest := c.log.Newest()
 	slices.SortStableFunc(u.Messages, func(a, b *table.WrappedMessage) int { return cmp.Compare(a.TimestampMs, b.TimestampMs) })
 	for _, wm := range u.Messages {
-		if wm.IsUnsent {
-			m.deleted(c, wm.MessageId)
-			continue
-		}
-		msg := m.convertFB(c, wm)
-		if m.sent[c.id] && hasNewest && positionOf(msg.ms) > newest.ID && c.msgs[msg.netID] == nil {
-			m.arrived(c, msg, wm.OfflineThreadingId)
-			continue
-		}
-		m.keep(c, msg)
-		c.activity = max(c.activity, msg.ms)
+		m.applyRow(func() {
+			if wm.IsUnsent {
+				m.deleted(c, wm.MessageId)
+				return
+			}
+			msg := m.convertFB(c, wm)
+			if m.sent[c.id] && hasNewest && positionOf(msg.ms) > newest.ID && c.msgs[msg.netID] == nil {
+				m.arrived(c, msg, wm.OfflineThreadingId)
+				return
+			}
+			m.keep(c, msg)
+			c.activity = max(c.activity, msg.ms)
+		})
 	}
 	if u.Range != nil {
 		c.fbHistory = u.Range.HasMoreBefore
@@ -434,6 +462,19 @@ func (m *Messenger) applyHistory(u *table.UpsertMessages) {
 	m.recount(c)
 	m.touch(c)
 	m.wake(key)
+}
+
+// applyRow applies one message row; m.mu is held. A row whose data trips a
+// bug is logged (where, never what) and dropped, and the rest of the table
+// still applies: one message mustn't cost a page of others, or keep the
+// account from connecting when it's in the page's first data.
+func (m *Messenger) applyRow(apply func()) {
+	defer func() {
+		if v := recover(); v != nil {
+			hlog.Recovered("messenger message row", v)
+		}
+	}()
+	apply()
 }
 
 // applyInsert adds a message that just arrived; m.mu is held.
@@ -503,6 +544,7 @@ func (m *Messenger) readElsewhere(threadKey, ms int64) {
 	}
 	c.readUpTo = ms
 	c.receipted = max(c.receipted, ms)
+	m.startTimers(c)
 	m.recount(c)
 	unread := c.unread
 	m.d.Events.Read(c.id, positionOf(ms), 0, &unread)

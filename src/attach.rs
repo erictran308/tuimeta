@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::messages::Preview;
+use crate::meta::FileToSend;
 use crate::text;
 
 /// Telegram's limits for photos. Bigger ones go as files, uncompressed.
@@ -48,32 +49,60 @@ pub struct Attachment {
 /// The next [`Attachment::image_id`].
 static NEXT_IMAGE_ID: AtomicI32 = AtomicI32::new(-1);
 
-/// What tells one file from another that took its place: on Unix its device
-/// and inode, everywhere its size and when it last changed.
+/// What tells one file from another that took its place: on Unix its device,
+/// inode and when its inode last changed, everywhere its size and when its
+/// contents last changed. Times are nanoseconds since 1970, as the helper
+/// reads them (PROTOCOL.md, `send_files`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
     device: u64,
     inode: u64,
     size: u64,
-    modified: Option<std::time::SystemTime>,
+    modified_ns: i64,
+    /// Any write, and putting the modification time back after one, moves
+    /// it on, so a file rewritten in place to look untouched is noticed.
+    changed_ns: i64,
 }
 
 impl Identity {
     fn of(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
-        let (device, inode) = {
+        let (device, inode, modified_ns, changed_ns) = {
             use std::os::unix::fs::MetadataExt;
-            (meta.dev(), meta.ino())
+            (
+                meta.dev(),
+                meta.ino(),
+                nanos(meta.mtime(), meta.mtime_nsec()),
+                nanos(meta.ctime(), meta.ctime_nsec()),
+            )
         };
         #[cfg(not(unix))]
-        let (device, inode) = (0, 0);
+        let (device, inode, modified_ns, changed_ns) = {
+            let modified_ns =
+                meta.modified()
+                    .map_or(0, |at| match at.duration_since(std::time::UNIX_EPOCH) {
+                        Ok(after) => after.as_nanos() as i64,
+                        Err(before) => -(before.duration().as_nanos() as i64),
+                    });
+            (0, 0, modified_ns, 0)
+        };
         Self {
             device,
             inode,
             size: meta.len(),
-            modified: meta.modified().ok(),
+            modified_ns,
+            changed_ns,
         }
     }
+}
+
+/// Seconds and nanoseconds as nanoseconds, wrapping past the year 2262 as
+/// Go's `UnixNano` does, so the helper's number for a file is this one.
+#[cfg(unix)]
+fn nanos(seconds: i64, nanoseconds: i64) -> i64 {
+    seconds
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(nanoseconds)
 }
 
 impl Attachment {
@@ -94,16 +123,21 @@ impl Attachment {
         if meta.len() == 0 {
             return Err(format!("{name} is empty"));
         }
+        let given = path;
         let path = std::fs::canonicalize(path).map_err(|e| format!("Can't read {name}: {e}"))?;
         // TDLib takes paths as JSON text.
         if path.to_str().is_none() {
             return Err(format!("Can't send {name}: its path isn't valid UTF-8"));
         }
         // The name of what goes out: for a link, that's what it points to,
-        // which a link's own name could pass off as something else.
-        let name = path
-            .file_name()
-            .map_or(name, |n| text::clean(&n.to_string_lossy()));
+        // which a link's own name could pass off as something else. A link
+        // to a file in another folder shows where that is: `report.pdf` in
+        // a shared folder can lead to your own one.
+        let name = match path.file_name() {
+            Some(_) if leaves_its_folder(given, &path) => text::clean(&from_home(&path)),
+            Some(file_name) => text::clean(&file_name.to_string_lossy()),
+            None => name,
+        };
         let kind = match photo_size(&path, meta.len()) {
             Some((width, height)) => Kind::Photo { width, height },
             None => Kind::File,
@@ -114,7 +148,8 @@ impl Attachment {
         Ok(Self {
             path,
             name,
-            size: meta.len(),
+            // The size of the file whose identity goes to the helper.
+            size: identity.size,
             kind,
             identity,
             image_id: NEXT_IMAGE_ID.fetch_sub(1, Ordering::Relaxed),
@@ -144,6 +179,40 @@ impl Attachment {
             .is_ok_and(|meta| meta.is_file() && Identity::of(&meta) == self.identity)
             .not()
     }
+
+    /// The file as the helper is to send it: where it is, and which file
+    /// it was when listed, so the helper sends nothing if what it opens is
+    /// another (one swapped in after [`swapped`](Self::swapped) looked).
+    pub fn to_send(&self) -> FileToSend {
+        let id = &self.identity;
+        FileToSend {
+            path: self.path.to_string_lossy().into_owned(),
+            dev: id.device,
+            ino: id.inode,
+            size: id.size,
+            mtime_ns: id.modified_ns,
+            ctime_ns: id.changed_ns,
+        }
+    }
+}
+
+/// Whether `canonical`, where `given` really is, is in another folder than
+/// `given` seems to be, as a link to a file elsewhere is.
+fn leaves_its_folder(given: &Path, canonical: &Path) -> bool {
+    let folder = match given.parent() {
+        Some(folder) if folder.as_os_str().is_empty() => Path::new("."),
+        Some(folder) => folder,
+        None => return false,
+    };
+    std::fs::canonicalize(folder).ok().as_deref() != canonical.parent()
+}
+
+/// `path`, from `~` when it's in the home folder.
+fn from_home(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_owned)) {
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// The size of an image that Telegram takes as a photo, read from its header.
@@ -152,13 +221,36 @@ fn photo_size(path: &Path, bytes: u64) -> Option<(u32, u32)> {
     if !PHOTO_TYPES.contains(&extension.as_str()) || bytes > PHOTO_MAX_BYTES {
         return None;
     }
-    let (width, height) = image::image_dimensions(path).ok()?;
+    // Opened without waiting, and read only if it's a plain file: one
+    // swapped for a pipe since it was looked at would otherwise hold the
+    // whole app until something wrote to it.
+    let file = open_without_waiting(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let format = image::ImageFormat::from_extension(&extension)?;
+    let (width, height) = image::ImageReader::with_format(std::io::BufReader::new(file), format)
+        .into_dimensions()
+        .ok()?;
     // In u64: a crafted header's sides can add up past u32.
     let (long, short) = (u64::from(width.max(height)), u64::from(width.min(height)));
     let fits = short > 0
         && long + short <= u64::from(PHOTO_MAX_SIDES)
         && long <= short * u64::from(PHOTO_MAX_RATIO);
     fits.then_some((width, height))
+}
+
+/// Opens a file to read without waiting for a writer, which opening a
+/// pipe would.
+fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
 }
 
 /// A paste that became attachments, which Ctrl-z turns back into the text.
@@ -332,6 +424,14 @@ pub fn complete(typed: &str) -> Completion {
     } else {
         expand_home(folder)
     };
+    let unchanged = || Completion {
+        text: typed.to_string(),
+        matches: Vec::new(),
+    };
+    // Listing a folder on another machine hands it the Windows login hash.
+    if on_another_machine(&dir) {
+        return unchanged();
+    }
     let mut names: Vec<(String, bool)> = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
@@ -345,10 +445,6 @@ pub fn complete(typed: &str) -> Completion {
         })
         .collect();
     names.sort();
-    let unchanged = || Completion {
-        text: typed.to_string(),
-        matches: Vec::new(),
-    };
     match names.as_slice() {
         [] => unchanged(),
         [(name, is_dir)] => Completion {
@@ -491,6 +587,46 @@ mod tests {
         assert_eq!(attachment.path, std::fs::canonicalize(&secret).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_in_another_folder_shows_that_folder() {
+        let shared = TempDir::new("link-shared");
+        let mine = TempDir::new("link-mine");
+        let secret = mine.file("report.pdf", b"private");
+        let link = shared.0.join("report.pdf");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let attachment = Attachment::new(&link).unwrap();
+        assert_eq!(attachment.path, secret);
+        assert!(
+            attachment.name.contains("link-mine") && attachment.name.ends_with("report.pdf"),
+            "{}",
+            attachment.name
+        );
+        // A file reached through a linked folder is where it seems.
+        let folder = shared.0.join("mine");
+        std::os::unix::fs::symlink(&mine.0, &folder).unwrap();
+        assert_eq!(
+            Attachment::new(&folder.join("report.pdf")).unwrap().name,
+            "report.pdf"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_named_like_a_photo_is_not_waited_on() {
+        let dir = TempDir::new("pipe");
+        let pipe = dir.0.join("cat.png");
+        let c_path = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: a valid C string; mkfifo touches nothing else.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(photo_size(&pipe, 100)));
+        let size = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waited for a writer");
+        assert_eq!(size, None);
+    }
+
     #[test]
     fn file_names_are_shown_without_control_characters() {
         let dir = TempDir::new("names");
@@ -595,6 +731,20 @@ mod tests {
     }
 
     #[test]
+    fn tab_never_lists_a_folder_on_another_machine() {
+        for typed in [r"\\evil.example\s\", "//", "//evil.example/s/"] {
+            assert_eq!(
+                complete(typed),
+                Completion {
+                    text: typed.to_string(),
+                    matches: Vec::new(),
+                },
+                "{typed}"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_swapped_after_it_was_listed_is_noticed() {
         let dir = std::env::temp_dir().join(format!("tuigram-swap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -615,6 +765,79 @@ mod tests {
             assert!(listed.swapped(), "a link isn't the file listed");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_rewritten_in_place_with_its_old_time_put_back_is_noticed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new("rewritten");
+        let path = dir.file("notes.txt", b"mine to send");
+        let listed = Attachment::new(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Same inode, same size, the same modification time: only the
+        // inode's change time tells. Its clock can be coarse, so the write
+        // is repeated until it has moved on.
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut &file, b"not yours!!!").unwrap();
+            file.set_modified(modified).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            if nanos(meta.ctime(), meta.ctime_nsec()) != listed.identity.changed_ns {
+                break;
+            }
+        }
+        let now = Identity::of(&std::fs::symlink_metadata(&path).unwrap());
+        assert_eq!(
+            (now.device, now.inode, now.size, now.modified_ns),
+            (
+                listed.identity.device,
+                listed.identity.inode,
+                listed.identity.size,
+                listed.identity.modified_ns
+            ),
+            "looks untouched"
+        );
+        assert!(listed.swapped());
+    }
+
+    #[test]
+    fn what_goes_to_the_helper_names_the_file_listed() {
+        let dir = TempDir::new("to-send");
+        let path = dir.file("notes.txt", b"mine to send");
+        let listed = Attachment::new(&path).unwrap();
+        let sent = serde_json::to_value(listed.to_send()).unwrap();
+        let mut keys: Vec<&str> = sent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["ctime_ns", "dev", "ino", "mtime_ns", "path", "size"],
+            "as PROTOCOL.md has them"
+        );
+        assert_eq!(sent["path"], path.to_string_lossy().as_ref());
+        assert_eq!(sent["size"], 12);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        let modified = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        assert_eq!(sent["mtime_ns"], modified);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(sent["dev"], meta.dev());
+            assert_eq!(sent["ino"], meta.ino());
+            assert_eq!(sent["ctime_ns"], nanos(meta.ctime(), meta.ctime_nsec()));
+            assert_ne!(sent["ctime_ns"], 0);
+        }
     }
 
     #[test]

@@ -103,7 +103,8 @@ func (m *Messenger) convertFB(c *chat, wm *table.WrappedMessage) *message {
 	return msg
 }
 
-// fbMentions reads a message's mention lists (comma-separated, UTF-16).
+// fbMentions reads a message's mention lists (comma-separated, UTF-16):
+// each once, at most MaxMentions, and only ranges within the text.
 func fbMentions(wm *table.WrappedMessage) []mention {
 	parsed, err := (&socket.MentionData{
 		MentionIDs: wm.MentionIds, MentionOffsets: wm.MentionOffsets,
@@ -112,15 +113,23 @@ func fbMentions(wm *table.WrappedMessage) []mention {
 	if err != nil {
 		return nil
 	}
-	out := make([]mention, 0, len(parsed))
+	units := proto.UTF16Len(wm.Text)
+	var set mentionSet
 	for _, p := range parsed {
+		// One past the text (or whose end doesn't fit in an int) marks
+		// nothing there; written so the sum can't overflow.
+		if p.Offset < 0 || p.Length <= 0 || p.Offset > units || p.Length > units-p.Offset {
+			continue
+		}
 		mn := mention{offset: p.Offset, length: p.Length}
 		if p.Type == socket.MentionTypePerson || p.Type == socket.MentionTypeSilent {
 			mn.fbid = p.ID
 		}
-		out = append(out, mn)
+		if !set.add(mn) {
+			break
+		}
 	}
-	return out
+	return set.list
 }
 
 // attachmentKind is what an attachment is shown as.
@@ -307,22 +316,44 @@ func setUnsupported(msg *message, label string) {
 	}
 }
 
+// Links a sender writes are looked at only within these bounds: an address
+// longer than MaxLink is dropped, and Facebook's redirect is unwrapped at
+// most maxShims times (a real link is wrapped once), so a crafted chain of
+// redirects costs as little as a plain link.
+const (
+	MaxLink  = 8192
+	maxShims = 2
+)
+
 // webLink is the web address an attachment's action points to: Facebook's
 // own redirect unwrapped, and only http(s) kept.
 func webLink(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	if u.Path == "/l.php" && strings.HasSuffix(u.Hostname(), "facebook.com") {
-		if inner := u.Query().Get("u"); inner != "" {
-			return webLink(inner)
+	for range maxShims + 1 {
+		if len(raw) > MaxLink {
+			return ""
 		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return ""
+		}
+		if u.Path == "/l.php" && isFacebook(u.Hostname()) {
+			if inner := u.Query().Get("u"); inner != "" {
+				raw = inner
+				continue
+			}
+		}
+		if u.Scheme != "https" && u.Scheme != "http" {
+			return ""
+		}
+		return u.String()
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return ""
-	}
-	return u.String()
+	return "" // redirects within redirects: no real link looks like that
+}
+
+// isFacebook reports whether host is facebook.com or one of its own names.
+func isFacebook(host string) bool {
+	host = strings.ToLower(host)
+	return host == "facebook.com" || strings.HasSuffix(host, ".facebook.com")
 }
 
 // register gives a downloadable thing a file id; m.mu is held. A URL that

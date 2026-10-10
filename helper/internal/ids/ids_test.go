@@ -194,6 +194,25 @@ func TestAnUnreadableIDsFileStartsOverFarAway(t *testing.T) {
 	}
 }
 
+func TestLoggingOutDeletesAnUnreadableIDsFileSetAside(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ids.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"next":0,"chats":[{"network":"whatsapp","id":"15550100100@s.whatsapp.net","n":7}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".bad"); err != nil {
+		t.Fatalf("the bad file wasn't set aside: %v", err)
+	}
+	s.Forget(proto.WhatsApp)
+	if _, err := os.Stat(path + ".bad"); !os.IsNotExist(err) {
+		t.Errorf("the set-aside file, with its numbers, outlived the logout: %v", err)
+	}
+	s.Forget(proto.WhatsApp) // and again, with nothing to delete
+}
+
 func TestFileIDsAreStablePerKey(t *testing.T) {
 	f := NewFiles()
 	a := f.Register(FileRef{Network: proto.Messenger, Key: "k", Size: 10, Source: "url1"})
@@ -205,5 +224,61 @@ func TestFileIDsAreStablePerKey(t *testing.T) {
 	ref, _ := f.Get(a)
 	if ref.Source != "url2" || ref.Size != 10 {
 		t.Errorf("ref = %+v", ref)
+	}
+}
+
+func TestAnotherMessageWithTheSameFileCantRenameIt(t *testing.T) {
+	f := NewFiles()
+	id := f.Register(FileRef{Network: proto.WhatsApp, Key: "k", Name: "report.pdf", Mime: "application/pdf", Source: "first"})
+	f.Register(FileRef{Network: proto.WhatsApp, Key: "k", Name: "report.command", Mime: "application/x-sh", Source: "second"})
+	ref, _ := f.Get(id)
+	if ref.Name != "report.pdf" || ref.Mime != "application/pdf" {
+		t.Errorf("renamed to %q (%s)", ref.Name, ref.Mime)
+	}
+	if ref.Source != "second" {
+		t.Errorf("the fresher source wasn't kept: %v", ref.Source)
+	}
+	// A name or type not known the first time is learned later.
+	bare := f.Register(FileRef{Network: proto.Instagram, Key: "k2"})
+	f.Register(FileRef{Network: proto.Instagram, Key: "k2", Name: "clip.mp4", Mime: "video/mp4"})
+	if ref, _ := f.Get(bare); ref.Name != "clip.mp4" || ref.Mime != "video/mp4" {
+		t.Errorf("not learned: %+v", ref)
+	}
+}
+
+func TestAForgottenFileIDIsGoneAndItsKeyGetsANewOne(t *testing.T) {
+	f := NewFiles()
+	a := f.Register(FileRef{Network: proto.WhatsApp, Key: "k"})
+	other := f.Register(FileRef{Network: proto.Messenger, Key: "k"})
+	if id, ok := f.Forget(proto.WhatsApp, "k"); !ok || id != a {
+		t.Fatalf("Forget = %d %v", id, ok)
+	}
+	if _, ok := f.Get(a); ok {
+		t.Error("a forgotten id is still served")
+	}
+	if _, ok := f.Forget(proto.WhatsApp, "k"); ok {
+		t.Error("forgotten twice")
+	}
+	if b := f.Register(FileRef{Network: proto.WhatsApp, Key: "k"}); b == a || b <= 0 {
+		t.Errorf("registered again as %d (was %d)", b, a)
+	}
+	if _, ok := f.Get(other); !ok {
+		t.Error("another network's file with the same key went too")
+	}
+}
+
+func TestLoggingOutForgetsTheNetworksFileIDs(t *testing.T) {
+	f := NewFiles()
+	wa := f.Register(FileRef{Network: proto.WhatsApp, Key: "a"})
+	wa2 := f.Register(FileRef{Network: proto.WhatsApp, Key: "b"})
+	fb := f.Register(FileRef{Network: proto.Messenger, Key: "a"})
+	f.ForgetNetwork(proto.WhatsApp)
+	for _, id := range []int32{wa, wa2} {
+		if _, ok := f.Get(id); ok {
+			t.Errorf("file %d outlived the logout", id)
+		}
+	}
+	if _, ok := f.Get(fb); !ok {
+		t.Error("another network's file went too")
 	}
 }

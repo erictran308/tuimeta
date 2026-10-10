@@ -4,6 +4,7 @@ package messenger
 
 import (
 	"slices"
+	"unicode/utf8"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
 	"github.com/erictran308/tuimeta/helper/internal/metatext"
@@ -34,6 +35,8 @@ func (m *Messenger) keep(c *chat, msg *message) (parts []proto.Message, gone []i
 	c.msgs[msg.netID] = msg
 	if msg.wa == nil {
 		m.msgChat[msg.netID] = c.key
+	} else {
+		c.indexWA(msg)
 	}
 	parts = m.render(c, msg)
 	c.log.Put(parts...)
@@ -164,6 +167,9 @@ func (m *Messenger) deleted(c *chat, netID string) {
 	}
 	delete(c.msgs, netID)
 	delete(m.msgChat, netID)
+	if msg.wa != nil {
+		c.unindexWA(msg)
+	}
 	c.log.Remove(msg.ids...)
 	if !m.replaying {
 		m.d.Events.MessageDeleted(c.id, msg.ids)
@@ -185,10 +191,26 @@ func (m *Messenger) messageOf(ref backend.MessageRef) (*chat, *message, error) {
 	return c, msg, nil
 }
 
-// snippet is a one-line quote of text, its markers read.
+// maxQuoted is as much of a message's text as its quote reads: a quote
+// shows a hundred characters, whatever the text a sender quotes.
+const maxQuoted = 1024
+
+// snippet is a one-line quote of text, its markers read. Only its start is
+// read.
 func snippet(text string) string {
-	plain, _ := metatext.Parse(text)
+	plain, _ := metatext.Parse(cutText(text, maxQuoted))
 	return proto.Snippet(plain, 100)
+}
+
+// cutText is s cut to at most n bytes, on a character's boundary.
+func cutText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // label names a kind of media, for a reply's quote.

@@ -239,3 +239,127 @@ func TestTooBigAndFailedDownloadsSayWhy(t *testing.T) {
 		t.Error("an unknown file id was accepted")
 	}
 }
+
+func TestAMediaFileIsNeverSavedUnderAnotherKindOfExtension(t *testing.T) {
+	cases := map[[2]string]string{
+		{"clip.command", "video/3gpp"}:        "clip.command.3gp",
+		{"clip.command", "video/x-unheard"}:   "clip.command.bin",
+		{"voice.app", "audio/x-unheard"}:      "voice.app.bin",
+		{"drawing.svg", "image/svg+xml"}:      "drawing.svg.bin",
+		{"IMG_0002.HEIC", "image/heic"}:       "IMG_0002.heic",
+		{"take.mp4", "video/x-unheard"}:       "take.mp4",
+		{"memo.wav", "audio/x-wav"}:           "memo.wav",
+		{"notes.command", "application/x-sh"}: "notes.command",
+	}
+	for in, want := range cases {
+		if got := SafeName(in[0], in[1]); got != want {
+			t.Errorf("SafeName(%q, %q) = %q, want %q", in[0], in[1], got, want)
+		}
+	}
+}
+
+// blockingFetch writes "x" for each file once release is closed, saying
+// on started which fetches began.
+type blockingFetch struct {
+	release chan struct{}
+	started chan string
+}
+
+func (b *blockingFetch) fetch(ctx context.Context, ref ids.FileRef, w io.Writer) error {
+	b.started <- ref.Key
+	<-b.release
+	_, err := w.Write([]byte("x"))
+	return err // the context is ignored on purpose, as a stuck backend might
+}
+
+func (m *Manager) jobCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.jobs)
+}
+
+func TestRemovingAFileStopsItsRunningDownloadAndItsID(t *testing.T) {
+	dir := t.TempDir()
+	files := ids.NewFiles()
+	ref := ids.FileRef{Network: proto.WhatsApp, Key: "wa:deleted", Name: "a.pdf", Mime: "application/pdf"}
+	id := files.Register(ref)
+	b := &blockingFetch{release: make(chan struct{}), started: make(chan string, 8)}
+	rec := &recorder{}
+	m := New(dir, files, func(proto.Network) Fetch { return b.fetch }, rec.emit)
+	defer m.Close(time.Second)
+
+	if err := m.Download(id, proto.High); err != nil {
+		t.Fatal(err)
+	}
+	<-b.started
+	m.Remove(ref) // its message deleted while it downloads
+	close(b.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for m.jobCount() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the download never ended")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, path := range m.places(ref) {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("a deleted message's file was saved after its deletion: %s", path)
+		}
+	}
+	rec.mu.Lock()
+	for _, f := range rec.events {
+		if f.Done {
+			t.Errorf("reported done: %+v", f)
+		}
+	}
+	rec.mu.Unlock()
+	if err := m.Download(id, proto.High); err != proto.ErrNoFile {
+		t.Errorf("a deleted message's file can still be asked for: %v", err)
+	}
+}
+
+func TestRemovingAFileDropsItsQueuedDownload(t *testing.T) {
+	files := ids.NewFiles()
+	b := &blockingFetch{release: make(chan struct{}), started: make(chan string, 8)}
+	m := New(t.TempDir(), files, func(proto.Network) Fetch { return b.fetch }, (&recorder{}).emit)
+	defer m.Close(time.Second)
+	defer close(b.release)
+	// Every worker busy, so the next download waits in the queue.
+	for i := range Workers {
+		id := files.Register(ids.FileRef{Network: proto.WhatsApp, Key: "busy-" + string(rune('a'+i))})
+		if err := m.Download(id, proto.High); err != nil {
+			t.Fatal(err)
+		}
+		<-b.started
+	}
+	ref := ids.FileRef{Network: proto.WhatsApp, Key: "wa:queued"}
+	id := files.Register(ref)
+	if err := m.Download(id, proto.Low); err != nil {
+		t.Fatal(err)
+	}
+	m.Remove(ref)
+	m.mu.Lock()
+	queued := len(m.low) + len(m.high)
+	_, job := m.jobs[id]
+	m.mu.Unlock()
+	if queued != 0 || job {
+		t.Errorf("still queued: %d waiting, job %v", queued, job)
+	}
+}
+
+func TestLoggingOutForgetsTheNetworksFileIDs(t *testing.T) {
+	files := ids.NewFiles()
+	wa := files.Register(ids.FileRef{Network: proto.WhatsApp, Key: "old-account"})
+	fb := files.Register(ids.FileRef{Network: proto.Messenger, Key: "kept"})
+	m := New(t.TempDir(), files, func(proto.Network) Fetch { return nil }, (&recorder{}).emit)
+	defer m.Close(time.Second)
+	if err := m.Forget(proto.WhatsApp); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Download(wa, proto.High); err != proto.ErrNoFile {
+		t.Errorf("the account before's file can still be asked for: %v", err)
+	}
+	if _, ok := files.Get(fb); !ok {
+		t.Error("another network's file id went too")
+	}
+}
