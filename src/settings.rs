@@ -32,6 +32,10 @@ pub struct Settings {
     /// After sending a message, go back to Normal mode instead of staying in
     /// Insert mode to write the next one.
     pub normal_after_send: bool,
+    /// Long lines in the composer wrap onto the next row, and the composer
+    /// grows with them. Off, a line stays on one row, which scrolls
+    /// sideways to the cursor.
+    pub wrap_composer: bool,
     /// Messages in a row from one person have a row of their bubble's
     /// background between them, so each stands apart within the block.
     pub block_gaps: bool,
@@ -53,6 +57,7 @@ impl Default for Settings {
             highlighted_chats: Vec::new(),
             notifications: Notifications::default(),
             normal_after_send: false,
+            wrap_composer: true,
             block_gaps: true,
             chat_gaps: true,
             chat_list_side: Side::Left,
@@ -149,6 +154,7 @@ mod tests {
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
             normal_after_send: true,
+            wrap_composer: false,
             block_gaps: false,
             chat_gaps: false,
             chat_list_side: Side::Right,
@@ -157,7 +163,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
         assert!(
@@ -174,7 +180,7 @@ mod tests {
         // Files from before a setting existed get its default.
         std::fs::write(&file, r#"theme = "latte""#).unwrap();
         let old = Settings::load(&file).unwrap();
-        assert!(old.block_gaps && old.chat_gaps);
+        assert!(old.block_gaps && old.chat_gaps && old.wrap_composer);
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
         assert_eq!(old.chat_list_side, Side::Left);
         assert_eq!(old.corners, Corners::Auto);
