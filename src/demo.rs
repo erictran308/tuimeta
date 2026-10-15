@@ -20,6 +20,7 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::app::{self, Account, App, Focus, HelpTab, Login, LoginStep, Screen, SettingsMenu};
 use crate::chats::{Chat, ChatPhoto, Chats, Peer, Presence};
+use crate::chime::{Output, Ringer};
 use crate::clipboard::Clipboard;
 use crate::images::{self, Images};
 use crate::messages::{
@@ -218,6 +219,8 @@ pub(crate) fn demo_app(meta: Meta, images: Images, dir: &Path) -> App {
         images,
         // The demo never pastes, so nothing is saved there.
         Clipboard::new(clipboard_tx, dir.join("outbox")),
+        // Nor plays sounds.
+        Ringer::new(unbounded_channel().0, Output::Nowhere),
         settings,
         dir.join("settings.toml"),
     );
@@ -355,7 +358,7 @@ fn help(app: &App, tab: HelpTab) -> SettingsMenu {
         .position(|t| t.id == app.settings.theme)
         .unwrap_or(0);
     SettingsMenu {
-        selected: SettingsMenu::THEMES + theme,
+        selected: SettingsMenu::themes(&app.sounds) + theme,
         ..SettingsMenu::new(tab, &app.settings)
     }
 }

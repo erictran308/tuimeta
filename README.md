@@ -121,9 +121,19 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 
 ## Your data
 
-Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it, to a folder only you can change: on Windows, one inside your user folder): your settings, your own themes, and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received, the newest 3000 per chat (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers. In both, disappearing messages are deleted when their time is up. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it, and `helper/ids.json.bad`, a list of ids the helper set aside as unreadable, which may hold any network's.
+Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it, to a folder only you can change: on Windows, one inside your user folder): your settings, your own themes and [sounds](#notification-sound), and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received, the newest 3000 per chat (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers. In both, disappearing messages are deleted when their time is up. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it, and `helper/ids.json.bad`, a list of ids the helper set aside as unreadable, which may hold any network's.
 
 The log never holds what people wrote, their names, or your cookies.
+
+## Notification sound
+
+tuimeta can play a sound of its own for new messages. Press `?`, go to **Settings**, and pick one under **Sound for new messages**: Ding, Chime, Trill, Pop or Knock. It plays once so you can hear it, and it's saved at once; **None** turns it off again.
+
+To use your own, put a WAV or Ogg Opus file in the `sounds` folder inside [your data folder](#your-data), press `?` and pick it in the same list. A file named like a built-in sound, such as `ding.wav`, replaces it. Only the first ten seconds play. On macOS, this turns one of the system's sounds into a file tuimeta plays: `afconvert -f WAVE -d LEI16 /System/Library/Sounds/Glass.aiff Glass.wav`.
+
+It plays as each new message comes, at most once a second, even in a chat that just had a notification and gets no other for half a minute. While tuimeta's window is focused it's quiet, unless you tick **Also while tuimeta's window is focused** above the sounds: then every message you'd be notified of rings, whether you're looking or not. Chats you muted stay silent, and with notifications turned off there's no sound either.
+
+The sound plays on the computer tuimeta runs on, so over SSH there's none, and the terminal's own sound stays. While tuimeta plays one, the terminal's notification makes no sound of its own, and with `notifications = "bell"` the bell isn't rung.
 
 ## Themes
 

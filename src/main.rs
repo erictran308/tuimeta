@@ -1,6 +1,7 @@
 mod app;
 mod attach;
 mod chats;
+mod chime;
 mod clipboard;
 mod complete;
 mod config;
@@ -9,11 +10,14 @@ mod images;
 mod messages;
 mod meta;
 mod notify;
+mod ogg;
+mod opus;
 mod picker;
 mod reactions;
 mod search;
 mod service;
 mod settings;
+mod sound;
 mod term;
 mod text;
 mod theme;
@@ -117,9 +121,14 @@ async fn main() -> Result<()> {
     images.measured(images::measure_cells());
     let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
     let clipboard = clipboard::Clipboard::new(clipboard_tx, outbox);
-    let mut app = app::App::new(meta, images, clipboard, settings, settings_path);
+    // Says why the sound for new messages couldn't play.
+    let (ring_tx, ring_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ringer = chime::Ringer::new(ring_tx, chime::Output::Speakers);
+    let mut app = app::App::new(meta, images, clipboard, ringer, settings, settings_path);
     app.browser = config::var("TM_BROWSER");
-    let result = app.run(&mut terminal, rx, image_rx, clipboard_rx).await;
+    let result = app
+        .run(&mut terminal, rx, image_rx, clipboard_rx, ring_rx)
+        .await;
 
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);

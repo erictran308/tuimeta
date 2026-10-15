@@ -29,6 +29,13 @@ pub struct Settings {
     /// How new messages are announced: "auto" picks what the terminal
     /// supports; also "off", "bell", "osc9", "osc777" or "osc99".
     pub notifications: Notifications,
+    /// The sound tuimeta plays for them, by name: a built-in one, or a file
+    /// in the sounds folder without its extension. None if not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_sound: Option<String>,
+    /// The sound plays while tuimeta's window is focused too, for every
+    /// message it would notify of if it weren't.
+    pub sound_when_focused: bool,
     /// After sending a message, go back to Normal mode instead of staying in
     /// Insert mode to write the next one.
     pub normal_after_send: bool,
@@ -56,6 +63,8 @@ impl Default for Settings {
             nerd_font: false,
             highlighted_chats: Vec::new(),
             notifications: Notifications::default(),
+            notification_sound: None,
+            sound_when_focused: false,
             normal_after_send: false,
             wrap_composer: true,
             block_gaps: true,
@@ -153,6 +162,8 @@ mod tests {
             nerd_font: true,
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
+            notification_sound: Some("chime".into()),
+            sound_when_focused: true,
             normal_after_send: true,
             wrap_composer: false,
             block_gaps: false,
@@ -163,7 +174,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
         assert!(
@@ -181,6 +192,7 @@ mod tests {
         std::fs::write(&file, r#"theme = "latte""#).unwrap();
         let old = Settings::load(&file).unwrap();
         assert!(old.block_gaps && old.chat_gaps && old.wrap_composer);
+        assert_eq!(old.notification_sound, None, "no sound unless picked");
         assert_eq!(old.chat_list_width, DEFAULT_LIST_WIDTH);
         assert_eq!(old.chat_list_side, Side::Left);
         assert_eq!(old.corners, Corners::Auto);
