@@ -119,6 +119,7 @@ func (f *Fake) logIn() *person {
 	}
 	f.loggedIn = true
 	f.sent = map[int64]bool{}
+	f.w.feedAt = 0
 	f.stop()
 	f.live, f.stop = context.WithCancel(f.base)
 	return f.w.self

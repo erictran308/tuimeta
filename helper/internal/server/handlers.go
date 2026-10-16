@@ -41,6 +41,8 @@ func init() {
 		"search":        (*Server).search,
 		"open_dm":       (*Server).openDM,
 		"mute":          (*Server).mute,
+		"load_feed":     (*Server).loadFeed,
+		"load_comments": (*Server).loadComments,
 	}
 }
 
@@ -254,6 +256,7 @@ func (s *Server) logout(c *call) (any, error) {
 		s.Messages.ForgetChat(id)
 	}
 	s.IDs.Forget(n)
+	s.forgetPosts(n)
 	if ferr := s.Downloads.Forget(n); ferr != nil {
 		hlog.Error("can't delete downloads", hlog.Str("network", string(n)), hlog.Kind(ferr))
 	}

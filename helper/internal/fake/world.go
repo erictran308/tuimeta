@@ -70,6 +70,18 @@ type world struct {
 	byUser map[int64]*person
 	chats  []*chat
 	byChat map[int64]*chat
+	// feed is Instagram's home feed, and feedAt how much of it load_feed
+	// has given since the login or the last fresh load.
+	feed   []proto.Post
+	feedAt int
+	// feedAuthors are the people and pages the feed's posts and comments
+	// are by; comments and replies are made when first asked for, and
+	// commentAt is how far each list (a post's, or a comment's replies)
+	// load_comments has given.
+	feedAuthors []proto.FeedAuthor
+	comments    map[int64][]proto.Comment // by post id
+	replies     map[int64][]proto.Comment // by comment id
+	commentAt   map[[2]int64]int          // by post id and comment id (0)
 }
 
 // fakeFile is a fake download: drawn or made up the first time it's asked.
@@ -248,6 +260,8 @@ func (f *Fake) build() *world {
 		w.chats = append(w.chats, c)
 		w.byChat[c.id] = c
 	}
+	// Last, so the chats' files keep the ids they had before there was one.
+	f.buildFeed(w)
 	return w
 }
 

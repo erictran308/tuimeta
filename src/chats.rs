@@ -69,6 +69,14 @@ pub struct Tab {
     pub unread: i32,
 }
 
+/// The row of Instagram's home feed. Not a chat the helper knows (their ids
+/// are all above 0), and nothing that acts on a chat (muting, marking read)
+/// goes to the helper for it.
+pub const FEED: i64 = -1;
+/// What its row says.
+const FEED_TITLE: &str = "Feed";
+const FEED_PREVIEW: &str = "Photos and videos from accounts you follow";
+
 /// What the tab of every chat is called.
 const ALL_CHATS: &str = "All";
 /// And the archive's.
@@ -298,10 +306,15 @@ impl Chats {
             return;
         }
         let list = self.shown;
+        // The feed is in the Instagram tab, and in the list of every chat
+        // only while there's no such tab.
+        let feed_in_main = self.networks().len() < 2;
         self.sorted = self
             .by_id
             .iter()
-            .filter(|(_, chat)| chat.in_list(list))
+            .filter(|&(&id, chat)| {
+                chat.in_list(list) && (id != FEED || list != List::Main || feed_in_main)
+            })
             .map(|(&id, _)| id)
             .collect();
         self.total = self.sorted.len();
@@ -313,12 +326,12 @@ impl Chats {
             });
             self.sorted = sorted;
         }
-        // Unread chats come first.
+        // The feed comes first, then unread chats.
         let (by_id, held) = (&self.by_id, self.held);
         self.sorted.sort_unstable_by_key(|&id| {
             let chat = &by_id[&id];
             let unread = chat.unread > 0 || held == Some(id);
-            std::cmp::Reverse((unread, chat.order, id))
+            std::cmp::Reverse((id == FEED, unread, chat.order, id))
         });
         self.dirty = false;
     }
@@ -369,10 +382,7 @@ impl Chats {
             unread: unread(list),
         };
         let mut tabs = vec![tab(List::Main, ALL_CHATS)];
-        let networks: Vec<Network> = Network::ALL
-            .into_iter()
-            .filter(|&n| self.by_id.values().any(|c| c.network == n))
-            .collect();
+        let networks = self.networks();
         if networks.len() > 1 {
             tabs.extend(networks.iter().map(|&n| tab(List::Network(n), n.name())));
         }
@@ -380,6 +390,43 @@ impl Chats {
             tabs.push(tab(List::Archive, ARCHIVE));
         }
         if tabs.len() == 1 { Vec::new() } else { tabs }
+    }
+
+    /// The networks with chats in the list (Instagram's feed counts).
+    fn networks(&self) -> Vec<Network> {
+        Network::ALL
+            .into_iter()
+            .filter(|&n| self.by_id.values().any(|c| c.network == n))
+            .collect()
+    }
+
+    /// Lists Instagram's home feed, as a row of its own at the top of the
+    /// Instagram chats, while the account is in.
+    pub fn add_feed(&mut self) {
+        if self.by_id.contains_key(&FEED) {
+            return;
+        }
+        let feed = Chat {
+            title: FEED_TITLE.into(),
+            network: Network::Instagram,
+            is_channel: false,
+            is_private: false,
+            unread: 0,
+            read_outbox: 0,
+            read_inbox: 0,
+            preview: FEED_PREVIEW.into(),
+            order: 0,
+            archived: false,
+            photo: None,
+            activity: Vec::new(),
+            peer: None,
+            muted: false,
+            encrypted: false,
+            request: false,
+            can_send: false,
+        };
+        self.by_id.insert(FEED, feed);
+        self.dirty = true;
     }
 
     /// The list `step` tabs away from the one shown, round the end.

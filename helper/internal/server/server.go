@@ -52,6 +52,14 @@ type Server struct {
 	// loading has one lock per network: its load_chats calls run one at a
 	// time, and a network that's stuck holds back only its own.
 	loading map[proto.Network]*sync.Mutex
+	// feeding lines up each network's load_feed calls, apart from its chat
+	// loads: a feed load never waits on the chat list, nor it on the feed.
+	feeding map[proto.Network]*turns
+	// commenting lines up each network's load_comments calls the same way.
+	commenting map[proto.Network]*turns
+	// posts are the networks that gave each post load_feed answered with.
+	postsMu sync.Mutex
+	posts   map[int64]proto.Network
 
 	// seq numbers requests in the order they came.
 	seq atomic.Uint64
@@ -64,17 +72,22 @@ type Server struct {
 // before anything else can be.
 func New(cfg Config, store *ids.Store, stdout io.Writer) *Server {
 	s := &Server{
-		cfg:      cfg,
-		IDs:      store,
-		Messages: ids.NewMessages(),
-		Files:    ids.NewFiles(),
-		backends: map[proto.Network]backend.Backend{},
-		ctx:      context.Background(),
-		loading:  map[proto.Network]*sync.Mutex{},
-		typingIn: map[int64]*typingOrder{},
+		cfg:        cfg,
+		IDs:        store,
+		Messages:   ids.NewMessages(),
+		Files:      ids.NewFiles(),
+		backends:   map[proto.Network]backend.Backend{},
+		ctx:        context.Background(),
+		loading:    map[proto.Network]*sync.Mutex{},
+		feeding:    map[proto.Network]*turns{},
+		commenting: map[proto.Network]*turns{},
+		posts:      map[int64]proto.Network{},
+		typingIn:   map[int64]*typingOrder{},
 	}
 	for _, n := range proto.Networks {
 		s.loading[n] = &sync.Mutex{}
+		s.feeding[n] = newTurns()
+		s.commenting[n] = newTurns()
 	}
 	s.out = newWriter(stdout, proto.NewHello(cfg.HelperVersion), func() {
 		if err := store.Flush(); err != nil {
@@ -208,6 +221,9 @@ type call struct {
 	// seq is the request's place in the order requests came: each is
 	// served on its own goroutine, so they can reach a network in another.
 	seq uint64
+	// turn is a load_feed's or load_comments' place in its network's line,
+	// taken as the request was read.
+	turn *turn
 }
 
 func (s *Server) handle(line []byte) {
@@ -239,6 +255,12 @@ func (s *Server) handle(line []byte) {
 	ctx := s.ctx
 	s.mu.Unlock()
 	c := &call{ctx: ctx, method: req.Method, params: req.Params, seq: s.seq.Add(1)}
+	switch req.Method {
+	case "load_feed":
+		c.turn = s.feedTurn(req.Params)
+	case "load_comments":
+		c.turn = s.commentTurn(req.Params)
+	}
 	go s.serve(req.ID, h, c)
 }
 

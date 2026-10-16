@@ -4,9 +4,12 @@ package fake
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
+	"image/gif"
 	"image/png"
 	"math"
 	"strings"
@@ -163,6 +166,128 @@ func (a art) png() []byte {
 	if err := png.Encode(&b, a.image()); err != nil {
 		panic("fake: png.Encode failed")
 	}
+	return b.Bytes()
+}
+
+// clip is a fake video: a ball crossing a dusk sky, as an animated GIF of
+// clipFrames frames that loops, the same bytes every run.
+type clip struct {
+	w, h, seed int
+}
+
+const (
+	clipFrames = 20
+	clipDelay  = 10 // hundredths of a second a frame shows: 2 s in all
+)
+
+// frame is frame i, in RGBA.
+func (c clip) frame(i int) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, c.w, c.h))
+	w, h := float64(c.w), float64(c.h)
+	top := mix(pick(c.seed+3), color.RGBA{0x10, 0x12, 0x30, 0xff}, 0.5)
+	bottom := pick(c.seed + 5)
+	for y := range c.h {
+		row := mix(top, bottom, float64(y)/h)
+		for x := range c.w {
+			img.SetRGBA(x, y, row)
+		}
+	}
+	t := float64(i) / clipFrames
+	x := w*0.15 + w*0.7*t
+	y := h*0.7 - h*0.45*math.Sin(t*math.Pi)
+	disc(img, x, y, math.Min(w, h)*0.09, color.RGBA{0xff, 0xf1, 0xc4, 0xff})
+	ground := mix(pick(c.seed+2), color.RGBA{0, 0, 0, 0xff}, 0.55)
+	for y := int(h * 0.82); y < c.h; y++ {
+		for x := range c.w {
+			img.SetRGBA(x, y, ground)
+		}
+	}
+	return img
+}
+
+// gif is the whole clip. Each frame takes the colours of a small palette
+// made from the scene's own, so the file stays small.
+func (c clip) gif() []byte {
+	pal := c.palette()
+	anim := &gif.GIF{LoopCount: 0}
+	for i := range clipFrames {
+		src := c.frame(i)
+		dst := image.NewPaletted(src.Rect, pal)
+		draw.Draw(dst, src.Rect, src, image.Point{}, draw.Src)
+		anim.Image = append(anim.Image, dst)
+		anim.Delay = append(anim.Delay, clipDelay)
+	}
+	var b bytes.Buffer
+	if err := gif.EncodeAll(&b, anim); err != nil {
+		panic("fake: gif.EncodeAll failed")
+	}
+	return b.Bytes()
+}
+
+// still is the clip's first frame, as a PNG: its cover.
+func (c clip) still() []byte {
+	var b bytes.Buffer
+	if err := png.Encode(&b, c.frame(0)); err != nil {
+		panic("fake: png.Encode failed")
+	}
+	return b.Bytes()
+}
+
+// palette is the sky's gradient in steps, the ball and the ground.
+func (c clip) palette() color.Palette {
+	top := mix(pick(c.seed+3), color.RGBA{0x10, 0x12, 0x30, 0xff}, 0.5)
+	bottom := pick(c.seed + 5)
+	pal := color.Palette{}
+	for i := range 48 {
+		pal = append(pal, mix(top, bottom, float64(i)/47))
+	}
+	ball := color.RGBA{0xff, 0xf1, 0xc4, 0xff}
+	for i := range 8 {
+		pal = append(pal, mix(top, ball, float64(i+1)/8), mix(bottom, ball, float64(i+1)/8))
+	}
+	return append(pal, ball, mix(pick(c.seed+2), color.RGBA{0, 0, 0, 0xff}, 0.55))
+}
+
+// Tone is the fake's sound: a 440 Hz sine about 24 dB below full scale, so
+// it's quiet, in 16-bit mono at toneRate, faded in and out over toneFade so
+// it doesn't click.
+const (
+	toneRate = 22050
+	toneHz   = 440
+	toneFade = 0.05 // seconds
+)
+
+var toneLevel = 32767 * math.Pow(10, -24.0/20)
+
+// tone is seconds of the tone as a WAV file.
+func tone(seconds int) []byte {
+	n := toneRate * seconds
+	samples := make([]int16, n)
+	fade := toneFade * toneRate
+	for i := range samples {
+		gain := math.Min(1, math.Min(float64(i), float64(n-1-i))/fade)
+		samples[i] = int16(math.Round(toneLevel * gain * math.Sin(2*math.Pi*toneHz*float64(i)/toneRate)))
+	}
+	var b bytes.Buffer
+	data := uint32(2 * n)
+	w := func(v any) {
+		if err := binary.Write(&b, binary.LittleEndian, v); err != nil {
+			panic("fake: binary.Write failed")
+		}
+	}
+	b.WriteString("RIFF")
+	w(36 + data)
+	b.WriteString("WAVEfmt ")
+	w(uint32(16))           // the fmt chunk's size
+	w(uint16(1))            // PCM
+	w(uint16(1))            // one channel
+	w(uint32(toneRate))     // samples a second
+	w(uint32(toneRate * 2)) // bytes a second
+	w(uint16(2))            // bytes a frame
+	w(uint16(16))           // bits a sample
+	b.WriteString("data")
+	w(data)
+	w(samples)
 	return b.Bytes()
 }
 

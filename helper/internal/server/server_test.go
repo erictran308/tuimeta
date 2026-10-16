@@ -241,8 +241,8 @@ func TestTheFirstLineIsHello(t *testing.T) {
 	if first.Seq != 0 || first.Event != "hello" {
 		t.Fatalf("first line = %s", first.Raw)
 	}
-	// Version 4: send_files names what tuimeta checked of each file.
-	if v := wiretest.Field[int](t, first, "version"); v != 4 || proto.Version != 4 {
+	// Version 5: Instagram's home feed, load_feed.
+	if v := wiretest.Field[int](t, first, "version"); v != 5 || proto.Version != 5 {
 		t.Errorf("version = %d", v)
 	}
 	nets := wiretest.Field[[]string](t, first, "networks")

@@ -4,7 +4,7 @@
 
 **Messenger, Instagram and WhatsApp at the speed of your keyboard.**
 
-A terminal client (TUI) for your own Facebook Messenger, Instagram and WhatsApp chats, with vim keys, inline photos and reactions.<br>
+A terminal client (TUI) for your own Facebook Messenger, Instagram and WhatsApp chats, with vim keys, inline photos and reactions, and your Instagram feed, its videos playing right in the terminal with [Pepper](https://github.com/erictran308/pepper).<br>
 The same app as [tuigram](https://github.com/erictran308/tuigram), for Meta's messengers.
 
 </div>
@@ -24,6 +24,7 @@ The same app as [tuigram](https://github.com/erictran308/tuigram), for Meta's me
 - **WhatsApp, linked like WhatsApp Web.** Scan a QR code with your phone (or type a code on it), and tuimeta becomes one of your linked devices. It has the chats your phone sends it when you link it and everything after, and asks your phone for older messages as you scroll up (the phone has to be online for that: WhatsApp keeps no history on its servers). Disappearing messages disappear here too, and view-once photos stay on your phone.
 - **Encrypted chats.** Every WhatsApp chat, and Messenger's end-to-end encrypted chats, are marked with a 🔒 that a name can't fake, and their notifications never show what was said. tuimeta joins your account as a new device, so it has the encrypted messages sent from the moment you log in on. Older encrypted history isn't there, and there's nowhere to enter the 6-digit PIN Messenger asks for to restore it: that PIN unlocks Messenger's encrypted backup, which the libraries tuimeta builds on can't open. Read older encrypted messages on your phone or at facebook.com.
 - **Photos inline.** Real images in kitty, Ghostty, WezTerm and iTerm2, and block-character previews in any other terminal. `Enter` on a photo shows it as big as the window allows: `h` / `l` go through the chat's photos, `j` / `k` zoom in and out, and `o` opens it in your default app.
+- **Instagram's feed, videos and all.** The Feed row at the top of the Instagram chats opens your home feed: photos, carousels, reels and Instagram's suggested posts, with each post's comments in a pane beside it. In [Pepper](https://github.com/erictran308/pepper), a video plays right over its post, with a seek bar; in other terminals you see its cover, and `Enter` opens it in your player. You can only look, for now. See [Instagram's feed](#instagrams-feed).
 - **Reactions.** `R` offers Messenger's reactions and common emoji, and `/` finds any emoji by name. You have one reaction per message: `Enter` on yours, or `X`, takes it back.
 - **Replies, edits, unsend.** `r` replies, `gd` jumps to what a reply answers, `e` edits your message while the network allows, `d` unsends it.
 - **Send files.** `a` attaches a file by path, `p` or `Ctrl-v` pastes copied files or an image, and dropping files on the window attaches them.
@@ -114,14 +115,50 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 | | `y` | Copy |
 | | `a` / `p` | Attach a file / paste |
 | | `gd` | Go to the message a reply answers |
+| Instagram feed | `j` / `k`, `gg` / `G` | Next, previous post |
+| | `[` / `]` | The photo or video before / after in a carousel |
+| | `Enter` | Show the photo, or play the video (inside Pepper; elsewhere in your player) |
+| | `Space` / `m` | Pause / mute the video |
+| | `,` / `.` | Back / on 5 seconds (a seek bar shows under the video in Pepper) |
+| | `o` / `y` | Open the post on instagram.com / copy its link |
+| | `r` | Reload, for the newest posts |
+| | `c` | The post's comments, in a pane beside it while its video plays on (`Enter` shows a comment's replies, `y` copies one, `h` / `l` go between post and comments, `Esc` closes) |
 | Writing | `Enter` | Send |
 | | `Alt-Enter` / `Ctrl-j` | New line |
 | | `:` and a few letters, `Tab` | An emoji by its shortcode |
 | | `Esc` | Back to Normal mode |
 
+## Instagram's feed
+
+When you're logged in to Instagram, the first row of its chats (of every chat, if Instagram is your only network) is **Feed**. `Enter` opens your home feed where a chat would open: what instagram.com shows you, in its order, a page at a time as you move down.
+
+- **Posts** show who posted and when, the photo or the video's cover, a carousel's position (`2/3 ●○○`), likes, comments and the caption. Posts are at most 60 columns wide, as instagram.com's feed is a narrow column, so a wide window shows more of them rather than bigger ones. `[` and `]` go through a carousel, and `Enter` on a photo shows it as big as the window allows (`h` / `l` then go through every photo of the feed).
+- **Suggested posts**, the ones Instagram mixes in from accounts you don't follow, show too, marked "Suggested for you". Ads are left out.
+- **Comments**: `c` opens the post's comments in a pane on its right, its video playing on beside them. `j` / `k` move through them, `Enter` on a comment shows its replies under it (or hides them), `y` copies one, `h` goes back to the post and `l` over again, and `c` or `Esc` closes them.
+- **Only looking, for now.** Nothing in tuimeta likes, comments, follows or saves. `o` opens the post on instagram.com to do that, and `y` copies its link.
+- **Nothing about what you look at goes to Instagram:** the feed is asked for a page at a time, without the "seen" and viewing reports Instagram's own apps send, and comments are only read. Videos and photos download from Instagram's servers like any other file, when you open them.
+
+Instagram's feed and comments aren't something Meta lets other apps use: tuimeta asks for them the way instagram.com itself does, so a change on Instagram's side can break them until tuimeta follows, and they're one more thing an unofficial client does with your account. The [warning](#tuimeta) at the top applies here too.
+
+### Videos in the terminal: Pepper
+
+[Pepper](https://github.com/erictran308/pepper) is [Ghostty](https://ghostty.org) with one thing added: a program can show a video in a box of cells of its tab, straight from the graphics chip. In Pepper, `Enter` on a video plays it right over its post:
+
+- It loops, as Instagram plays it, with its sound. `Space` pauses it, `m` mutes it, `,` and `.` jump back and on 5 seconds, and a seek bar under it shows where it is. `Esc` stops it, and so does moving to another post.
+- It keeps playing with the post's comments open beside it. A popup (help, the chat finder, a warning) takes the picture away until it closes, so nothing is ever hidden under it.
+
+To use it:
+
+1. Install Pepper (see [its README](https://github.com/erictran308/pepper#install)) and mpv, whose library Pepper's player uses: `brew install mpv`.
+2. Run tuimeta in a Pepper tab. Pepper tells every shell where its player is (`PEPPER_PLAY`), and tuimeta finds it there. Inside tmux, screen or zellij, which don't pass Pepper's escape sequence on, videos open in your player instead.
+
+How it plays: tuimeta's helper downloads the video from Instagram's servers first, as it downloads any file, then tuimeta starts Pepper's player, `pepper-play`, on that file. The player gets the file's path and nothing else: none of mpv's config, scripts or yt-dlp, no web address to fetch, and nothing it prints reaches tuimeta's screen. The box it plays in is placed by a random token that tuimeta hands it over a private socket, never on its command line. Instagram's reels often come with their picture and sound as two files; Pepper's player plays the two together.
+
+In any other terminal you see each video's cover, with `▶` and its length, and `Enter` opens the video in your default player once it's downloaded. A reel whose sound comes as a file of its own opens there without it, since only Pepper's player puts the two together here.
+
 ## Your data
 
-Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it, to a folder only you can change: on Windows, one inside your user folder): your settings, your own themes and [sounds](#notification-sound), and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received, the newest 3000 per chat (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers. In both, disappearing messages are deleted when their time is up. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it, and `helper/ids.json.bad`, a list of ids the helper set aside as unreadable, which may hold any network's.
+Everything is in one folder, `tuimeta --help` says where (`TM_DATA_DIR` moves it, to a folder only you can change: on Windows, one inside your user folder): your settings, your own themes and [sounds](#notification-sound), and in `helper/` the sessions, downloaded files and the helper's log. For Messenger's encrypted chats it also keeps the device's keys and the encrypted messages it received, the newest 3000 per chat (tuimeta can't restore Messenger's PIN-locked backup, so these are all it has of them). For WhatsApp it keeps the linked device's keys and the chats and messages it has, the newest 3000 per chat, since WhatsApp keeps none on its servers. In both, disappearing messages are deleted when their time is up. Photos and videos of Instagram's feed are downloaded there like a chat's files, once you open them or scroll past them. The folder is readable by you alone, but not encrypted, and backups (Time Machine and the like) copy it like everything else: anyone who can read your files can read those messages and act as those devices until you remove them from your accounts. Logging out of a network deletes what's kept for it, and `helper/ids.json.bad`, a list of ids the helper set aside as unreadable, which may hold any network's.
 
 The log never holds what people wrote, their names, or your cookies.
 
@@ -150,7 +187,10 @@ cargo test                  # the app's tests
 cargo clippy --all-targets
 (cd helper && go test ./... && go vet ./...)
 cargo run -- --fake         # needs target/debug/tuimeta-helper (see helper/README.md)
+cargo test -- --ignored     # end to end against the helper's --fake, and Pepper's player (in a Pepper tab)
 ```
+
+`--fake` has an Instagram feed too: made-up posts (carousels, videos as animated GIFs, one with its sound apart, suggested posts) and their comments, so the feed, its comments and Pepper's playback can be tried without an account.
 
 Never point a development build at your real account to try a change: `--fake` and `--demo` exist for that. Development builds also read `TM_*` settings from a `.env` in the repository's root (see `.env.example`; `TM_HELPER` must be an absolute path), never from the folder they're run in; release builds read no `.env`. `helper/PROTOCOL.md` is the contract between the two programs.
 

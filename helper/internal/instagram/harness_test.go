@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -164,6 +165,11 @@ type fakeAPI struct {
 	nextUpload   int64
 	reactionResp *slidetypes.SendReactionResponse
 	search       *slidetypes.SearchResponse
+	// feed answers FeedTimeline: the body for the form's max_id ("" for
+	// the first page), with its error.
+	feed func(maxID string) ([]byte, error)
+	// comments answers Comments: the body for the path and query.
+	comments func(path string, query url.Values) ([]byte, error)
 }
 
 func newFakeAPI(t testing.TB) *fakeAPI {
@@ -350,6 +356,29 @@ func (f *fakeAPI) Upload(ctx context.Context, threadKey int64, name, mime string
 	defer f.mu.Unlock()
 	f.nextUpload++
 	return f.nextUpload, nil
+}
+
+func (f *fakeAPI) FeedTimeline(ctx context.Context, form url.Values) ([]byte, error) {
+	f.record("FeedTimeline", form)
+	if f.feed == nil {
+		return []byte(`{"feed_items":[],"more_available":false,"status":"ok"}`), nil
+	}
+	return f.feed(form.Get("max_id"))
+}
+
+// commentCall is a Comments request as it was asked.
+type commentCall struct {
+	path    string
+	query   url.Values
+	referer string
+}
+
+func (f *fakeAPI) Comments(ctx context.Context, path string, query url.Values, referer string) ([]byte, error) {
+	f.record("Comments", commentCall{path, query, referer})
+	if f.comments == nil {
+		return []byte(`{"comments":[],"has_more_comments":false,"status":"ok"}`), nil
+	}
+	return f.comments(path, query)
 }
 
 func sentMessage(id string, ms int64) slidetypes.SentMessage {

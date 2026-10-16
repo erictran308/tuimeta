@@ -55,6 +55,8 @@ fn lock_spans(colors: &Colors) -> [Span<'static>; 2] {
 }
 
 mod chat_list;
+mod comments;
+mod feed;
 mod help;
 mod messages;
 mod viewer;
@@ -656,13 +658,48 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 colors,
             );
         }
-        None => frame.render_widget(
-            Paragraph::new("Press Enter to open a chat")
-                .fg(colors.muted)
-                .centered()
-                .block(bordered(colors).border_style(border(false, colors))),
-            chat_area,
-        ),
+        None => match app.feed.as_mut() {
+            Some(feed) => {
+                // With its comments open, the post keeps the left and the
+                // comments take a pane on the right.
+                let (feed_area, comments_area) = match app.comments.is_some() {
+                    true => {
+                        let [post, comments] = comments::split(chat_area);
+                        (post, Some(comments))
+                    }
+                    false => (chat_area, None),
+                };
+                let in_comments = app.comments.is_some() && app.comments_focus;
+                let view = feed::View {
+                    feed,
+                    focused: app.focus == Focus::Messages && !in_comments,
+                    covered: popup_over_chat,
+                    playing: app
+                        .playing
+                        .as_ref()
+                        .map(|p| (p.post_id, p.file_id, p.label())),
+                    progress: app
+                        .playing
+                        .as_ref()
+                        .and_then(|p| Some((p.position?, p.duration?))),
+                };
+                app.video_box = feed::draw(frame, feed_area, view, &mut app.images, colors);
+                if let (Some(area), Some(comments)) = (comments_area, app.comments.as_mut()) {
+                    let focused = app.focus == Focus::Messages && in_comments;
+                    comments::draw(frame, area, comments, focused, colors);
+                }
+            }
+            None => frame.render_widget(
+                Paragraph::new("Press Enter to open a chat")
+                    .fg(colors.muted)
+                    .centered()
+                    .block(bordered(colors).border_style(border(false, colors))),
+                chat_area,
+            ),
+        },
+    }
+    if app.feed.is_none() {
+        app.video_box = None;
     }
     if suggesting && let (Some(composer), Some(completion)) = (suggestions_at, &app.completion) {
         draw_suggestions(frame, composer, completion, colors);
@@ -694,6 +731,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         let yours: Vec<&str> = yours.iter().map(String::as_str).collect();
         draw_react(frame, chat_area, menu, &yours, colors);
     }
+
     if let Some(picker) = &mut app.picker {
         let names = messages::Names {
             users: &app.users,
@@ -2012,6 +2050,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
         ),
+
         _ if app.picker.is_some() => (
             normal,
             "  type a name or username · `arrows` choose · `Enter` open · `Esc` cancel",
@@ -2027,6 +2066,22 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         Focus::Chats => (
             normal,
             "  `j/k` move · `Enter` open · `i` write · `/` search · `s` find anyone · `m` mute · `H` highlight · `gg/G` top/bottom · `Ctrl-d/u` half page · `Ctrl-r` resize · `:` commands · `?` help · `q` quit",
+        ),
+        Focus::Messages if app.comments.is_some() && app.comments_focus => (
+            normal,
+            "  `j/k` comments · `Enter` show or hide replies · `y` copy · `Space` pause · `,/.` seek · `m` mute · `h` the post · `g/G` first/last · `c` or `Esc` close",
+        ),
+        Focus::Messages if app.feed.is_some() && app.comments.is_some() => (
+            normal,
+            "  `l` comments · `Space` pause · `,/.` seek · `m` mute · `[ ]` carousel · `Enter` photo or video · `c` close comments · `j/k` another post, closing them",
+        ),
+        Focus::Messages if app.feed.is_some() && app.playing.is_some() => (
+            normal,
+            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `Esc` stop · `j/k` next/previous post · `[ ]` carousel · `o` open on instagram.com · `h` back",
+        ),
+        Focus::Messages if app.feed.is_some() => (
+            normal,
+            "  `j/k` next/previous post · `[ ]` carousel · `Enter` photo or video · `o` open on instagram.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `s` find anyone · `:` commands · `?` help · `q` quit",
         ),
         Focus::Messages if editing => (
             normal,

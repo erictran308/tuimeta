@@ -53,6 +53,16 @@ type api interface {
 	// Upload sends a file to Instagram's upload endpoint and returns the
 	// attachment id a media message then names.
 	Upload(ctx context.Context, threadKey int64, name, mime string, data []byte, voice bool) (int64, error)
+
+	// FeedTimeline asks for a page of the home feed with form (feedForm)
+	// and returns the answer's body, also with an error, when Instagram
+	// said why.
+	FeedTimeline(ctx context.Context, form url.Values) ([]byte, error)
+
+	// Comments GETs path (a post's comments, or a comment's replies) on
+	// www.instagram.com with query, as from the post's page (referer), and
+	// returns the answer's body, also with an error when Instagram said why.
+	Comments(ctx context.Context, path string, query url.Values, referer string) ([]byte, error)
 }
 
 // realAPI is instameow itself.
@@ -100,6 +110,63 @@ func (r realAPI) Upload(ctx context.Context, threadKey int64, name, mime string,
 		return 0, fmt.Errorf("instagram: upload answered without metadata")
 	}
 	return resp.Payload.RealMetadata.GetFbId(), nil
+}
+
+// FeedTimeline is the web client's own request for the home feed, through
+// the session's client, so it carries the session's cookies and the
+// browser it says it is (browser.Identity.Use wraps the client's
+// transport), with the headers instameow's own web API requests have.
+func (r realAPI) FeedTimeline(ctx context.Context, form url.Values) ([]byte, error) {
+	cli := r.GetHTTP()
+	base := r.GetEndpoint("base_url")
+	h := cli.BuildHeaders(true, false)
+	feedHeaders(h, base)
+	_, body, err := cli.MakeRequest(ctx, base+feedPath, http.MethodPost, h, []byte(form.Encode()), types.FORM)
+	return body, err
+}
+
+// Comments is the web client's request for a post's comments, or a
+// comment's replies, made as FeedTimeline is, from the post's page: a GET,
+// which a page's fetch sends without an Origin.
+func (r realAPI) Comments(ctx context.Context, path string, query url.Values, referer string) ([]byte, error) {
+	cli := r.GetHTTP()
+	base := r.GetEndpoint("base_url")
+	h := cli.BuildHeaders(true, false)
+	commentHeaders(h, base, referer)
+	_, body, err := cli.MakeRequest(ctx, commentsURL(base, path, query), http.MethodGet, h, nil, types.NONE)
+	return body, err
+}
+
+// commentHeaders are feedHeaders for a GET from the post's page (referer;
+// the site's own page without one).
+func commentHeaders(h http.Header, base, referer string) {
+	feedHeaders(h, base)
+	h.Del("origin")
+	if referer != "" {
+		h.Set("referer", referer)
+	}
+}
+
+// commentsURL is base and path, with query when it has anything.
+func commentsURL(base, path string, query url.Values) string {
+	if len(query) == 0 {
+		return base + path
+	}
+	return base + path + "?" + query.Encode()
+}
+
+// feedHeaders are what the web client's feed request adds to the headers
+// every web request has: the ones instameow's FetchMedia sets, as a fetch
+// from the instagram.com page. (FetchMedia also sends X-Web-Session-ID,
+// which instameow keeps to itself: the only way to it, NewHTTPQuery, also
+// counts a GraphQL request, unguarded, while others may be counting.)
+func feedHeaders(h http.Header, base string) {
+	h.Set("x-requested-with", "XMLHttpRequest")
+	h.Set("origin", base)
+	h.Set("referer", base+"/")
+	h.Set("sec-fetch-dest", "empty")
+	h.Set("sec-fetch-mode", "cors")
+	h.Set("sec-fetch-site", "same-origin")
 }
 
 // quietLogger is the only logger instameow gets. At debug and trace levels

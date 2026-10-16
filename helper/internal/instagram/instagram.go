@@ -93,6 +93,9 @@ type Instagram struct {
 
 	sending   map[string]*sendState // messages being sent, by offline threading id
 	reactLogs map[string]reactionRef
+
+	// feed is where the home feed got to, under its own lock (feed.go).
+	feed feedState
 }
 
 // connection is one client and its sockets.

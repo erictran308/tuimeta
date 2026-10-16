@@ -1,4 +1,4 @@
-# tuimeta helper protocol, version 4
+# tuimeta helper protocol, version 5
 
 `tuimeta-helper` is a separate program (Go, AGPL-3.0-or-later) that speaks
 Messenger, Instagram and WhatsApp for tuimeta (Rust, MIT). tuimeta starts it as a child
@@ -41,14 +41,16 @@ raw newline (JSON escapes them).
   `timeout`, `cancelled`, `internal`. `message` is one sentence a person can act on; tuimeta may show
   it in its status bar.
 - The helper's first line is always:
-  `{"event":"hello","version":4,"helper":"<semver>","networks":["messenger","instagram","whatsapp"]}`.
+  `{"event":"hello","version":5,"helper":"<semver>","networks":["messenger","instagram","whatsapp"]}`.
   tuimeta refuses to go on if `version` isn't one it knows. (Version 2 added
   `login_cookies`' `browser`: a helper that ignored it would log in as
   another browser than the user asked for. Version 3 added WhatsApp, which
   logs in by linking a device: `login_link`, `cancel_login` and the
   `login_code` event. Version 4 changed `send_files` to name each file with
   what tuimeta checked when it was listed: a helper that read only paths
-  would upload a file swapped since.)
+  would upload a file swapped since. Version 5 added Instagram's home feed,
+  `load_feed` and its posts: tuimeta lists the feed only with a helper that
+  has it.)
 - No line the helper writes is longer than 8 MiB. An answer that would be
   is sent as an `internal` error for its `id` instead, and an event that would
   be is dropped; `history` stops a page short to fit (see `history`).
@@ -93,6 +95,12 @@ ids.
     on every part.
   - A message you're sending gets a temporary id until the network confirms
     it; `message_sent` then gives the final one.
+- `post_id` (i64 > 0): a post of a network's home feed (`load_feed`).
+  Stable for the run: the same post given again, by a later page or a
+  `fresh` load, has the same id. Not chronological: the feed is in the
+  network's order.
+- `comment_id` (i64 > 0): a comment on a post of the feed, or a reply to
+  one (`load_comments`). Stable for the run, like `post_id`.
 - `file_id` (i32 > 0): anything downloadable (a photo, a video, a thumbnail, a
   profile picture, a file). Stable for the run, but a file whose message
   was deleted can be forgotten, and `logout` forgets all of the network's
@@ -177,12 +185,16 @@ ids.
   "name": "IMG_0001.jpg",       // ?
   "mime": "image/jpeg",         // ?
   "size": 123456,               // ? bytes
-  "view_once": false            // shown only once on the phone; never offered as a file
+  "view_once": false,           // shown only once on the phone; never offered as a file
+  "audio": 23                   // ? a video's sound, when it's a file of its own
 }
 ```
 
 For a photo, `thumbnail` may be the same file as `file_id`. A view-once photo
-or video has no `file_id` (0) and no `thumbnail`.
+or video has no `file_id` (0) and no `thumbnail`. A video with `audio` has its
+picture alone in `file_id` and its sound in `audio` (Instagram's web feed
+sends them apart, as DASH streams): a player plays the two together, and
+one without `audio` has its sound in `file_id`, or none.
 
 ### LinkPreview
 
@@ -193,6 +205,72 @@ or video has no `file_id` (0) and no `thumbnail`.
 
 Only from the network's own data: the helper never fetches a URL found in a
 message.
+
+### Post
+
+A post of the home feed (`load_feed`): photos and videos from the people and
+pages the account follows, in the order the network puts them.
+
+```json
+{
+  "id": 5,                      // post_id
+  "author": {"name": "Alice Example", "username": "alice.example",
+             "verified": false,
+             "photo": {"file_id": 40, "width": 150, "height": 150}},   // photo ?
+  "date": 1759912345,           // unix seconds
+  "caption": "sunset over the lake",   // "" when there's none
+  "media": [Media],             // in order, 1 to 20: several are a carousel
+  "likes": 120,                 // ? absent when the author hides the count
+  "comments": 8,                // ?
+  "url": "https://www.instagram.com/p/DAbc123/",  // the post on the network's website
+  "suggested": false            // Instagram's pick from an account you don't follow
+}
+```
+
+- `author` is the post's owner as the feed describes them, not a `user_id`:
+  people seen only in the feed aren't added to anyone's chats or users.
+  `name` may be empty (then `username` is what to show).
+- `caption` is plain text (no `entities`): at most 2200 characters, as
+  Instagram allows, longer ones cut.
+- Each `media` is a `photo` or a `video` (a reel too). For a photo,
+  `file_id` is the picture about 1080 px wide (the smallest at least that
+  wide, else the largest) and `thumbnail` the same file. For a video,
+  `file_id` is the video (`mime` `video/mp4`), the version about 720 px wide
+  rather than the largest, to keep downloads small, `duration` its length,
+  and `thumbnail` its cover picture, about 1080 px wide. The video comes
+  from the media's `video_versions`, whole files with their sound; without
+  any, from its DASH manifest (`video_dash_manifest`): the picture
+  representation about 720 px wide as `file_id` and the sound as `audio`,
+  each a whole file (a representation's `BaseURL`). A video with neither
+  still comes, with `file_id` 0, so its post and cover show. `width` and
+  `height` are the media's own. Nothing is downloaded until asked for.
+- `url` is always `https://www.instagram.com/p/<code>/` or
+  `https://www.instagram.com/reel/<code>/`.
+- `suggested` posts are the ones Instagram mixes into the feed from accounts
+  the user doesn't follow ("Suggested for you": the timeline's
+  `explore_story` rows, and any other row holding a post), in the feed's
+  order with the rest.
+
+### Comment
+
+A comment on a post of the feed, or a reply to one (`load_comments`).
+
+```json
+{
+  "id": 9,                      // comment_id
+  "author": {"name": "Sam Rivera", "username": "sam.climbs", "verified": false},
+  "date": 1759912345,           // unix seconds
+  "text": "so good 😍",
+  "likes": 4,                   // ? absent when the network doesn't say
+  "replies": 2,                 // replies it has; 0 for a reply
+  "reply_to": 7                 // ? the comment a reply answers
+}
+```
+
+- `author` is as a post's, without `photo`.
+- `text` is plain text (no `entities`), at most 2200 characters, longer
+  ones cut. A comment can mention people (`@name`) and tags (`#tag`) as
+  plain words.
 
 ### File
 
@@ -243,6 +321,8 @@ message.
 | `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. On WhatsApp: the contacts and groups this device knows, and, for a query that is a phone number written with `+` and its country code, that number if it's on WhatsApp. |
 | `open_dm` | `network`, `user_id` | `{"chat_id": i64}`: the chat with that person, made if needed. |
 | `mute` | `chat_id`, `muted` | `{}` |
+| `load_feed` | `network`, `limit`, `fresh?` | `{"posts": [Post], "has_more": bool}`: the next posts of the account's home feed, about `limit` of them (the network gives pages of its own size, so fewer or more can come), after those already given. `fresh: true` starts again from the top, as pulling the feed down does: the newest posts, whatever was loaded before. Suggested posts come too, marked `suggested`; ads are left out. A network's loads run one at a time, in the order asked. Only Instagram has one: Messenger and WhatsApp answer `unsupported`. Errors: `not_logged_in`, `network`, `checkpoint`. |
+| `load_comments` | `post_id`, `replies_of?`, `more?` | `{"comments": [Comment], "has_more": bool}`: the comments on a post that `load_feed` gave, a page at a time, in the network's order (the post's page shows its top comments first). Without `more`, the first page, again if asked again; with `more: true`, the page after the last one given. With `replies_of` (a `comment_id`), that comment's replies instead, oldest first, paged the same way. A post's loads run one at a time, in the order asked. Errors: `not_found` (a post or comment this run didn't give), `not_logged_in`, `network`, `checkpoint`. |
 
 `send_text` and `send_files` first send a `message` event for each new
 message, with `"state": "pending"`, its temporary id, `outgoing: true`, your
@@ -285,6 +365,10 @@ when tuimeta asks.
   linked and the encrypted app-state patches, which whatsmeow fetches from
   WhatsApp's servers to work (the helper's README lists them).
 - No URL from a message is ever fetched.
+- The feed is only read: `load_feed` and `load_comments` send Instagram
+  nothing about what was looked at (no seen posts, view, impression or
+  video-play logging) and never like, follow or comment. Files of its posts
+  download only on `download`, like any other.
 - No message text, names, cookies, tokens or keys in logs, errors or panics.
 
 ## `--fake` mode
@@ -311,5 +395,19 @@ access at all.
   person starts `typing` 500 ms later and answers "echo: <text>" 1.5 s later.
 - `mark_read`, `typing`, `react`, `edit_text`, `delete`, `mute` change the
   fake state and send the events the real network would.
+- Instagram's `load_feed` gives 30 made-up posts from the last week, 10
+  per page, then `has_more: false`; `fresh` starts again from the first.
+  Among them: a carousel of three photos, a carousel of a photo and a
+  video, videos, a post with no caption, one with a caption of many lines
+  one with its likes hidden, and every fourth post `suggested`. A video's
+  file is a short animated GIF the
+  helper draws (`mime` `image/gif`), which a player plays like a video, and
+  its `thumbnail` a PNG of its first frame. One video has its sound apart,
+  as `audio`: a quiet two-second tone, a WAV file (`audio/wav`).
+- Instagram's `load_comments` gives each made-up post as many comments as
+  its `comments` says (at most 40), 10 per page: from several people, one
+  of them verified, one comment of many lines, one with a mention and a
+  tag, and some with replies (up to 12, 5 per page). The same post gives
+  the same comments every time.
 - The run is deterministic apart from timing: the same ids, names and texts
   every time.

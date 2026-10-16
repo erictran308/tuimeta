@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper, twice what it writes at most. A
@@ -234,6 +234,10 @@ pub struct Media {
     pub size: i64,
     #[serde(default)]
     pub view_once: bool,
+    /// A video's sound, when it's a file of its own (Instagram's DASH
+    /// videos): `file_id` is then the picture alone. 0 when there's none.
+    #[serde(default)]
+    pub audio: i32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -352,6 +356,75 @@ pub struct FileToSend {
     pub ctime_ns: i64,
 }
 
+/// A post of a network's home feed (`load_feed` in PROTOCOL.md).
+#[derive(Clone, Debug, Deserialize)]
+pub struct FeedPost {
+    pub id: i64,
+    pub author: FeedAuthor,
+    #[serde(default)]
+    pub date: i64,
+    #[serde(default)]
+    pub caption: String,
+    /// One for a single photo or video, several for a carousel. One that
+    /// doesn't read costs only itself.
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub media: Vec<Media>,
+    /// Absent when the author hides the count.
+    #[serde(default, deserialize_with = "lenient")]
+    pub likes: Option<i64>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub comments: Option<i64>,
+    #[serde(default)]
+    pub url: String,
+    /// Instagram's pick from an account the user doesn't follow.
+    #[serde(default)]
+    pub suggested: bool,
+}
+
+/// Whose post it is, as the feed describes them.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FeedAuthor {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub verified: bool,
+}
+
+/// A comment on a post of the feed, or a reply to one (`load_comments`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct CommentInfo {
+    pub id: i64,
+    pub author: FeedAuthor,
+    #[serde(default)]
+    pub date: i64,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub likes: Option<i64>,
+    #[serde(default)]
+    pub replies: i64,
+    #[serde(default, deserialize_with = "lenient")]
+    pub reply_to: Option<i64>,
+}
+
+/// The items of a list that read, the others left out.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Value::Array(items) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect())
+}
+
 /// Which part of a chat's history to fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -467,6 +540,20 @@ pub enum MetaEvent {
         qr: Option<String>,
         pairing: Option<String>,
         expires: i64,
+    },
+    /// A page of a network's home feed, for the load numbered `load`: the
+    /// posts and whether more come after them, or why there are none.
+    Feed {
+        network: Network,
+        load: u64,
+        page: Result<(Vec<FeedPost>, bool), String>,
+    },
+    /// A page of a post's comments, or of a comment's replies, for the load
+    /// numbered `load` (which says which it is), or why there's none.
+    Comments {
+        post_id: i64,
+        load: u64,
+        page: Result<(Vec<CommentInfo>, bool), String>,
     },
     /// The helper stopped or broke the protocol; nothing more will come.
     Gone(String),
@@ -919,6 +1006,57 @@ impl Meta {
 
     pub fn set_muted(&self, chat_id: i64, muted: bool) {
         self.spawn("mute", json!({"chat_id": chat_id, "muted": muted}));
+    }
+
+    /// Asks for the next page of a network's home feed, or with `fresh` its
+    /// newest posts again, answered by [`MetaEvent::Feed`] numbered `load`.
+    pub fn load_feed(&self, network: Network, limit: i32, fresh: bool, load: u64) {
+        self.then(
+            "load_feed",
+            json!({"network": network, "limit": limit, "fresh": fresh}),
+            move |answer| {
+                let page = answer.map(|mut result| {
+                    // A post that doesn't read costs that post.
+                    let posts = serde_json::from_value::<Vec<Value>>(result["posts"].take())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|p| serde_json::from_value(p).ok())
+                        .collect();
+                    (posts, result["has_more"].as_bool().unwrap_or(false))
+                });
+                Some(MetaEvent::Feed {
+                    network,
+                    load,
+                    page,
+                })
+            },
+        );
+    }
+
+    /// Asks for a page of a feed post's comments, or of a comment's replies
+    /// (`replies_of`): the first, or with `more` the next. Answered by
+    /// [`MetaEvent::Comments`] numbered `load`.
+    pub fn load_comments(&self, post_id: i64, replies_of: Option<i64>, more: bool, load: u64) {
+        let mut params = json!({"post_id": post_id, "more": more});
+        if let Some(id) = replies_of {
+            params["replies_of"] = id.into();
+        }
+        self.then("load_comments", params, move |answer| {
+            let page = answer.map(|mut result| {
+                // A comment that doesn't read costs that comment.
+                let comments = serde_json::from_value::<Vec<Value>>(result["comments"].take())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| serde_json::from_value(c).ok())
+                    .collect();
+                (comments, result["has_more"].as_bool().unwrap_or(false))
+            });
+            Some(MetaEvent::Comments {
+                post_id,
+                load,
+                page,
+            })
+        });
     }
 
     /// Closes the helper's stdin, after which it disconnects quietly and
@@ -1425,6 +1563,115 @@ mod tests {
             assert_eq!(mode & 0o077, 0, "{mode:o}");
         }
 
+        // Instagram's feed: a page of posts, each one shown, and a video
+        // that downloads to a file a player can open.
+        meta.load_feed(Network::Messenger, 10, false, 1);
+        let refused = next(&mut rx, |e| match e {
+            MetaEvent::Feed { page, .. } => Some(page),
+            _ => None,
+        })
+        .await;
+        assert!(refused.is_err(), "only Instagram has a feed");
+        meta.login_cookies(
+            Network::Instagram,
+            "sessionid=1; ds_user_id=2; csrftoken=3".into(),
+            None,
+            4,
+        );
+        next(&mut rx, |e| match e {
+            MetaEvent::Account {
+                network: Network::Instagram,
+                state: AccountState::Ready,
+                ..
+            } => Some(()),
+            _ => None,
+        })
+        .await;
+        meta.load_feed(Network::Instagram, 10, false, 2);
+        let (posts, more) = next(&mut rx, |e| match e {
+            MetaEvent::Feed { load: 2, page, .. } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert_eq!(posts.len(), 10);
+        assert!(more);
+        let shown: Vec<crate::feed::Post> = posts.iter().map(Into::into).collect();
+        assert!(shown.iter().all(|p| !p.media.is_empty() && p.url.is_some()));
+        assert!(
+            shown.iter().any(|p| p.likes.is_none()),
+            "one hides its likes"
+        );
+        assert!(shown.iter().any(|p| p.suggested), "Instagram suggests some");
+        let video = shown
+            .iter()
+            .flat_map(|p| &p.media)
+            .find(|m| m.video && m.still.is_some())
+            .and_then(|m| m.file.as_ref())
+            .expect("a video with its cover")
+            .id;
+        meta.download(video);
+        let path = next(&mut rx, |e| match e {
+            MetaEvent::Downloaded { file_id, path } if file_id == video => Some(path),
+            _ => None,
+        })
+        .await
+        .expect("downloaded");
+        assert!(Path::new(&path).is_absolute() && Path::new(&path).is_file());
+        meta.load_feed(Network::Instagram, 10, true, 3);
+        let (again, _) = next(&mut rx, |e| match e {
+            MetaEvent::Feed { load: 3, page, .. } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert_eq!(again[0].id, posts[0].id, "a fresh load starts from the top");
+
+        // Its comments, a page at a time, and a comment's replies.
+        let post = posts
+            .iter()
+            .find(|p| p.comments.unwrap_or(0) > 10)
+            .expect("a post with more than a page of comments");
+        meta.load_comments(post.id, None, false, 4);
+        let (first, more) = next(&mut rx, |e| match e {
+            MetaEvent::Comments { load: 4, page, .. } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert_eq!(first.len(), 10);
+        assert!(more);
+        let shown: Vec<crate::comments::Comment> = first.iter().map(Into::into).collect();
+        assert!(
+            shown
+                .iter()
+                .all(|c| !c.text.is_empty() && c.reply_to.is_none())
+        );
+        meta.load_comments(post.id, None, true, 5);
+        let (second, _) = next(&mut rx, |e| match e {
+            MetaEvent::Comments { load: 5, page, .. } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert!(second.iter().all(|c| first.iter().all(|f| f.id != c.id)));
+        let parent = first
+            .iter()
+            .chain(&second)
+            .find(|c| c.replies > 0)
+            .expect("a comment with replies");
+        meta.load_comments(post.id, Some(parent.id), false, 6);
+        let (replies, _) = next(&mut rx, |e| match e {
+            MetaEvent::Comments { load: 6, page, .. } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert!(!replies.is_empty());
+        assert!(replies.iter().all(|r| r.reply_to == Some(parent.id)));
+        meta.load_comments(post.id, Some(999_999), false, 7);
+        let unknown = next(&mut rx, |e| match e {
+            MetaEvent::Comments { load: 7, page, .. } => Some(page),
+            _ => None,
+        })
+        .await;
+        assert!(unknown.is_err(), "a comment this run didn't give");
+
         // WhatsApp links a device instead: a code to type on the phone,
         // given up, then a QR code, which the fake takes as scanned.
         meta.login_link(Network::WhatsApp, Some("+1 555 010 0100".into()), 4);
@@ -1537,13 +1784,16 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":4,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":5}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":5,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":6}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
         // Version 3 read `send_files` by path alone, so a file swapped after
-        // the composer checked it would go out.
-        let older = check_hello(br#"{"event":"hello","version":3}"#).unwrap_err();
-        assert!(older.to_string().contains("same release"), "{older}");
+        // the composer checked it would go out; version 4 has no feed.
+        for older in [3, 4] {
+            let line = format!(r#"{{"event":"hello","version":{older}}}"#);
+            let older = check_hello(line.as_bytes()).unwrap_err();
+            assert!(older.to_string().contains("same release"), "{older}");
+        }
         assert!(check_hello(b"not json").is_err());
         assert!(check_hello(br#"{"event":"chat","version":1}"#).is_err());
     }

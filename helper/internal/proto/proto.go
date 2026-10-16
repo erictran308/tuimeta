@@ -10,7 +10,7 @@ import (
 )
 
 // Version is the protocol version the hello line announces.
-const Version = 4
+const Version = 5
 
 // Network is "messenger", "instagram" or "whatsapp".
 type Network string
@@ -166,6 +166,9 @@ type Media struct {
 	Mime      string    `json:"mime,omitempty"`
 	Size      int64     `json:"size,omitempty"`
 	ViewOnce  bool      `json:"view_once"`
+	// Audio is a video's sound when it's a file of its own (Instagram's web
+	// feed sends DASH streams apart): FileID is then the picture alone.
+	Audio int32 `json:"audio,omitempty"`
 }
 
 // MarshalJSON keeps the numbers a sender chose within what tuimeta reads
@@ -246,6 +249,79 @@ type File struct {
 	Done       bool    `json:"done"`
 	Path       *string `json:"path"`
 	Error      string  `json:"error,omitempty"`
+}
+
+// Post is a post of a home feed (load_feed): photos and videos from the
+// people and pages the account follows.
+type Post struct {
+	ID       int64      `json:"id"`
+	Author   FeedAuthor `json:"author"`
+	Date     int64      `json:"date"`
+	Caption  string     `json:"caption"`
+	Media    []Media    `json:"media"`
+	Likes    *int64     `json:"likes,omitempty"`
+	Comments *int64     `json:"comments,omitempty"`
+	URL      string     `json:"url"`
+	// Suggested is Instagram's pick from an account not followed.
+	Suggested bool `json:"suggested"`
+}
+
+// FeedAuthor is a post's owner as the feed describes them: not a user, so
+// people seen only in the feed never join the chats' people.
+type FeedAuthor struct {
+	Name     string `json:"name"`
+	Username string `json:"username"`
+	Verified bool   `json:"verified"`
+	Photo    *Image `json:"photo,omitempty"`
+}
+
+// MaxCount is the largest like or comment count written: JSON numbers past
+// 2^53 lose their last digits in readers that take them as doubles.
+const MaxCount = 1 << 53
+
+// MarshalJSON writes no media as [] rather than null, and keeps counts
+// within what every reader takes.
+func (p Post) MarshalJSON() ([]byte, error) {
+	type plain Post
+	if p.Media == nil {
+		p.Media = []Media{}
+	}
+	clamp := func(n *int64) *int64 {
+		if n == nil {
+			return nil
+		}
+		v := min(max(*n, 0), MaxCount)
+		return &v
+	}
+	p.Likes, p.Comments = clamp(p.Likes), clamp(p.Comments)
+	p.Date = max(p.Date, 0)
+	return json.Marshal(plain(p))
+}
+
+// Comment is a comment on a post of the feed, or a reply to one
+// (load_comments). Its author has no photo.
+type Comment struct {
+	ID      int64      `json:"id"`
+	Author  FeedAuthor `json:"author"`
+	Date    int64      `json:"date"`
+	Text    string     `json:"text"`
+	Likes   *int64     `json:"likes,omitempty"`
+	Replies int64      `json:"replies"`
+	ReplyTo int64      `json:"reply_to,omitempty"`
+}
+
+// MarshalJSON keeps counts within what every reader takes, and the author
+// without a photo.
+func (c Comment) MarshalJSON() ([]byte, error) {
+	type plain Comment
+	if c.Likes != nil {
+		v := min(max(*c.Likes, 0), MaxCount)
+		c.Likes = &v
+	}
+	c.Replies = min(max(c.Replies, 0), MaxCount)
+	c.Date = max(c.Date, 0)
+	c.Author.Photo = nil
+	return json.Marshal(plain(c))
 }
 
 // SearchResult is a person or group a search found.

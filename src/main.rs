@@ -3,16 +3,20 @@ mod attach;
 mod chats;
 mod chime;
 mod clipboard;
+mod comments;
 mod complete;
 mod config;
 mod demo;
+mod feed;
 mod images;
 mod messages;
 mod meta;
 mod notify;
 mod ogg;
 mod opus;
+mod pepper;
 mod picker;
+mod player;
 mod reactions;
 mod search;
 mod service;
@@ -126,6 +130,8 @@ async fn main() -> Result<()> {
     let ringer = chime::Ringer::new(ring_tx, chime::Output::Speakers);
     let mut app = app::App::new(meta, images, clipboard, ringer, settings, settings_path);
     app.browser = config::var("TM_BROWSER");
+    // Inside Pepper, the feed's videos play over their posts.
+    app.pepper = pepper::find();
     let result = app
         .run(&mut terminal, rx, image_rx, clipboard_rx, ring_rx)
         .await;
@@ -169,6 +175,10 @@ against Meta's terms, and an account can be locked or banned for it.
 --fake runs the whole app with made-up accounts and no network: log in
 with any text that names the cookies, e.g. c_user=1; xs=2; datr=3;
 WhatsApp links by itself a few seconds after its code shows.
+
+Instagram's home feed is the Feed row at the top of its chats. Run in
+Pepper (github.com/erictran308/pepper), its videos play over their posts;
+in other terminals they show their cover, and Enter opens your player.
 
 Your login sessions, downloaded files and settings are kept in this
 folder, and your own color themes in its themes folder:

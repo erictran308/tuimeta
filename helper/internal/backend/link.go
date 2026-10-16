@@ -5,6 +5,8 @@ package backend
 import (
 	"context"
 	"strings"
+
+	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
 // Linker is a network that logs in by linking tuimeta as a new device of
@@ -23,6 +25,28 @@ type Linker interface {
 	// CancelLink ends the waiting Link of attempt (any, with 0), so no code
 	// shown for it works any more. Nothing waiting, nothing happens.
 	CancelLink(attempt uint64)
+}
+
+// Feeder is a network with a home feed (Instagram): the server sends
+// load_feed to it, one load at a time.
+type Feeder interface {
+	// LoadFeed is the next posts of the feed, after those it gave since the
+	// last fresh load (or login), and whether more remain. limit is a hint:
+	// the network gives pages of its own size. fresh starts again from the
+	// newest posts. It never tells the network what was looked at.
+	LoadFeed(ctx context.Context, limit int, fresh bool) (posts []proto.Post, more bool, err error)
+}
+
+// Commenter is a network whose feed's posts have comments (Instagram): the
+// server sends load_comments to it, for posts its LoadFeed gave.
+type Commenter interface {
+	// LoadComments is a page of the comments on post postID, or with
+	// repliesOf (a comment id it gave) of that comment's replies, oldest
+	// first, and whether more remain. Without more, the first page; with
+	// it, the page after the last one given. It never tells the network
+	// what was read. Errors: not_found for a post or comment it didn't give
+	// in this session.
+	LoadComments(ctx context.Context, postID, repliesOf int64, more bool) (comments []proto.Comment, hasMore bool, err error)
 }
 
 // PhoneDigits reads a phone number in international form: digits, with an

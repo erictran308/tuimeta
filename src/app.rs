@@ -6,24 +6,29 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui_textarea::{DataCursor, TextArea};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, sleep_until};
 
 use crate::attach::{self, Attachment, Dropped};
-use crate::chats::{Chats, List, Presence};
+use crate::chats::{Chats, FEED, List, Presence};
 use crate::chime::{self, Ringer, Sounds};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
+use crate::comments::{Comments, Replies};
 use crate::complete::{self, Completion};
 use crate::config;
+use crate::feed::{self, Feed};
 use crate::images::{self, ImageEvent, Images};
 use crate::messages::{
-    Editable, Editing, Link, MediaFile, OpenChat, Replied, SendState, link_host,
+    Editable, Editing, Link, MediaFile, OpenChat, Preview, Replied, SendState, link_host,
 };
-use crate::meta::{AccountState, Meta, MetaEvent, Network, Page};
+use crate::meta::{AccountState, CommentInfo, FeedPost, Meta, MetaEvent, Network, Page};
 use crate::notify::{self, Note, Notifications, Notifier};
+use crate::pepper::{self, Pepper, Placed};
 use crate::picker::{ChatPicker, Choice};
+use crate::player::{self, Player, PlayerEvent};
 use crate::reactions::{self, ReactMenu};
 use crate::settings::{self, Settings, Side};
 use crate::term::Terminal;
@@ -42,6 +47,8 @@ const MIN_LOADED: usize = 30;
 const LOAD_AHEAD: usize = 10;
 /// Rows moved by Ctrl-d / Ctrl-u.
 const HALF_PAGE: isize = 10;
+/// Posts of the feed moved by Ctrl-d / Ctrl-u.
+const FEED_JUMP: isize = 3;
 /// How long to wait for the helper to disconnect on quit.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a toast stays up.
@@ -66,6 +73,39 @@ const RING_GAP: Duration = Duration::from_secs(1);
 pub enum Screen {
     Login(Box<Login>),
     Main,
+}
+
+/// A video of the feed playing over its post inside Pepper, or downloading
+/// to.
+pub struct Playing {
+    pub post_id: i64,
+    pub file_id: i32,
+    /// The token its box is placed with ([`crate::pepper`]).
+    token: String,
+    /// Where the video is, once downloaded.
+    video: Option<String>,
+    /// Its sound, when that's a file of its own (Instagram's DASH videos),
+    /// and where it is once downloaded.
+    audio: Option<(i32, Option<String>)>,
+    /// `None` while the files download.
+    player: Option<Player>,
+    pub paused: bool,
+    pub muted: bool,
+    /// Where it is and how long it is, in seconds, as pepper-play tells.
+    pub position: Option<f64>,
+    pub duration: Option<f64>,
+}
+
+impl Playing {
+    /// What the post's line says about it.
+    pub fn label(&self) -> &'static str {
+        match (&self.player, self.paused, self.muted) {
+            (None, ..) => "loading…",
+            (_, true, _) => "paused",
+            (_, _, true) => "playing, muted",
+            _ => "playing",
+        }
+    }
 }
 
 pub enum LoginStep {
@@ -748,6 +788,30 @@ pub struct App {
     /// Counts the logins asked for: an answer to an earlier one (a link
     /// given up with Esc) is old news.
     login_attempt: u64,
+    /// Instagram's home feed, while it's open instead of a chat.
+    pub feed: Option<Feed>,
+    /// The feed as it was left for a chat, to come back to as it was.
+    feed_kept: Option<Feed>,
+    /// When a fresh page last took the place of the posts shown: an Enter
+    /// that quick was meant for what was there before.
+    feed_changed: Option<Instant>,
+    /// `c`: the selected post's comments, in a popup over the feed.
+    pub comments: Option<Comments>,
+    /// The keys go to the comments pane, not to the post beside it.
+    pub comments_focus: bool,
+    /// Pepper and its player, when videos play inside the terminal.
+    pub pepper: Option<Pepper>,
+    /// The feed's video playing over its post, inside Pepper.
+    pub playing: Option<Playing>,
+    /// Where the last frame drew the playing video's post, for Pepper's
+    /// box; `None` while it's out of view.
+    pub video_box: Option<Rect>,
+    /// What Pepper was last told about the box.
+    placed: Option<Placed>,
+    /// Counts playbacks, so news about one that ended is told apart.
+    plays: u64,
+    player_tx: UnboundedSender<PlayerEvent>,
+    player_rx: Option<UnboundedReceiver<PlayerEvent>>,
     exit: bool,
 }
 
@@ -766,6 +830,7 @@ impl App {
             .notifications
             .resolve(|name| std::env::var(name).ok());
         let rounded = settings.corners.rounded(|name| std::env::var(name).ok());
+        let (player_tx, player_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = Self {
             meta,
             screen: login_screen(LoginStep::Connecting),
@@ -830,6 +895,18 @@ impl App {
             cells_resized: false,
             browser: None,
             login_attempt: 0,
+            feed: None,
+            feed_kept: None,
+            feed_changed: None,
+            comments: None,
+            comments_focus: false,
+            pepper: None,
+            playing: None,
+            video_box: None,
+            placed: None,
+            plays: 0,
+            player_tx,
+            player_rx: Some(player_rx),
             exit: false,
         };
         app.use_saved_theme();
@@ -874,6 +951,10 @@ impl App {
     ) -> Result<()> {
         let mut keys = EventStream::new();
         let mut signals = quit_signals();
+        let mut players = self
+            .player_rx
+            .take()
+            .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
         // What broke the terminal, if it went away: the app then closes as
         // `q` closes it, without drawing, and returns this.
         let mut failed: Option<anyhow::Error> = None;
@@ -915,6 +996,10 @@ impl App {
                 failed = Some(e.into());
                 self.hang_up();
             }
+            // After the frame: where the video playing shows now.
+            if failed.is_none() {
+                notify::send(&self.video_placement());
+            }
             // Start downloads/encodes for photos the frame showed but didn't have.
             self.images.fetch(&self.meta);
             if let Some(open) = self.open.as_mut() {
@@ -944,6 +1029,7 @@ impl App {
                     }
                 }
                 Some(event) = image_events.recv() => self.images.on_built(event),
+                Some(event) = players.recv() => self.on_player(event),
                 Some(event) = clipboard.recv() => self.on_clipboard(event),
                 Some(why) = rings.recv() => {
                     self.status = Some(format!("Can't play the sound for new messages: {why}"));
@@ -960,6 +1046,11 @@ impl App {
                 _ = sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {}
                 else => break,
             }
+        }
+        // Pepper's box goes with the video.
+        self.stop_video();
+        if failed.is_none() {
+            notify::send(&self.video_placement());
         }
         match failed {
             Some(e) => Err(e),
@@ -1300,8 +1391,19 @@ impl App {
                         None => self.status = Some("Download failed".into()),
                     }
                 }
+                self.on_video_downloaded(file_id, path.as_deref());
                 self.images.on_downloaded(file_id, path);
             }
+            MetaEvent::Feed {
+                network,
+                load,
+                page,
+            } => self.on_feed_page(network, load, page),
+            MetaEvent::Comments {
+                post_id,
+                load,
+                page,
+            } => self.on_comments_page(post_id, load, page),
             MetaEvent::ChatsFound {
                 network,
                 query,
@@ -1372,6 +1474,9 @@ impl App {
                     if let Some(name) = name {
                         self.users.insert(id, name);
                     }
+                }
+                if network == Network::Instagram {
+                    self.chats.add_feed();
                 }
                 if was != Some(AccountState::Ready) {
                     // Messages from before now came while tuimeta wasn't
@@ -1453,6 +1558,7 @@ impl App {
             .open
             .as_ref()
             .is_some_and(|o| gone(&self.chats, o.chat_id))
+            || self.feed.as_ref().is_some_and(|f| f.network == network)
         {
             self.close_chat_popups();
             self.leave_chat();
@@ -1476,6 +1582,7 @@ impl App {
             }
         }
         self.chats.forget(network);
+        self.feed_kept = None;
         self.loading_chats.remove(&network);
         self.loaded_chats.remove(&network);
         self.picker = None;
@@ -1934,6 +2041,19 @@ impl App {
     /// Normal mode: every key is a command, nothing is typed.
     fn on_normal_key(&mut self, key: KeyEvent, ctrl: bool) {
         let pending_g = std::mem::take(&mut self.pending_g);
+        if self.focus == Focus::Messages
+            && self.comments_focus
+            && self.comments.is_some()
+            && self.on_comments_key(key, ctrl)
+        {
+            return;
+        }
+        if self.focus == Focus::Messages
+            && self.feed.is_some()
+            && self.on_feed_key(key, ctrl, pending_g)
+        {
+            return;
+        }
         // `h` and `l` go toward the pane on that side of the screen, so they
         // swap when the chat list is on the right.
         let (to_chat, to_list) = match self.settings.chat_list_side {
@@ -2488,7 +2608,11 @@ impl App {
     fn command_chat(&self) -> Option<i64> {
         match self.focus {
             Focus::Chats => self.selected,
-            _ => self.open.as_ref().map(|o| o.chat_id),
+            _ => self
+                .open
+                .as_ref()
+                .map(|o| o.chat_id)
+                .or(self.feed.as_ref().map(|_| FEED)),
         }
     }
 
@@ -2609,10 +2733,17 @@ impl App {
 
     /// Where the cursor is: the open chat, and the message it's on.
     fn here(&self) -> Option<Jump> {
-        self.open.as_ref().map(|o| Jump {
-            chat_id: o.chat_id,
-            message_id: o.selected,
-        })
+        let feed = self.feed.as_ref().map(|_| Jump {
+            chat_id: FEED,
+            message_id: None,
+        });
+        self.open
+            .as_ref()
+            .map(|o| Jump {
+                chat_id: o.chat_id,
+                message_id: o.selected,
+            })
+            .or(feed)
     }
 
     /// Ctrl-o (`back`) or Ctrl-i: to the chat or message left before, or
@@ -2653,6 +2784,10 @@ impl App {
             self.selected = Some(chat_id);
         }
         self.focus = Focus::Messages;
+        if chat_id == FEED {
+            self.open_feed();
+            return;
+        }
         if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
             return;
         }
@@ -2671,6 +2806,7 @@ impl App {
         self.delete_menu = None;
         self.react_menu = None;
         self.photo_view = None;
+        self.close_comments();
     }
 
     /// Leaves the chat open: you stop typing in it.
@@ -2681,6 +2817,13 @@ impl App {
         self.changed.clear();
         if self.open.take().is_some() {
             self.images.clear();
+        }
+        // Its video stops; the posts are kept to come back to.
+        if let Some(feed) = self.feed.take() {
+            self.stop_video();
+            self.close_comments();
+            self.images.clear();
+            self.feed_kept = Some(feed);
         }
     }
 
@@ -3191,6 +3334,10 @@ impl App {
         let Some(view) = &self.photo_view else {
             return;
         };
+        if view.chat_id == FEED {
+            self.view_next_feed_photo(view.message_id, view.photo.file_id, newer);
+            return;
+        }
         let Some(open) = self.open.as_ref().filter(|o| o.chat_id == view.chat_id) else {
             return;
         };
@@ -3856,6 +4003,10 @@ impl App {
         let Some(chat_id) = self.selected else {
             return;
         };
+        if chat_id == FEED {
+            self.status = Some("The feed has no notifications to mute".into());
+            return;
+        }
         let mute = !self.chats.muted(chat_id);
         self.meta.set_muted(chat_id, mute);
         self.chats.set_muted(chat_id, mute);
@@ -3863,7 +4014,7 @@ impl App {
 
     /// `H`: marks the selected chat so it's easy to find, or unmarks it.
     fn toggle_highlight(&mut self) {
-        let Some(chat_id) = self.selected else {
+        let Some(chat_id) = self.selected.filter(|&id| id != FEED) else {
             return;
         };
         self.settings.highlighted_chats = self.chats.toggle_highlight(chat_id);
@@ -3880,6 +4031,7 @@ impl App {
             return;
         }
         self.set_typing(false);
+        self.stop_video();
         self.meta.close();
         // Nothing to wait for without a helper.
         if self.meta.is_detached() {
@@ -3887,6 +4039,570 @@ impl App {
         }
         self.quit_deadline = Some(Instant::now() + CLOSE_TIMEOUT);
     }
+}
+
+/// Instagram's home feed, and its videos inside Pepper.
+impl App {
+    /// Opens the feed in the chat's place: as it was left, or its first
+    /// page.
+    fn open_feed(&mut self) {
+        if self.feed.is_some() {
+            return;
+        }
+        self.leave_chat();
+        let network = Network::Instagram;
+        let feed = match self.feed_kept.take().filter(|f| f.network == network) {
+            Some(feed) => feed,
+            None => {
+                let mut feed = Feed::new(network);
+                if let Some(load) = feed.start_load(false) {
+                    self.meta.load_feed(network, feed::PAGE, false, load);
+                }
+                feed
+            }
+        };
+        self.feed = Some(feed);
+    }
+
+    /// A key in the feed's pane, before the keys every pane has. False if
+    /// it's one of those: quitting, help, commands, the picker, jumps,
+    /// going back to the list.
+    fn on_feed_key(&mut self, key: KeyEvent, ctrl: bool, pending_g: bool) -> bool {
+        let to_list = match self.settings.chat_list_side {
+            Side::Left => 'h',
+            Side::Right => 'l',
+        };
+        let motion = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Some(1),
+            KeyCode::Char('k') | KeyCode::Up => Some(-1),
+            KeyCode::Char('d') if ctrl => Some(FEED_JUMP),
+            KeyCode::Char('u') if ctrl => Some(-FEED_JUMP),
+            KeyCode::Char('g') if pending_g => Some(isize::MIN),
+            KeyCode::Char('G') => Some(isize::MAX),
+            _ => None,
+        };
+        if let Some(delta) = motion {
+            self.move_feed_cursor(delta);
+            return true;
+        }
+        match key.code {
+            _ if ctrl => return false,
+            KeyCode::Char('[') | KeyCode::Left => self.step_feed_item(-1),
+            KeyCode::Char(']') | KeyCode::Right => self.step_feed_item(1),
+            KeyCode::Enter => self.open_feed_item(),
+            KeyCode::Char(' ') => self.pause_video(),
+            KeyCode::Char('m') => self.mute_video(),
+            KeyCode::Char(',') => self.seek_video(-player::SEEK_STEP),
+            KeyCode::Char('.') => self.seek_video(player::SEEK_STEP),
+            KeyCode::Char('o') => self.open_post_outside(),
+            KeyCode::Char('y') => self.copy_post_link(),
+            KeyCode::Char('r') => self.reload_feed(),
+            KeyCode::Char('c') => self.toggle_comments(),
+            // The comments pane is on the post's right.
+            KeyCode::Char('l') if self.comments.is_some() && !self.comments_focus => {
+                self.comments_focus = true
+            }
+            KeyCode::Esc if self.playing.is_some() => self.stop_video(),
+            KeyCode::Char('q' | '?' | ':' | 's' | 'g') | KeyCode::Esc | KeyCode::Tab => {
+                return false;
+            }
+            KeyCode::Char(c) if c == to_list => return false,
+            // A chat's keys (writing, replying, reacting) have nothing to
+            // act on here.
+            _ => {}
+        }
+        true
+    }
+
+    /// Moves the feed's cursor `delta` posts. A video playing stops with
+    /// its post left; near the end, the next page is asked for.
+    fn move_feed_cursor(&mut self, delta: isize) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        let before = feed.selected;
+        feed.move_cursor(delta);
+        // The video and the comments are the post's.
+        if feed.selected != before {
+            self.stop_video();
+            self.close_comments();
+        }
+        self.load_more_feed();
+    }
+
+    /// `[` / `]`: the photo or video before or after in the post's
+    /// carousel.
+    fn step_feed_item(&mut self, step: isize) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        if feed.step_item(step) {
+            self.stop_video();
+        } else if feed.selected_post().is_some_and(|p| p.media.len() < 2) {
+            self.status = Some("This post has one photo or video".into());
+        }
+    }
+
+    /// The next page, if the cursor is near the end and one isn't on its
+    /// way. Only as the feed is read: loading all of it is what a script
+    /// would do.
+    fn load_more_feed(&mut self) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        if feed.wants_more()
+            && let Some(load) = feed.start_load(false)
+        {
+            self.meta.load_feed(feed.network, feed::PAGE, false, load);
+        }
+    }
+
+    /// `r`: the newest posts again.
+    fn reload_feed(&mut self) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        if let Some(load) = feed.start_load(true) {
+            self.meta.load_feed(feed.network, feed::PAGE, true, load);
+        }
+    }
+
+    /// A page of the feed came, or why it didn't. One for a feed left for
+    /// a chat goes in it, for when it's opened again.
+    fn on_feed_page(
+        &mut self,
+        network: Network,
+        load: u64,
+        page: Result<(Vec<FeedPost>, bool), String>,
+    ) {
+        let open = self.feed.as_ref().is_some_and(|f| f.network == network);
+        let feed = match open {
+            true => self.feed.as_mut(),
+            false => self.feed_kept.as_mut().filter(|f| f.network == network),
+        };
+        let Some(feed) = feed else {
+            return;
+        };
+        let fresh = feed.is_fresh(load);
+        let failed = page.as_ref().err().map(|why| text::clean(why));
+        if !feed.on_page(load, page) || !open {
+            return;
+        }
+        if let Some(why) = failed {
+            self.status = Some(format!("Feed: {why}"));
+            return;
+        }
+        if fresh {
+            // Another post is under the cursor now.
+            self.stop_video();
+            self.close_comments();
+            self.feed_changed = Some(Instant::now());
+        }
+        self.load_more_feed();
+    }
+
+    /// Enter on a post: its photo in the viewer; its video over the post
+    /// inside Pepper, or in the system's player anywhere else.
+    fn open_feed_item(&mut self) {
+        let Some(feed) = self.feed.as_ref() else {
+            return;
+        };
+        let Some((post, item)) = feed.shown_item() else {
+            self.status = Some("Nothing to open in this post".into());
+            return;
+        };
+        // The posts were replaced a moment ago, maybe just as the key went
+        // down: the one under the cursor isn't what the user meant to open.
+        if self
+            .feed_changed
+            .take()
+            .is_some_and(|at| at.elapsed() < CONFIRM_GRACE)
+        {
+            self.status = Some("The feed just changed: press Enter again to open it".into());
+            return;
+        }
+        let Some(file) = item.file.clone() else {
+            self.status = Some(match item.video {
+                true => "This video can't be played here: o opens it on instagram.com".into(),
+                false => "This post can't be opened here".into(),
+            });
+            return;
+        };
+        let (post_id, audio) = (post.id, item.audio);
+        if !item.video {
+            self.photo_view = feed_photo(post_id, item);
+            return;
+        }
+        if self
+            .playing
+            .as_ref()
+            .is_some_and(|p| p.post_id == post_id && p.file_id == file.id)
+        {
+            self.pause_video();
+            return;
+        }
+        let Some(token) = self.pepper.as_ref().and_then(|_| pepper::new_token()) else {
+            self.open_target(Target::File(file));
+            if audio.is_some() {
+                self.status = Some(
+                    "It opens without its sound: Instagram sends that apart, and only Pepper plays the two together here"
+                        .into(),
+                );
+            }
+            return;
+        };
+        self.stop_video();
+        self.playing = Some(Playing {
+            post_id,
+            file_id: file.id,
+            token,
+            video: None,
+            audio: audio.map(|id| (id, None)),
+            player: None,
+            paused: false,
+            muted: false,
+            position: None,
+            duration: None,
+        });
+        // The helper answers at once if they're already downloaded.
+        self.meta.download(file.id);
+        if let Some(audio) = audio {
+            self.meta.download(audio);
+        }
+    }
+
+    /// `h` / `l` in the viewer over the feed: the photo before or after,
+    /// through the carousels and the posts, loading more past the last.
+    fn view_next_feed_photo(&mut self, post_id: i64, file_id: i32, newer: bool) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        let before = feed.selected;
+        match feed.next_photo(post_id, file_id, newer) {
+            Some((post_id, item)) => {
+                if feed.selected != before {
+                    self.stop_video();
+                    self.close_comments();
+                }
+                if let Some(view) = feed_photo(post_id, &item) {
+                    self.photo_view = Some(view);
+                }
+                self.load_more_feed();
+            }
+            None if newer && feed.has_more => {
+                self.status = Some("Loading more posts…".into());
+                feed.selected = feed.posts.len().saturating_sub(1);
+                self.load_more_feed();
+            }
+            None if newer => self.status = Some("No more photos in the feed".into()),
+            None => self.status = Some("No photos before this one".into()),
+        }
+    }
+
+    /// `o`: the post on instagram.com, where it can be liked or answered.
+    fn open_post_outside(&mut self) {
+        match self.feed_link() {
+            Some(link) => self.open_link_outside(link),
+            None => self.status = Some("This post has no link".into()),
+        }
+    }
+
+    /// `y`: copies the post's link.
+    fn copy_post_link(&mut self) {
+        match self.feed_link() {
+            Some(link) => self.copy_target(Target::Link(link)),
+            None => self.status = Some("This post has no link".into()),
+        }
+    }
+
+    /// `c`: the selected post's comments, in a pane on its right, which
+    /// takes the keys; `c` again closes it. The post stays in view, and its
+    /// video plays on.
+    fn toggle_comments(&mut self) {
+        let Some(post) = self.feed.as_ref().and_then(Feed::selected_post) else {
+            return;
+        };
+        if self.comments.as_ref().is_some_and(|c| c.post_id == post.id) {
+            self.close_comments();
+            return;
+        }
+        let author = match post.username.is_empty() {
+            true => post.name.clone(),
+            false => format!("@{}", post.username),
+        };
+        let mut comments = Comments::new(post.id, &author);
+        if let Some(load) = comments.start_load(None, false) {
+            self.meta.load_comments(post.id, None, false, load);
+        }
+        self.comments = Some(comments);
+        self.comments_focus = true;
+    }
+
+    fn close_comments(&mut self) {
+        self.comments = None;
+        self.comments_focus = false;
+    }
+
+    /// A key in the comments pane, while it has the keys. False if it's one
+    /// every pane has (quitting, help, commands, the picker, jumps, going to
+    /// the chat list), for those to take; the rest act on the comments, and
+    /// Space and `m` on the video playing beside them.
+    fn on_comments_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        let to_list = match self.settings.chat_list_side {
+            Side::Left => 'h',
+            Side::Right => 'l',
+        };
+        let Some(comments) = self.comments.as_mut() else {
+            return false;
+        };
+        let motion = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Some(1),
+            KeyCode::Char('k') | KeyCode::Up => Some(-1),
+            KeyCode::Char('d') if ctrl => Some(HALF_PAGE / 2),
+            KeyCode::Char('u') if ctrl => Some(-HALF_PAGE / 2),
+            KeyCode::Char('g') => Some(isize::MIN),
+            KeyCode::Char('G') => Some(isize::MAX),
+            _ => None,
+        };
+        if let Some(delta) = motion {
+            comments.move_cursor(delta);
+            self.load_more_comments();
+            return true;
+        }
+        match key.code {
+            _ if ctrl => return false,
+            // One page at a time, as the helper takes them.
+            KeyCode::Enter if comments.loading.is_some() => {
+                self.status = Some("Still loading: press Enter again in a moment".into());
+            }
+            KeyCode::Enter => {
+                if let Replies::Load { of, more } = comments.enter()
+                    && let Some(load) = comments.start_load(Some(of), more)
+                {
+                    self.meta
+                        .load_comments(comments.post_id, Some(of), more, load);
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(text) = comments.selected_comment().map(|c| c.text.clone()) {
+                    self.copy_target(Target::Text(text));
+                }
+            }
+            KeyCode::Char('o') => self.open_post_outside(),
+            KeyCode::Char(' ') => self.pause_video(),
+            KeyCode::Char('m') => self.mute_video(),
+            KeyCode::Char(',') => self.seek_video(-player::SEEK_STEP),
+            KeyCode::Char('.') => self.seek_video(player::SEEK_STEP),
+            // The post is on the pane's left.
+            KeyCode::Char('h') => self.comments_focus = false,
+            KeyCode::Esc | KeyCode::Char('c') => self.close_comments(),
+            KeyCode::Char(c) if c == to_list => return false,
+            KeyCode::Char('q' | '?' | ':' | 's') | KeyCode::Tab => return false,
+            _ => {}
+        }
+        true
+    }
+
+    /// The next page of top comments, once the cursor nears the last.
+    fn load_more_comments(&mut self) {
+        let Some(comments) = self.comments.as_mut() else {
+            return;
+        };
+        if comments.wants_more()
+            && let Some(load) = comments.start_load(None, true)
+        {
+            self.meta.load_comments(comments.post_id, None, true, load);
+        }
+    }
+
+    /// A page of comments or replies came, or why it didn't.
+    fn on_comments_page(
+        &mut self,
+        post_id: i64,
+        load: u64,
+        page: Result<(Vec<CommentInfo>, bool), String>,
+    ) {
+        let Some(comments) = self.comments.as_mut().filter(|c| c.post_id == post_id) else {
+            return;
+        };
+        let failed = page.as_ref().err().map(|why| text::clean(why));
+        if !comments.on_page(load, page) {
+            return;
+        }
+        match failed {
+            Some(why) => self.status = Some(format!("Comments: {why}")),
+            None => self.load_more_comments(),
+        }
+    }
+
+    fn feed_link(&self) -> Option<Link> {
+        let url = self.feed.as_ref()?.selected_post()?.url.as_deref()?;
+        Some(Link::from(url))
+    }
+
+    /// A download finished: if it's the video waiting to play, or its
+    /// sound, it plays once both are there. A sound that didn't come leaves
+    /// it to play without.
+    fn on_video_downloaded(&mut self, file_id: i32, path: Option<&str>) {
+        let Some(playing) = self.playing.as_mut().filter(|p| p.player.is_none()) else {
+            return;
+        };
+        let sound = playing.audio.as_ref().is_some_and(|(id, _)| *id == file_id);
+        match path {
+            Some(path) if file_id == playing.file_id => playing.video = Some(path.into()),
+            Some(path) if sound => playing.audio = Some((file_id, Some(path.into()))),
+            None if file_id == playing.file_id => {
+                self.playing = None;
+                self.status = Some("Couldn't download the video".into());
+                return;
+            }
+            None if sound => {
+                playing.audio = None;
+                self.status = Some("The video's sound didn't download: it plays without".into());
+            }
+            _ => return,
+        }
+        let Some(video) = playing.video.clone() else {
+            return;
+        };
+        let audio = match &playing.audio {
+            Some((_, None)) => return,
+            Some((_, Some(path))) => Some(path.clone()),
+            None => None,
+        };
+        let Some(pepper) = self.pepper.as_ref() else {
+            self.playing = None;
+            return;
+        };
+        self.plays += 1;
+        match Player::start(
+            pepper,
+            &playing.token,
+            Path::new(&video),
+            audio.as_deref().map(Path::new),
+            self.plays,
+            self.player_tx.clone(),
+        ) {
+            Ok(player) => playing.player = Some(player),
+            Err(e) => {
+                self.playing = None;
+                self.status = Some(format!("Can't play the video: {e:#}"));
+            }
+        }
+    }
+
+    /// News from pepper-play about the video playing; any other is over.
+    fn on_player(&mut self, event: PlayerEvent) {
+        let now = self
+            .playing
+            .as_ref()
+            .and_then(|p| p.player.as_ref())
+            .map(|p| p.play);
+        match event {
+            PlayerEvent::Failed { play, why } if now == Some(play) => {
+                self.status = Some(format!("Can't play the video: {why}"));
+                self.stop_video();
+            }
+            PlayerEvent::Position { play, seconds } if now == Some(play) => {
+                if let Some(playing) = self.playing.as_mut() {
+                    playing.position = Some(seconds);
+                }
+            }
+            PlayerEvent::Duration { play, seconds } if now == Some(play) => {
+                if let Some(playing) = self.playing.as_mut() {
+                    playing.duration = Some(seconds);
+                }
+            }
+            PlayerEvent::Exited { play } if now == Some(play) => self.playing = None,
+            _ => {}
+        }
+    }
+
+    /// Stops the video playing, or waiting to: its player goes, and with it
+    /// Pepper's box after the next frame.
+    fn stop_video(&mut self) {
+        self.playing = None;
+    }
+
+    /// Space: pauses the video playing, or plays it on.
+    fn pause_video(&mut self) {
+        match self.playing.as_mut() {
+            Some(playing) if playing.player.is_some() => {
+                if let Some(player) = &playing.player {
+                    player.toggle_pause();
+                }
+                playing.paused = !playing.paused;
+            }
+            Some(_) => {}
+            None => self.status = Some("No video playing: Enter plays one".into()),
+        }
+    }
+
+    /// `,` / `.`: the video playing [`player::SEEK_STEP`] seconds back or on.
+    fn seek_video(&mut self, seconds: i32) {
+        match self.playing.as_ref().and_then(|p| p.player.as_ref()) {
+            Some(player) => player.seek(seconds),
+            None => self.status = Some("No video playing: Enter plays one".into()),
+        }
+    }
+
+    /// `m`: the video's sound off, or on again.
+    fn mute_video(&mut self) {
+        match self.playing.as_mut() {
+            Some(playing) if playing.player.is_some() => {
+                if let Some(player) = &playing.player {
+                    player.toggle_mute();
+                }
+                playing.muted = !playing.muted;
+            }
+            Some(_) => {}
+            None => self.status = Some("No video playing".into()),
+        }
+    }
+
+    /// What to tell Pepper after a frame: where the video playing shows now
+    /// (`OSC 777;pepper`), or that it's gone, if that changed. Under a
+    /// popup, or with its post out of view, it's taken away: it would cover
+    /// what's drawn there. Empty when nothing changed.
+    pub fn video_placement(&mut self) -> String {
+        let shown = matches!(self.screen, Screen::Main) && !self.popup_over_chat();
+        let wanted = self
+            .playing
+            .as_ref()
+            .filter(|p| p.player.is_some())
+            .zip(self.video_box.filter(|_| shown))
+            .map(|(p, area)| Placed {
+                token: p.token.clone(),
+                area,
+            });
+        let out = pepper::tell(self.placed.as_ref(), wanted.as_ref());
+        self.placed = wanted;
+        out
+    }
+}
+
+/// The viewer on a photo of the feed's post `post_id`.
+fn feed_photo(post_id: i64, item: &feed::Item) -> Option<PhotoView> {
+    let file = item.file.clone().filter(|_| !item.video)?;
+    let (width, height) = item
+        .still
+        .as_ref()
+        .map_or((1080, 1080), |s| (s.width, s.height));
+    Some(PhotoView {
+        chat_id: FEED,
+        message_id: post_id,
+        photo: Preview {
+            file_id: file.id,
+            width,
+            height,
+            thumbnail: None,
+            sticker: false,
+        },
+        stand_in: None,
+        file,
+        zoom: None,
+        natural: 1.0,
+    })
 }
 
 /// SIGHUP (the terminal closed, an SSH connection dropped) and SIGTERM, one
@@ -6322,5 +7038,604 @@ mod tests {
             rows[rows.len() - 1].contains("o open in its app · y copy"),
             "{rows:#?}"
         );
+    }
+
+    /// The Instagram account comes in, as the helper says it.
+    fn instagram_in(app: &mut App) {
+        app.on_meta(MetaEvent::Account {
+            network: Network::Instagram,
+            state: AccountState::Ready,
+            user_id: None,
+            name: None,
+            error: None,
+        });
+    }
+
+    /// Opens the feed from its row in the Instagram tab.
+    fn open_the_feed(app: &mut App) {
+        instagram_in(app);
+        app.focus = Focus::Chats;
+        app.chats.show(List::Network(Network::Instagram));
+        app.chats.refresh();
+        app.selected = Some(FEED);
+        press(app, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    /// The page the feed waits for comes.
+    fn feed_page(app: &mut App, posts: Vec<FeedPost>, more: bool) {
+        let load = app
+            .feed
+            .as_ref()
+            .unwrap()
+            .loading
+            .expect("a load on its way");
+        app.on_meta(MetaEvent::Feed {
+            network: Network::Instagram,
+            load,
+            page: Ok((posts, more)),
+        });
+    }
+
+    fn post(id: i64, fields: serde_json::Value) -> FeedPost {
+        crate::feed::tests::post(id, fields)
+    }
+
+    /// A post of one video, file 7 with its cover 8.
+    fn video_post(id: i64) -> FeedPost {
+        post(
+            id,
+            serde_json::json!({"media": [{"kind": "video", "file_id": 7, "duration": 15,
+                "width": 720, "height": 1280, "mime": "video/mp4",
+                "thumbnail": {"file_id": 8, "width": 1080, "height": 1920}}]}),
+        )
+    }
+
+    #[test]
+    fn the_feed_is_the_first_row_of_the_instagram_tab_and_opens_in_the_chats_place() {
+        let mut app = test_app("feed-row");
+        let none = KeyModifiers::NONE;
+        instagram_in(&mut app);
+        app.chats.refresh();
+        assert!(
+            !app.chats.ids().contains(&FEED),
+            "not among every network's chats while Instagram has a tab"
+        );
+        app.chats.show(List::Network(Network::Instagram));
+        app.chats.refresh();
+        assert_eq!(app.chats.ids().first(), Some(&FEED));
+        app.selected = Some(FEED);
+        app.focus = Focus::Chats;
+        assert!(screen(&mut app).iter().any(|r| r.contains("Feed")));
+        // Nothing that acts on a chat goes to the helper for it.
+        press(&mut app, KeyCode::Char('m'), none);
+        press(&mut app, KeyCode::Char('H'), none);
+        assert!(sent_with(&app, "mute").is_empty());
+        assert!(!app.settings.highlighted_chats.contains(&FEED));
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.open.is_none() && app.feed.is_some());
+        assert_eq!(app.focus, Focus::Messages);
+        let asked = sent_with(&app, "load_feed");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0]["network"], "instagram");
+        assert_eq!(asked[0]["fresh"], false);
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Loading the feed…")),
+            "{rows:#?}"
+        );
+        // A chat's keys do nothing here.
+        for key in ['i', 'r', 'R', 'd', 'e', 'a', 'p'] {
+            if key != 'r' {
+                press(&mut app, KeyCode::Char(key), none);
+            }
+        }
+        assert_eq!(app.focus, Focus::Messages);
+        assert!(app.prompt.is_none() && app.react_menu.is_none() && app.delete_menu.is_none());
+        assert!(
+            !sent(&app)
+                .iter()
+                .any(|m| ["mark_read", "typing", "send_text"].contains(&m.as_str()))
+        );
+        // Back to the list, and the chat opened from it takes the feed's place.
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(app.focus, Focus::Chats);
+    }
+
+    #[test]
+    fn the_feed_loads_as_it_is_read_and_r_starts_again_from_the_newest() {
+        let mut app = test_app("feed-pages");
+        let none = KeyModifiers::NONE;
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            (1..=10).map(|i| post(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Alice Example @alice.example")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("12 likes · 3 comments")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("sunset")), "{rows:#?}");
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('j'), none);
+        }
+        assert_eq!(app.feed.as_ref().unwrap().selected, 6);
+        assert_eq!(sent_with(&app, "load_feed").len(), 1);
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(
+            sent_with(&app, "load_feed").len(),
+            2,
+            "the next page, near the end"
+        );
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(sent_with(&app, "load_feed").len(), 2, "one at a time");
+        press(&mut app, KeyCode::Char('r'), none);
+        let asked = sent_with(&app, "load_feed");
+        assert_eq!(asked.len(), 3);
+        assert_eq!(asked[2]["fresh"], true);
+        feed_page(
+            &mut app,
+            vec![post(30, serde_json::json!({"caption": "newest"}))],
+            true,
+        );
+        let feed = app.feed.as_ref().unwrap();
+        assert_eq!((feed.posts.len(), feed.selected), (1, 0));
+        // The post under the cursor just changed: Enter asks again.
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.photo_view.is_none());
+        assert!(app.status.as_ref().unwrap().contains("Enter again"));
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.photo_view.is_some());
+    }
+
+    #[test]
+    fn a_video_outside_pepper_shows_its_cover_and_enter_opens_it_in_the_systems_player() {
+        let mut app = test_app("feed-video-outside");
+        open_the_feed(&mut app);
+        feed_page(&mut app, vec![video_post(1)], false);
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("video 0:15")), "{rows:#?}");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.playing.is_none());
+        assert!(app.opening.contains(&7), "opens in its app once downloaded");
+        assert_eq!(sent_with(&app, "download")[0]["file_id"], 7);
+    }
+
+    #[test]
+    fn inside_pepper_a_video_plays_over_its_post_and_goes_under_a_popup_or_with_its_post() {
+        let mut app = test_app("feed-video-pepper");
+        let none = KeyModifiers::NONE;
+        app.pepper = Some(Pepper {
+            port: "x.1".into(),
+            play: "/nonexistent/pepper-play".into(),
+        });
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            vec![video_post(1), post(2, serde_json::json!({}))],
+            false,
+        );
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(sent_with(&app, "download")[0]["file_id"], 7);
+        assert!(app.opening.is_empty(), "not handed to another app");
+        assert!(
+            screen(&mut app)
+                .iter()
+                .any(|r| r.contains("video loading…"))
+        );
+        assert_eq!(
+            app.video_placement(),
+            "",
+            "nothing to show while it downloads"
+        );
+        // As if pepper-play started on the downloaded file.
+        let playing = app.playing.as_mut().unwrap();
+        let token = playing.token.clone();
+        assert_eq!(token.len(), 32);
+        playing.player = Some(Player::pretend(&token, Path::new("/data/7.mp4"), None, 1));
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("video playing")),
+            "{rows:#?}"
+        );
+        let area = app.video_box.expect("its post is in view");
+        assert_eq!(app.video_placement(), pepper::place(&token, area));
+        assert_eq!(app.video_placement(), "", "said once");
+        // Its seek bar, under it, once pepper-play says where it is.
+        app.on_player(PlayerEvent::Duration {
+            play: 1,
+            seconds: 15.0,
+        });
+        app.on_player(PlayerEvent::Position {
+            play: 1,
+            seconds: 6.0,
+        });
+        // News of another playback is old news.
+        app.on_player(PlayerEvent::Position {
+            play: 9,
+            seconds: 1.0,
+        });
+        let rows = screen(&mut app);
+        let under = &rows[usize::from(area.bottom())];
+        // A video this narrow gets the times alone (`ui::feed::seek_bar`).
+        assert!(under.contains("0:06") && under.contains("0:15"), "{under}");
+        // `,` and `.` jump back and on.
+        press(&mut app, KeyCode::Char(','), none);
+        press(&mut app, KeyCode::Char('.'), none);
+        let sent = app
+            .playing
+            .as_ref()
+            .unwrap()
+            .player
+            .as_ref()
+            .unwrap()
+            .sent
+            .clone();
+        let seeks: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("\"seek\""))
+            .cloned()
+            .collect();
+        assert!(
+            seeks[0].contains(r#"["seek",-5,"relative+exact"]"#),
+            "{seeks:?}"
+        );
+        assert!(
+            seeks[1].contains(r#"["seek",5,"relative+exact"]"#),
+            "{seeks:?}"
+        );
+        press(&mut app, KeyCode::Char(' '), none);
+        let sent = app
+            .playing
+            .as_ref()
+            .unwrap()
+            .player
+            .as_ref()
+            .unwrap()
+            .sent
+            .clone();
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains(r#"["cycle","pause"]"#))
+        );
+        assert!(screen(&mut app).iter().any(|r| r.contains("video paused")));
+        // A popup over it takes the box away until it closes.
+        press(&mut app, KeyCode::Char('?'), none);
+        screen(&mut app);
+        assert_eq!(app.video_placement(), pepper::remove(&token));
+        press(&mut app, KeyCode::Esc, none);
+        screen(&mut app);
+        assert_eq!(app.video_placement(), pepper::place(&token, area));
+        // Its post left, it stops.
+        press(&mut app, KeyCode::Char('j'), none);
+        assert!(app.playing.is_none());
+        screen(&mut app);
+        assert_eq!(app.video_placement(), pepper::remove(&token));
+        // A player that can't start says why.
+        press(&mut app, KeyCode::Char('k'), none);
+        press(&mut app, KeyCode::Enter, none);
+        app.on_meta(MetaEvent::Downloaded {
+            file_id: 7,
+            path: Some("/data/7.mp4".into()),
+        });
+        assert!(app.playing.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .contains("Can't play the video")
+        );
+    }
+
+    #[test]
+    fn a_video_whose_sound_comes_apart_plays_once_both_are_downloaded_or_without_it() {
+        let mut app = test_app("feed-video-sound");
+        let none = KeyModifiers::NONE;
+        app.pepper = Some(Pepper {
+            port: "x.1".into(),
+            play: "/nonexistent/pepper-play".into(),
+        });
+        open_the_feed(&mut app);
+        let dash = post(
+            1,
+            serde_json::json!({"media": [{"kind": "video", "file_id": 7, "audio": 9,
+                "duration": 15, "thumbnail": {"file_id": 8, "width": 1080, "height": 1920}}]}),
+        );
+        let unplayable = post(
+            2,
+            serde_json::json!({"media": [{"kind": "video", "file_id": 0,
+                "thumbnail": {"file_id": 10, "width": 1080, "height": 1920}}]}),
+        );
+        feed_page(&mut app, vec![dash, unplayable], false);
+        press(&mut app, KeyCode::Enter, none);
+        let asked: Vec<i64> = sent_with(&app, "download")
+            .iter()
+            .filter_map(|p| p["file_id"].as_i64())
+            .collect();
+        assert_eq!(asked, [7, 9], "the picture and its sound");
+        let downloaded = |app: &mut App, file_id, path: Option<&str>| {
+            app.on_meta(MetaEvent::Downloaded {
+                file_id,
+                path: path.map(String::from),
+            })
+        };
+        downloaded(&mut app, 7, Some("/data/7.mp4"));
+        assert!(
+            app.playing.is_some() && app.status.is_none(),
+            "waits for its sound"
+        );
+        downloaded(&mut app, 9, Some("/data/9.m4a"));
+        // pepper-play isn't there in tests: trying it says so.
+        assert!(app.playing.is_none());
+        assert!(app.status.take().unwrap().contains("Can't play the video"));
+        // A sound that doesn't come: the picture plays without it.
+        press(&mut app, KeyCode::Enter, none);
+        downloaded(&mut app, 9, None);
+        assert!(app.status.take().unwrap().contains("sound didn't download"));
+        assert!(app.playing.as_ref().is_some_and(|p| p.audio.is_none()));
+        downloaded(&mut app, 7, Some("/data/7.mp4"));
+        assert!(app.status.take().unwrap().contains("Can't play the video"));
+        // A video that can't be had shows its post, and says where to watch it.
+        press(&mut app, KeyCode::Char('j'), none);
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.playing.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .contains("o opens it on instagram.com")
+        );
+    }
+
+    #[test]
+    fn a_feed_photo_shows_in_the_viewer_where_h_and_l_go_through_carousels_and_posts() {
+        let mut app = test_app("feed-viewer");
+        let none = KeyModifiers::NONE;
+        open_the_feed(&mut app);
+        let carousel = post(
+            1,
+            serde_json::json!({"media": [{"kind": "photo", "file_id": 11},
+                {"kind": "photo", "file_id": 13}]}),
+        );
+        feed_page(
+            &mut app,
+            vec![carousel, post(2, serde_json::json!({}))],
+            false,
+        );
+        assert!(screen(&mut app).iter().any(|r| r.contains("1/2 ●○")));
+        press(&mut app, KeyCode::Char(']'), none);
+        assert!(screen(&mut app).iter().any(|r| r.contains("2/2 ○●")));
+        press(&mut app, KeyCode::Char('['), none);
+        press(&mut app, KeyCode::Enter, none);
+        let shown = |app: &App| app.photo_view.as_ref().map(|v| v.photo.file_id);
+        assert_eq!(shown(&app), Some(11));
+        assert_eq!(app.photo_view.as_ref().unwrap().chat_id, FEED);
+        press(&mut app, KeyCode::Char('l'), none);
+        assert_eq!(shown(&app), Some(13));
+        press(&mut app, KeyCode::Char('l'), none);
+        assert_eq!(shown(&app), Some(20));
+        assert_eq!(app.feed.as_ref().unwrap().selected, 1);
+        press(&mut app, KeyCode::Char('l'), none);
+        assert_eq!(shown(&app), Some(20));
+        assert!(app.status.as_ref().unwrap().contains("No more photos"));
+        press(&mut app, KeyCode::Char('h'), none);
+        assert_eq!(shown(&app), Some(13));
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.photo_view.is_none() && app.feed.is_some());
+    }
+
+    /// A comment as the helper sends it.
+    fn comment(id: i64, fields: serde_json::Value) -> CommentInfo {
+        let mut c = serde_json::json!({"id": id, "author": {"name": "Sam Rivera",
+            "username": "sam.climbs"}, "date": unix_now(), "text": format!("comment {id}")});
+        if let (Some(c), Some(fields)) = (c.as_object_mut(), fields.as_object()) {
+            for (key, value) in fields {
+                c.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::from_value(c).unwrap()
+    }
+
+    /// The comments page the popup waits for comes.
+    fn comments_page(app: &mut App, comments: Vec<CommentInfo>, more: bool) {
+        let popup = app.comments.as_ref().unwrap();
+        let (load, _) = popup.loading.expect("a load on its way");
+        let post_id = popup.post_id;
+        app.on_meta(MetaEvent::Comments {
+            post_id,
+            load,
+            page: Ok((comments, more)),
+        });
+    }
+
+    #[test]
+    fn c_shows_a_posts_comments_beside_it_while_its_video_plays_on() {
+        let mut app = test_app("feed-comments");
+        let none = KeyModifiers::NONE;
+        app.pepper = Some(Pepper {
+            port: "x.1".into(),
+            play: "/nonexistent/pepper-play".into(),
+        });
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            vec![post(1, serde_json::json!({})), video_post(2)],
+            false,
+        );
+        press(&mut app, KeyCode::Char('j'), none);
+        // Its video playing, as if pepper-play started.
+        press(&mut app, KeyCode::Enter, none);
+        let playing = app.playing.as_mut().unwrap();
+        let token = playing.token.clone();
+        playing.player = Some(Player::pretend(&token, Path::new("/data/7.mp4"), None, 1));
+        screen_of(&mut app, 160);
+        app.video_placement();
+
+        press(&mut app, KeyCode::Char('c'), none);
+        let asked = sent_with(&app, "load_comments");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            (asked[0]["post_id"].as_i64(), asked[0]["more"].as_bool()),
+            (Some(2), Some(false))
+        );
+        assert!(asked[0].get("replies_of").is_none());
+        assert!(app.comments_focus && !app.popup_over_chat());
+        let rows = screen_of(&mut app, 160);
+        let pane = rows[0]
+            .find("Comments · @alice.example")
+            .expect("the pane's title");
+        // The video stays, beside the pane: moved, not taken away.
+        let area = app.video_box.expect("the post is still in view");
+        assert_eq!(app.video_placement(), pepper::place(&token, area));
+        assert!(usize::from(area.right()) < rows[0][..pane].chars().count());
+        assert!(!app.playing.as_ref().unwrap().paused, "it plays on");
+        // Space pauses it from the comments too.
+        press(&mut app, KeyCode::Char(' '), none);
+        assert!(app.playing.as_ref().unwrap().paused);
+        // Enter while the page loads says so, and asks for nothing.
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.status.take().unwrap().contains("Still loading"));
+        comments_page(
+            &mut app,
+            vec![
+                comment(10, serde_json::json!({})),
+                comment(11, serde_json::json!({"replies": 2})),
+            ],
+            false,
+        );
+        let rows = screen_of(&mut app, 160);
+        assert!(rows.iter().any(|r| r.contains("comment 10")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("View 2 replies")),
+            "{rows:#?}"
+        );
+        // `j` moves through the comments, not the posts.
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(app.feed.as_ref().unwrap().selected, 1);
+        press(&mut app, KeyCode::Enter, none);
+        let asked = sent_with(&app, "load_comments");
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1]["replies_of"], 11);
+        comments_page(
+            &mut app,
+            vec![comment(20, serde_json::json!({"text": "a reply"}))],
+            false,
+        );
+        assert!(
+            screen_of(&mut app, 160)
+                .iter()
+                .any(|r| r.contains("a reply"))
+        );
+        press(&mut app, KeyCode::Enter, none);
+        assert!(
+            !screen_of(&mut app, 160)
+                .iter()
+                .any(|r| r.contains("a reply")),
+            "hidden again"
+        );
+        // `h` to the post and `l` back; another post closes them.
+        press(&mut app, KeyCode::Char('h'), none);
+        assert!(!app.comments_focus && app.comments.is_some());
+        assert_eq!(app.focus, Focus::Messages, "the post, not the chat list");
+        press(&mut app, KeyCode::Char('l'), none);
+        assert!(app.comments_focus);
+        press(&mut app, KeyCode::Char('h'), none);
+        press(&mut app, KeyCode::Char('k'), none);
+        assert!(app.comments.is_none() && !app.comments_focus);
+        assert!(app.playing.is_none(), "its post left, the video stops");
+        // `c` again, then Esc, closes them.
+        press(&mut app, KeyCode::Char('c'), none);
+        assert!(app.comments.is_some());
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.comments.is_none() && app.feed.is_some());
+        // An answer for comments closed is dropped.
+        app.on_meta(MetaEvent::Comments {
+            post_id: 1,
+            load: 1,
+            page: Ok((vec![comment(30, serde_json::json!({}))], false)),
+        });
+        assert!(app.comments.is_none());
+        // Leaving the feed closes them too.
+        press(&mut app, KeyCode::Char('c'), none);
+        let chat = app
+            .chats
+            .ids()
+            .iter()
+            .copied()
+            .find(|&id| id != FEED)
+            .unwrap();
+        app.open_chat(chat);
+        assert!(app.comments.is_none());
+    }
+
+    #[test]
+    fn o_opens_the_post_on_instagram_and_y_copies_its_link() {
+        let mut app = test_app("feed-link");
+        open_the_feed(&mut app);
+        feed_page(&mut app, vec![post(1, serde_json::json!({}))], false);
+        assert_eq!(
+            app.feed_link().map(|l| l.url).as_deref(),
+            Some("https://www.instagram.com/p/ABC/")
+        );
+        assert!(
+            app.confirm.is_none(),
+            "an instagram.com link opens without asking"
+        );
+    }
+
+    #[test]
+    fn the_feed_and_its_row_go_once_instagram_is_logged_out_of() {
+        let mut app = test_app("feed-logout");
+        open_the_feed(&mut app);
+        feed_page(&mut app, vec![post(1, serde_json::json!({}))], false);
+        app.on_meta(MetaEvent::Account {
+            network: Network::Instagram,
+            state: AccountState::LoggedOut,
+            user_id: None,
+            name: None,
+            error: None,
+        });
+        assert!(app.feed.is_none() && app.feed_kept.is_none());
+        assert_eq!(app.focus, Focus::Chats);
+        app.chats.refresh();
+        assert!(app.chats.get(FEED).is_none());
+    }
+
+    #[test]
+    fn a_chat_opened_from_the_feed_keeps_the_feed_to_come_back_to() {
+        let mut app = test_app("feed-kept");
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            (1..=3).map(|i| post(i, serde_json::json!({}))).collect(),
+            false,
+        );
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let chat = app
+            .chats
+            .ids()
+            .iter()
+            .copied()
+            .find(|&id| id != FEED)
+            .unwrap();
+        app.open_chat(chat);
+        assert!(app.feed.is_none() && app.open.is_some());
+        // Ctrl-o comes back to it as it was.
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let feed = app.feed.as_ref().expect("back to the feed");
+        assert_eq!((feed.posts.len(), feed.selected), (3, 1));
+        assert_eq!(sent_with(&app, "load_feed").len(), 1, "not loaded again");
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::CONTROL);
+        assert_eq!(app.open.as_ref().map(|o| o.chat_id), Some(chat));
     }
 }

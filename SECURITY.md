@@ -14,7 +14,10 @@ Anything another Messenger or Instagram user, or a file, link or folder tuimeta 
 - messages marked read, or typing shown, while you're away;
 - your session cookies or encrypted-chat keys read, logged, replaced or left where another account can reach them;
 - files sent that you didn't pick;
-- the helper fetching a URL from a message, or sending anything the app didn't ask for.
+- the helper fetching a URL from a message, or sending anything the app didn't ask for;
+- a post, comment, caption or name in Instagram's feed that does any of the above, passes for another account, or opens something without asking;
+- the feed telling Instagram what you looked at or watched, or liking, commenting or following on its own;
+- Pepper's player (`pepper-play`) being made to play anything but the file tuimeta downloaded, to fetch something, or to draw where tuimeta didn't place it.
 
 Bugs in mautrix-meta or whatsmeow themselves belong at <https://github.com/mautrix/meta> and <https://github.com/tulir/whatsmeow>.
 

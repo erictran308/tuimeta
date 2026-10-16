@@ -138,6 +138,53 @@ What goes to Instagram without tuimeta asking, and why it's kept:
   stays unread.
 - Answering a message request accepts it first
   (`useIGDirectAcceptMessageRequestMutation`), as Instagram requires.
+- The home feed (`load_feed`) is the one request instagram.com's home page
+  makes for it: `POST https://www.instagram.com/api/v1/feed/timeline/`, a
+  page at a time, with the session's cookies and `ig_did` as `device_id`,
+  the four `is_async_ads_*`/`rti_delivery_backend` fields at `0`, and from
+  the second page on `max_id` (the page before's `next_max_id`). The web
+  client also sends `seen_posts` and `feed_view_info`, which tell Instagram
+  what you scrolled past and for how long; the helper never does, nor any
+  view, impression or video-play logging, and it never likes, follows or
+  comments. Requests are at least 2 s apart, so a key held down can't page
+  faster than anyone scrolls, and a load asks for at most three pages (only
+  while the ones before had nothing to show). Ads are left out, and so are
+  rows that aren't posts (suggested people, stories, "you're all caught
+  up"); a paid partnership (`sponsor_tags`) is a post of someone followed,
+  not an ad, and stays. Instagram's "Suggested for you" posts don't come as
+  `media_or_ad` items but inside other rows (`explore_story`, units of
+  several reels), whose shape isn't documented: a row is searched for media
+  dicts at most three levels down (`media_or_ad`, `media`, `clips_item`,
+  `clip`, `item` first, then any field, lists too), at most 20 a row, and
+  each found is a post marked `suggested` (ads among them still left out).
+  Rows of people to follow, stories, tags and the end mark aren't searched.
+  The feed's files (pictures about 1080 px wide, videos about 720 px wide
+  rather than the largest) download only on `download`, from the CDNs
+  below, and stay with the other downloads; the posts and comments themselves
+  are kept only in memory, for the run. A video
+  comes from `video_versions` (one file, picture and sound) or, when the web
+  feed sends only a DASH manifest (`video_dash_manifest`, read only up to
+  256 KiB, with Go's XML reader, which fetches nothing), as two files: the
+  picture nearest 720 px wide and the sound of the highest bandwidth, each
+  a representation's whole `BaseURL` on the CDN, as yt-dlp downloads them.
+  A video with neither still comes, with no file, so its cover shows.
+  `helper.log` counts, per page, the videos by where their file came from,
+  the posts left out, and the rows that weren't `media_or_ad`, as
+  `name=rows/rows with posts`, by the row's field name when it reads as
+  one of Instagram's (lower case, digits and `_`, up to 40), at most eight
+  names a line, the rest as `other`; nothing of the posts themselves.
+- A post's comments (`load_comments`) are the requests its page on
+  instagram.com makes, GETs from that page (its address as the referer):
+  `/api/v1/media/<media pk>/comments/?can_support_threading=true&permalink_enabled=false`,
+  with `min_id` (the page before's `next_min_id`) or else `max_id` (its
+  `next_max_id`) for later pages, and a comment's replies
+  `/api/v1/media/<media pk>/comments/<comment pk>/child_comments/`, with
+  `max_id` (`next_max_child_cursor`) for later ones. Only numbers go into
+  those addresses. They only read: nothing is liked, written or marked
+  seen, and they share the feed's lock and its 2 s gap, so going back and
+  forth between the feed and comments pages no faster than either. The
+  preview replies inside a comment are never read; replies come only when
+  asked for. `helper.log` says how many came, never who wrote them or what.
 
 instameow itself sends no presence, "active now", foreground or app state,
 and registers no push; it marks nothing read and sends no typing on its own
@@ -473,6 +520,22 @@ its `search` finds them by either. Pictures are PNGs drawn by
 `internal/fake/draw.go`; the video and voice files are headers with nothing
 playable after them.
 
+Instagram also has a home feed (`load_feed`): 30 posts over the past week,
+ten a page, from its people and two pages only the feed knows (one
+verified), with single photos, a carousel of three photos, a carousel of a
+photo and a video, reels, a post without a caption, one with a caption of
+many lines and one with its likes hidden. A feed video is a two-second
+animated GIF the helper draws (`image/gif`, saved as `.gif`), which a player
+plays as a video, with a PNG of its first frame as its cover. One reel has
+its sound apart (`audio`), as a DASH video's is: a quiet two-second 440 Hz
+tone in a WAV file (`audio/wav`, saved as `.wav`). Every fourth post (ids 4,
+8, …) is `suggested`, from pages the account doesn't know. Each post has as many
+comments as it says (at most 40, ten a page) from the feed's people and
+pages, one of them verified, among them a comment of several lines and one
+with a mention and a tag; every fourth has replies (up to 12, five a page),
+oldest first. The same post gives the same comments every run. Messenger
+and WhatsApp answer `load_feed` with `unsupported`.
+
 Logging in takes any cookies with the required names (`c_user=1; xs=2;
 datr=3`, or `sessionid`, `ds_user_id` and `csrftoken` for Instagram), parsed
 as real ones are. WhatsApp links instead: `login_link` shows a QR code
@@ -531,6 +594,16 @@ A network that logs in by linking a device (WhatsApp) also implements
 `CancelLink()`); the server sends it `login_link` and `cancel_login`, and
 refuses `login_cookies` for it. `backend.PhoneDigits` reads a phone number in
 international form.
+
+A network with a home feed (Instagram) implements `backend.Feeder`
+(`LoadFeed(ctx, limit, fresh)`, the next posts and whether there are more,
+with post ids it keeps for the run); the server lines its `load_feed` calls
+up one at a time in the order they came, apart from its `load_chats`, and
+answers `unsupported` for a network without one. If its posts have
+comments it also implements `backend.Commenter` (`LoadComments(ctx, post,
+repliesOf, more)`); the server keeps which network gave each post, sends
+`load_comments` only there (a post no `load_feed` gave is `not_found`),
+and lines those calls up the same way.
 
 A backend is given `backend.Deps`:
 

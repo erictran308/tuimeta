@@ -89,6 +89,50 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Instagram feed",
+        &[
+            ("j / k", "Next / previous post"),
+            ("gg / G", "First / last post loaded"),
+            ("Ctrl-d / Ctrl-u", "Three posts down / up"),
+            ("[ / ]", "The photo or video before / after in a carousel"),
+            (
+                "Enter",
+                "Show the photo, or play the video (inside Pepper; elsewhere in your player)",
+            ),
+            ("Space / m", "Pause / mute the video playing"),
+            (", / .", "Back / on 5 seconds in the video playing"),
+            ("o", "Open the post on instagram.com, to like or comment"),
+            ("y", "Copy the post's link"),
+            ("r", "Reload: the newest posts"),
+            (
+                "c",
+                "The post's comments, in a pane beside it (again to close)",
+            ),
+            ("l", "Over to the comments pane, while it's open"),
+            ("Esc", "Stop the video, or go back"),
+        ],
+    ),
+    (
+        "Comments",
+        &[
+            ("j / k", "Next / previous comment"),
+            ("g / G", "First / last loaded"),
+            (
+                "Enter",
+                "Show or hide a comment's replies; on a reply, more of them",
+            ),
+            ("y", "Copy the comment"),
+            ("o", "Open the post on instagram.com, to answer there"),
+            (
+                "Space / m",
+                "Pause / mute the post's video, playing beside them",
+            ),
+            (", / .", "Back / on 5 seconds in it"),
+            ("h", "Back to the post"),
+            ("Esc / c", "Close them"),
+        ],
+    ),
+    (
         "Writing",
         &[
             ("Enter", "Send, or save the edit"),
@@ -114,7 +158,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "Photo viewer",
         &[
-            ("h / l", "The photo before / after it in the chat"),
+            (
+                "h / l",
+                "The photo before / after it in the chat or the feed",
+            ),
             (
                 "j / k",
                 "Zoom in / out (also + / -), up to filling the window",
