@@ -25,6 +25,19 @@ func feedLimit(n int) int {
 	return min(n, MaxFeedLimit)
 }
 
+// MaxBoxSide is the most a side of load_feed's box counts as, in pixels:
+// past any screen's width.
+const MaxBoxSide = 8192
+
+// feedBox is load_feed's width and height as a box; none unless both are
+// above 0.
+func feedBox(width, height int) backend.Box {
+	if width <= 0 || height <= 0 {
+		return backend.Box{}
+	}
+	return backend.Box{Width: min(width, MaxBoxSide), Height: min(height, MaxBoxSide)}
+}
+
 // turns lets one network's feed loads through one at a time, in the order
 // they were asked. Each request is served on its own goroutine, which may
 // start after a later one's, so the place in line is taken while requests
@@ -104,6 +117,8 @@ func (s *Server) loadFeed(c *call) (any, error) {
 		Network string `json:"network"`
 		Limit   int    `json:"limit"`
 		Fresh   bool   `json:"fresh"`
+		Width   int    `json:"width"`
+		Height  int    `json:"height"`
 	}](c.params)
 	if err != nil {
 		return nil, err
@@ -119,7 +134,7 @@ func (s *Server) loadFeed(c *call) (any, error) {
 	if err := s.ready(n); err != nil {
 		return nil, err
 	}
-	posts, more, err := f.LoadFeed(c.ctx, feedLimit(p.Limit), p.Fresh)
+	posts, more, err := f.LoadFeed(c.ctx, feedLimit(p.Limit), p.Fresh, feedBox(p.Width, p.Height))
 	if err != nil {
 		return nil, err
 	}

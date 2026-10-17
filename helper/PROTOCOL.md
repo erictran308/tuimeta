@@ -234,10 +234,14 @@ pages the account follows, in the order the network puts them.
   Instagram allows, longer ones cut.
 - Each `media` is a `photo` or a `video` (a reel too). For a photo,
   `file_id` is the picture about 1080 px wide (the smallest at least that
-  wide, else the largest) and `thumbnail` the same file. For a video,
-  `file_id` is the video (`mime` `video/mp4`), the version about 720 px wide
-  rather than the largest, to keep downloads small, `duration` its length,
-  and `thumbnail` its cover picture, about 1080 px wide. The video comes
+  wide, else the largest), for the photo viewer, and `thumbnail` the one
+  the feed draws: the smallest version that fills the box `load_feed`
+  named without being enlarged (at least `width` wide or `height` tall),
+  else the largest, but never one wider than `file_id`'s; without a box,
+  the same file as `file_id`. For a video, `file_id` is the video (`mime`
+  `video/mp4`), the version about 720 px wide rather than the largest, to
+  keep downloads small, `duration` its length, and `thumbnail` its cover
+  picture, picked as a photo's `thumbnail` is. The video comes
   from the media's `video_versions`, whole files with their sound; without
   any, from its DASH manifest (`video_dash_manifest`): the picture
   representation about 720 px wide as `file_id` and the sound as `audio`,
@@ -321,7 +325,7 @@ A comment on a post of the feed, or a reply to one (`load_comments`).
 | `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. On WhatsApp: the contacts and groups this device knows, and, for a query that is a phone number written with `+` and its country code, that number if it's on WhatsApp. |
 | `open_dm` | `network`, `user_id` | `{"chat_id": i64}`: the chat with that person, made if needed. |
 | `mute` | `chat_id`, `muted` | `{}` |
-| `load_feed` | `network`, `limit`, `fresh?` | `{"posts": [Post], "has_more": bool}`: the next posts of the account's home feed, about `limit` of them (the network gives pages of its own size, so fewer or more can come), after those already given. `fresh: true` starts again from the top, as pulling the feed down does: the newest posts, whatever was loaded before. Suggested posts come too, marked `suggested`; ads are left out. A network's loads run one at a time, in the order asked. Only Instagram has one: Messenger and WhatsApp answer `unsupported`. Errors: `not_logged_in`, `network`, `checkpoint`. |
+| `load_feed` | `network`, `limit`, `fresh?`, `width?`, `height?` | `{"posts": [Post], "has_more": bool}`: the next posts of the account's home feed, about `limit` of them (the network gives pages of its own size, so fewer or more can come), after those already given. `fresh: true` starts again from the top, as pulling the feed down does: the newest posts, whatever was loaded before. `width` and `height` are the largest box, in pixels, tuimeta draws a post's picture in, so each `thumbnail` is no bigger than it needs to be (see Post); without both above 0 there's no box, and a side past 8192 counts as 8192. Suggested posts come too, marked `suggested`; ads are left out. A network's loads run one at a time, in the order asked. Only Instagram has one: Messenger and WhatsApp answer `unsupported`. Errors: `not_logged_in`, `network`, `checkpoint`. |
 | `load_comments` | `post_id`, `replies_of?`, `more?` | `{"comments": [Comment], "has_more": bool}`: the comments on a post that `load_feed` gave, a page at a time, in the network's order (the post's page shows its top comments first). Without `more`, the first page, again if asked again; with `more: true`, the page after the last one given. With `replies_of` (a `comment_id`), that comment's replies instead, oldest first, paged the same way. A post's loads run one at a time, in the order asked. Errors: `not_found` (a post or comment this run didn't give), `not_logged_in`, `network`, `checkpoint`. |
 
 `send_text` and `send_files` first send a `message` event for each new

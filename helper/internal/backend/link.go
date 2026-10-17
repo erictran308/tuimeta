@@ -33,8 +33,16 @@ type Feeder interface {
 	// LoadFeed is the next posts of the feed, after those it gave since the
 	// last fresh load (or login), and whether more remain. limit is a hint:
 	// the network gives pages of its own size. fresh starts again from the
-	// newest posts. It never tells the network what was looked at.
-	LoadFeed(ctx context.Context, limit int, fresh bool) (posts []proto.Post, more bool, err error)
+	// newest posts. box is what each picture is drawn in, so its thumbnail
+	// is no bigger than that needs. It never tells the network what was
+	// looked at.
+	LoadFeed(ctx context.Context, limit int, fresh bool, box Box) (posts []proto.Post, more bool, err error)
+}
+
+// Box is the largest box, in pixels, tuimeta draws a post's picture in
+// (load_feed's width and height); zero when it didn't say.
+type Box struct {
+	Width, Height int
 }
 
 // Commenter is a network whose feed's posts have comments (Instagram): the

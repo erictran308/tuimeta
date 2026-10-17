@@ -6,7 +6,7 @@
 
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -15,7 +15,7 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
 use super::{border, bordered, truncate};
-use crate::feed::{Feed, Item, Post};
+use crate::feed::{self, Feed, Item, Post};
 use crate::images::Images;
 use crate::messages::{Preview, duration};
 use crate::theme::Colors;
@@ -92,17 +92,13 @@ pub fn draw(
     }
     // A bar and a space on the left, a space on the right, in a column no
     // wider than MAX_POST_COLS, centered.
-    let width = inner.width.saturating_sub(3).min(MAX_POST_COLS);
+    let (width, max_rows) = media_room(inner);
     let column = Rect {
         x: inner.x + inner.width.saturating_sub(width + 3) / 2,
         width: (width + 3).min(inner.width),
         ..inner
     };
     let font = images.font_size();
-    let max_rows = inner
-        .height
-        .saturating_sub(FRAME_ROWS + CAPTION_LINES as u16)
-        .max(MIN_MEDIA_ROWS);
     let layout = |feed: &Feed, i: usize| {
         let post = &feed.posts[i];
         let item = post.media.get(feed.shown_index(post));
@@ -205,6 +201,13 @@ pub fn draw(
         y = y.saturating_add(total);
         i += 1;
     }
+    // The next posts' photos download before they're in view (feed::AHEAD).
+    for post in feed.posts.iter().skip(feed.selected + 1).take(feed::AHEAD) {
+        let item = post.media.get(feed.shown_index(post));
+        if let Some(still) = item.and_then(|it| it.still.as_ref()) {
+            images.prefetch(still);
+        }
+    }
     if i == feed.posts.len() && y < inner.height {
         let end = match (&feed.error, feed.loading.is_some(), feed.has_more) {
             (_, true, _) => Some("Loading more…".to_string()),
@@ -223,6 +226,29 @@ pub fn draw(
         }
     }
     video_box
+}
+
+/// The room a post's photo has inside the feed's pane `inner`: the columns
+/// it may be wide and the rows it may be tall.
+fn media_room(inner: Rect) -> (u16, u16) {
+    let width = inner.width.saturating_sub(3).min(MAX_POST_COLS);
+    let rows = inner
+        .height
+        .saturating_sub(FRAME_ROWS + CAPTION_LINES as u16)
+        .max(MIN_MEDIA_ROWS);
+    (width, rows)
+}
+
+/// The largest box, in pixels, a post's picture is drawn in when the feed
+/// takes `area` (inside its border), so `load_feed` sends no bigger one
+/// than that needs. `None` before anything was drawn there.
+pub fn picture_box(area: Rect, font: FontSize) -> Option<(u32, u32)> {
+    let (cols, rows) = media_room(area.inner(Margin::new(1, 1)));
+    let size = (
+        u32::from(cols) * u32::from(font.width),
+        u32::from(rows) * u32::from(font.height),
+    );
+    (size.0 > 0 && size.1 > 0).then_some(size)
 }
 
 /// `▌ Alice Example ✓ @alice.example · 3h`
@@ -475,6 +501,36 @@ fn draw_still(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_post_is_drawn_no_bigger_than_the_box_its_picture_is_asked_for_in() {
+        let font = FontSize::new(10, 20);
+        // Inside the border 68 × 28: 60 columns at most, and 28 rows less
+        // the author, the counts and two lines of caption.
+        let area = Rect::new(0, 0, 70, 30);
+        assert_eq!(picture_box(area, font), Some((600, 420)));
+        assert_eq!(picture_box(Rect::default(), font), None, "nothing drawn");
+        let photo = |width: u32, height: u32| Item {
+            video: false,
+            still: Some(Preview {
+                file_id: 1,
+                width,
+                height,
+                thumbnail: None,
+                sticker: false,
+            }),
+            file: None,
+            audio: None,
+            duration: 0,
+        };
+        for (w, h) in [(1080, 1350), (1080, 566), (1080, 1920)] {
+            let (cols, rows) = media_cells(Some(&photo(w, h)), 60, 21, font);
+            assert!(
+                u32::from(cols) * 10 <= 600 && u32::from(rows) * 20 <= 420,
+                "{w}×{h}"
+            );
+        }
+    }
 
     #[test]
     fn counts_and_times_read_as_instagram_writes_them() {

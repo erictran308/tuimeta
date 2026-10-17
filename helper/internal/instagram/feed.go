@@ -114,7 +114,7 @@ var _ backend.Feeder = (*Instagram)(nil)
 // LoadFeed is the next page of the home feed. limit is only a hint:
 // Instagram's pages are their own size, and a page isn't cut, since the
 // cursor has moved past it.
-func (b *Instagram) LoadFeed(ctx context.Context, _ int, fresh bool) ([]proto.Post, bool, error) {
+func (b *Instagram) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.Box) ([]proto.Post, bool, error) {
 	conn, err := b.waitReady(ctx)
 	if err != nil {
 		return nil, false, err
@@ -157,7 +157,7 @@ func (b *Instagram) LoadFeed(ctx context.Context, _ int, fresh bool) ([]proto.Po
 		f.more = page.more && page.next != ""
 		st := feedStats{rows: page.rows, ads: page.ads, unreadable: page.unreadable}
 		for i := range page.media {
-			p, ok := b.feedPost(f, &page.media[i], &st)
+			p, ok := b.feedPost(f, &page.media[i], box, &st)
 			if ok && !given[p.ID] {
 				given[p.ID] = true
 				posts = append(posts, p)
@@ -563,7 +563,7 @@ func rowAttrs(rows map[string]*rowCount) []hlog.Attr {
 // feedPost is the protocol's post of a media dict, registering its files;
 // false when there's nothing to show (no media on Instagram's CDN, no
 // address to open it at). f.mu is held.
-func (b *Instagram) feedPost(f *feedState, m *feedMedia, st *feedStats) (proto.Post, bool) {
+func (b *Instagram) feedPost(f *feedState, m *feedMedia, box backend.Box, st *feedStats) (proto.Post, bool) {
 	key := string(m.ID)
 	if key == "" {
 		key = string(m.Pk)
@@ -585,7 +585,7 @@ func (b *Instagram) feedPost(f *feedState, m *feedMedia, st *feedStats) (proto.P
 	}
 	var media []proto.Media
 	for _, it := range items {
-		if md, ok := b.feedMediaOf(it, st); ok {
+		if md, ok := b.feedMediaOf(it, box, st); ok {
 			media = append(media, md)
 		}
 	}
@@ -630,28 +630,37 @@ func (b *Instagram) feedPost(f *feedState, m *feedMedia, st *feedStats) (proto.P
 }
 
 // feedMediaOf is one photo or video of a post. A photo needs its picture
-// on Instagram's CDN. A video's file is its progressive version (picture
-// and sound together) about videoWidth wide, else its DASH picture (with
-// its sound apart, as audio, when there is one); with neither it still
-// comes, file 0, so its cover shows, unless it hasn't one either.
-func (b *Instagram) feedMediaOf(m *feedMedia, st *feedStats) (proto.Media, bool) {
-	var cover *proto.Image
+// on Instagram's CDN: the one about photoWidth wide is its file, for the
+// viewer, and its thumbnail is what the feed draws, no bigger than box
+// needs (drawnIn). A video's file is its progressive version (picture and
+// sound together) about videoWidth wide, else its DASH picture (with its
+// sound apart, as audio, when there is one); with neither it still comes,
+// file 0, so its cover, picked as a photo's thumbnail is, shows, unless it
+// hasn't one either.
+func (b *Instagram) feedMediaOf(m *feedMedia, box backend.Box, st *feedStats) (proto.Media, bool) {
+	video := m.MediaType == 2 || (m.MediaType != 1 && (len(m.Videos) > 0 || m.DashManifest != ""))
+	var full, cover *proto.Image
 	stillURL := ""
 	w, h := int(m.Width), int(m.Height)
 	if still, ok := atLeast(m.Images.Candidates, photoWidth); ok {
-		cover = b.feedFile(still.URL, "feed-still", proto.Photo, int(still.Width), int(still.Height))
+		drawn := drawnIn(m.Images.Candidates, box, still)
+		cover = b.feedFile(drawn.URL, "feed-still", proto.Photo, int(drawn.Width), int(drawn.Height))
+		full = cover
+		// A video's cover is only drawn: no larger one for the viewer.
+		if !video && drawn.URL != still.URL {
+			full = b.feedFile(still.URL, "feed-still", proto.Photo, int(still.Width), int(still.Height))
+		}
 		stillURL = still.URL
 		if w <= 0 || h <= 0 {
 			w, h = int(still.Width), int(still.Height)
 		}
 	}
-	video := m.MediaType == 2 || (m.MediaType != 1 && (len(m.Videos) > 0 || m.DashManifest != ""))
 	if !video {
-		if cover == nil {
+		if full == nil || cover == nil {
 			return proto.Media{}, false
 		}
 		return proto.Media{
-			Kind: proto.Photo, FileID: cover.FileID, Thumbnail: cover,
+			Kind: proto.Photo, FileID: full.FileID, Thumbnail: cover,
 			Width: w, Height: h, Mime: mimeOf(stillURL, proto.Photo),
 		}, true
 	}
@@ -746,6 +755,34 @@ func atLeast(cs []feedCandidate, want int) (feedCandidate, bool) {
 		}
 	}
 	return best, found
+}
+
+// drawnIn is the narrowest candidate on the CDN, of most's shape, that
+// fills box without being enlarged (at least as wide or as tall), so the
+// feed downloads and decodes no more than it draws; most when there's no
+// box, or no narrower one fills it. Another shape would be a crop of the
+// picture.
+func drawnIn(cs []feedCandidate, box backend.Box, most feedCandidate) feedCandidate {
+	best := most
+	if box.Width <= 0 || box.Height <= 0 || most.Width <= 0 || most.Height <= 0 {
+		return best
+	}
+	for _, c := range cs {
+		if !onCDNURL(c.URL) || c.Width <= 0 || c.Height <= 0 || c.Width >= best.Width || !sameShape(c, most) {
+			continue
+		}
+		if int(c.Width) >= box.Width || int(c.Height) >= box.Height {
+			best = c
+		}
+	}
+	return best
+}
+
+// sameShape reports whether a's sides are b's in proportion, within the
+// rounding of a smaller version's (2%).
+func sameShape(a, b feedCandidate) bool {
+	across, down := float64(a.Width)*float64(b.Height), float64(a.Height)*float64(b.Width)
+	return math.Abs(across-down) <= 0.02*across
 }
 
 // nearest is the candidate on the CDN nearest want px wide, the narrower

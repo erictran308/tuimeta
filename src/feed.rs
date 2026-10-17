@@ -16,9 +16,10 @@ use crate::text;
 
 /// Posts asked for at a time.
 pub const PAGE: i32 = 10;
-/// Within this many posts of the last one loaded, the next page is asked
-/// for, so it's there by the time the cursor gets to the end.
-const LOAD_AHEAD: usize = 3;
+/// Posts after the selected one kept ready: within this many of the last
+/// one loaded, the next page is asked for, and their photos download before
+/// they're in view (`ui::feed::draw`), so moving on doesn't wait.
+pub const AHEAD: usize = 5;
 /// A caption is cut after this many characters, which is what Instagram
 /// allows.
 const MAX_CAPTION: usize = 2200;
@@ -241,7 +242,7 @@ impl Feed {
         self.has_more
             && self.loading.is_none()
             && self.error.is_none()
-            && self.selected + LOAD_AHEAD >= self.posts.len()
+            && self.selected + AHEAD >= self.posts.len()
     }
 
     /// The answer to load `load`. A fresh one takes the place of what was
@@ -470,25 +471,25 @@ pub(crate) mod tests {
         assert!(feed.on_page(
             first,
             Ok((
-                (1..=5).map(|i| post(i, serde_json::json!({}))).collect(),
+                (1..=7).map(|i| post(i, serde_json::json!({}))).collect(),
                 true
             ))
         ));
-        assert_eq!(feed.posts.len(), 5);
+        assert_eq!(feed.posts.len(), 7);
         feed.move_cursor(1);
         assert!(!feed.wants_more());
         feed.move_cursor(1);
-        assert!(feed.wants_more(), "within {LOAD_AHEAD} of the end");
+        assert!(feed.wants_more(), "within {AHEAD} of the end");
         let second = feed.start_load(false).unwrap();
         feed.on_page(
             second,
             Ok((
-                (4..=8).map(|i| post(i, serde_json::json!({}))).collect(),
+                (6..=10).map(|i| post(i, serde_json::json!({}))).collect(),
                 true,
             )),
         );
         let ids: Vec<i64> = feed.posts.iter().map(|p| p.id).collect();
-        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         // A fresh load drops the answer of the one before it.
         let stale = feed.start_load(false).unwrap();
         let fresh = feed.start_load(true).unwrap();

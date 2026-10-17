@@ -17,6 +17,7 @@ import (
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 
+	"github.com/erictran308/tuimeta/helper/internal/backend"
 	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/cookies"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
@@ -126,7 +127,7 @@ func feedHarness(t *testing.T, pages map[string][]byte) (*harness, *[]time.Time)
 
 func load(t *testing.T, h *harness, fresh bool) ([]proto.Post, bool) {
 	t.Helper()
-	posts, more, err := h.b.LoadFeed(context.Background(), 10, fresh)
+	posts, more, err := h.b.LoadFeed(context.Background(), 10, fresh, backend.Box{})
 	if err != nil {
 		t.Fatalf("LoadFeed: %v", err)
 	}
@@ -439,7 +440,7 @@ func TestFeedRequestsAreSpacedOut(t *testing.T) {
 	// Given up while it waits, a load asks for nothing.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, _, err := h.b.LoadFeed(ctx, 10, false); !errors.Is(err, context.DeadlineExceeded) || len(*at) != 3 {
+	if _, _, err := h.b.LoadFeed(ctx, 10, false, backend.Box{}); !errors.Is(err, context.DeadlineExceeded) || len(*at) != 3 {
 		t.Errorf("got %v after %d requests", err, len(*at))
 	}
 	if feedGap < 2*time.Second {
@@ -496,7 +497,7 @@ func TestAFeedRefusalSaysWhatToDo(t *testing.T) {
 			h.b.feed.gap = time.Millisecond
 			h.api.feed = func(string) ([]byte, error) { return c.body, c.err }
 			h.login(mailbox(t, "", false))
-			_, _, err := h.b.LoadFeed(context.Background(), 10, false)
+			_, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{})
 			var pe *proto.Error
 			if !errors.As(err, &pe) || pe.Code != c.want.Code || pe.Message != c.want.Message {
 				t.Errorf("got %v, want %v", err, c.want)
@@ -522,7 +523,7 @@ func TestAFeedRefusalSaysWhatToDo(t *testing.T) {
 		}
 		return feedPageJSON(false, ""), nil
 	}
-	if _, _, err := h.b.LoadFeed(context.Background(), 10, false); err == nil {
+	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}); err == nil {
 		t.Fatal("no error")
 	}
 	if _, more := load(t, h, false); more {
@@ -532,7 +533,7 @@ func TestAFeedRefusalSaysWhatToDo(t *testing.T) {
 
 func TestTheFeedNeedsTheAccountConnected(t *testing.T) {
 	h := newHarness(t)
-	if _, _, err := h.b.LoadFeed(context.Background(), 10, false); err != errNotConnected {
+	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}); err != errNotConnected {
 		t.Errorf("got %v", err)
 	}
 	if h.api.count("FeedTimeline") != 0 {
@@ -588,6 +589,59 @@ func TestCandidatesArePickedBySize(t *testing.T) {
 	}
 	if _, ok := atLeast([]feedCandidate{off}, photoWidth); ok {
 		t.Error("picked a picture off the CDN")
+	}
+}
+
+func TestTheFeedDrawsAPictureNoBiggerThanItsBoxAndTheViewerTheLargerOne(t *testing.T) {
+	h, _ := feedHarness(t, map[string][]byte{
+		"": feedPageJSON(true, "QVFDcursor1",
+			photoPost("3400000000000000001", "DAbcPhoto1", mayaFeed, `{"pk":"1","text":"hi"}`, ""),
+			reelPost("3400000000000000002", "DAbcReel02")),
+	})
+	posts, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{Width: 600, Height: 600})
+	if err != nil || len(posts) != 2 {
+		t.Fatalf("got %+v, %v", posts, err)
+	}
+	// 640×800 is the smallest that fills 600×600; the viewer's is still
+	// about 1080 wide.
+	pm := posts[0].Media[0]
+	if u := fileURL(t, h, pm.Thumbnail.FileID); !strings.Contains(u, "_640.jpg") || pm.Thumbnail.Width != 640 || pm.Thumbnail.Height != 800 {
+		t.Errorf("drawn %s %+v", u, pm.Thumbnail)
+	}
+	if u := fileURL(t, h, pm.FileID); !strings.Contains(u, "_1080.jpg") || pm.Width != 1440 {
+		t.Errorf("viewer's %s %+v", u, pm)
+	}
+	// A video's cover the same way: 540×960 is tall enough.
+	vm := posts[1].Media[0]
+	if u := fileURL(t, h, vm.Thumbnail.FileID); !strings.Contains(u, "c3400000000000000002_540.jpg") {
+		t.Errorf("cover %s", u)
+	}
+}
+
+func TestTheVersionDrawnIsTheSmallestThatFillsItsBox(t *testing.T) {
+	c := func(w, h int) feedCandidate {
+		return feedCandidate{Width: flexInt(w), Height: flexInt(h), URL: fmt.Sprintf("%s/v/%dx%d.jpg", cdn, w, h)}
+	}
+	most := c(1080, 1350)
+	cs := []feedCandidate{c(1440, 1800), most, c(750, 938), c(640, 800), c(320, 400), c(150, 188)}
+	for _, tc := range []struct {
+		box   backend.Box
+		width int
+	}{
+		{backend.Box{}, 1080},
+		{backend.Box{Width: 600, Height: 2000}, 640}, // as wide as the box
+		{backend.Box{Width: 2000, Height: 390}, 320}, // as tall
+		{backend.Box{Width: 100, Height: 100}, 150},
+		{backend.Box{Width: 2400, Height: 3000}, 1080}, // never past the viewer's
+	} {
+		if got := drawnIn(cs, tc.box, most); int(got.Width) != tc.width {
+			t.Errorf("in %v: %d", tc.box, got.Width)
+		}
+	}
+	// A square version is a crop, and one off the CDN isn't downloaded.
+	off := feedCandidate{Width: 640, Height: 800, URL: "https://evil.example/640.jpg"}
+	if got := drawnIn([]feedCandidate{most, c(640, 640), off}, backend.Box{Width: 600, Height: 600}, most); got != most {
+		t.Errorf("picked %+v", got)
 	}
 }
 

@@ -56,7 +56,7 @@ fn lock_spans(colors: &Colors) -> [Span<'static>; 2] {
 
 mod chat_list;
 mod comments;
-mod feed;
+pub(crate) mod feed;
 mod help;
 mod messages;
 mod viewer;
@@ -571,6 +571,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         }
     };
 
+    app.chat_area = chat_area;
     let list = chat_list::ChatList {
         chats: &app.chats,
         users: &app.users,

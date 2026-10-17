@@ -806,6 +806,9 @@ pub struct App {
     /// Where the last frame drew the playing video's post, for Pepper's
     /// box; `None` while it's out of view.
     pub video_box: Option<Rect>,
+    /// Where the last frame drew the open chat, or the feed in its place,
+    /// which a page of the feed is sized for (`ui::feed::picture_box`).
+    pub chat_area: Rect,
     /// What Pepper was last told about the box.
     placed: Option<Placed>,
     /// Counts playbacks, so news about one that ended is told apart.
@@ -903,6 +906,7 @@ impl App {
             pepper: None,
             playing: None,
             video_box: None,
+            chat_area: Rect::default(),
             placed: None,
             plays: 0,
             player_tx,
@@ -4049,6 +4053,7 @@ impl App {
         if self.feed.is_some() {
             return;
         }
+        let picture = self.feed_picture();
         self.leave_chat();
         let network = Network::Instagram;
         let feed = match self.feed_kept.take().filter(|f| f.network == network) {
@@ -4056,7 +4061,8 @@ impl App {
             None => {
                 let mut feed = Feed::new(network);
                 if let Some(load) = feed.start_load(false) {
-                    self.meta.load_feed(network, feed::PAGE, false, load);
+                    self.meta
+                        .load_feed(network, feed::PAGE, false, picture, load);
                 }
                 feed
             }
@@ -4147,24 +4153,35 @@ impl App {
     /// way. Only as the feed is read: loading all of it is what a script
     /// would do.
     fn load_more_feed(&mut self) {
+        let picture = self.feed_picture();
         let Some(feed) = self.feed.as_mut() else {
             return;
         };
         if feed.wants_more()
             && let Some(load) = feed.start_load(false)
         {
-            self.meta.load_feed(feed.network, feed::PAGE, false, load);
+            self.meta
+                .load_feed(feed.network, feed::PAGE, false, picture, load);
         }
     }
 
     /// `r`: the newest posts again.
     fn reload_feed(&mut self) {
+        let picture = self.feed_picture();
         let Some(feed) = self.feed.as_mut() else {
             return;
         };
         if let Some(load) = feed.start_load(true) {
-            self.meta.load_feed(feed.network, feed::PAGE, true, load);
+            self.meta
+                .load_feed(feed.network, feed::PAGE, true, picture, load);
         }
+    }
+
+    /// The largest box a post's picture is drawn in, in pixels, for
+    /// `load_feed`: photos that come no bigger than they're shown are
+    /// downloaded and decoded sooner, in less memory.
+    fn feed_picture(&self) -> Option<(u32, u32)> {
+        ui::feed::picture_box(self.chat_area, self.images.font_size())
     }
 
     /// A page of the feed came, or why it didn't. One for a feed left for
@@ -4598,7 +4615,8 @@ fn feed_photo(post_id: i64, item: &feed::Item) -> Option<PhotoView> {
             thumbnail: None,
             sticker: false,
         },
-        stand_in: None,
+        // The feed's smaller copy shows until the viewer's is downloaded.
+        stand_in: item.still.clone().filter(|s| s.file_id != file.id),
         file,
         zoom: None,
         natural: 1.0,
@@ -7162,10 +7180,10 @@ mod tests {
             "{rows:#?}"
         );
         assert!(rows.iter().any(|r| r.contains("sunset")), "{rows:#?}");
-        for _ in 0..6 {
+        for _ in 0..4 {
             press(&mut app, KeyCode::Char('j'), none);
         }
-        assert_eq!(app.feed.as_ref().unwrap().selected, 6);
+        assert_eq!(app.feed.as_ref().unwrap().selected, 4);
         assert_eq!(sent_with(&app, "load_feed").len(), 1);
         press(&mut app, KeyCode::Char('j'), none);
         assert_eq!(
@@ -7179,6 +7197,15 @@ mod tests {
         let asked = sent_with(&app, "load_feed");
         assert_eq!(asked.len(), 3);
         assert_eq!(asked[2]["fresh"], true);
+        // Sized for the pane the last frame drew, once there was one.
+        assert!(asked[0].get("width").is_none(), "{:?}", asked[0]);
+        let (width, height) = ui::feed::picture_box(app.chat_area, app.images.font_size()).unwrap();
+        for page in &asked[1..] {
+            assert_eq!(
+                (page["width"].as_u64(), page["height"].as_u64()),
+                (Some(width.into()), Some(height.into()))
+            );
+        }
         feed_page(
             &mut app,
             vec![post(30, serde_json::json!({"caption": "newest"}))],
@@ -7192,6 +7219,39 @@ mod tests {
         assert!(app.status.as_ref().unwrap().contains("Enter again"));
         press(&mut app, KeyCode::Enter, none);
         assert!(app.photo_view.is_some());
+    }
+
+    #[test]
+    fn the_photos_of_the_next_five_posts_download_before_they_are_in_view() {
+        let mut app = test_app("feed-ahead");
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            (1..=10).map(|i| post(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        // What a frame asks for, as `App::run` fetches after each.
+        let downloads = |app: &mut App| -> Vec<String> {
+            screen(app);
+            app.images.fetch(&app.meta);
+            sent_with(app, "download")
+                .iter()
+                .map(|p| format!("{} {}", p["file_id"], p["priority"].as_str().unwrap()))
+                .collect()
+        };
+        // The first two posts are in view; the next five download behind them.
+        let asked = downloads(&mut app);
+        assert_eq!(
+            asked,
+            ["10 high", "20 high", "30 low", "40 low", "50 low", "60 low"]
+        );
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let asked = downloads(&mut app);
+        assert_eq!(
+            asked[6..],
+            ["30 high", "70 low"],
+            "in view now, it goes first"
+        );
     }
 
     #[test]

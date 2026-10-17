@@ -213,6 +213,9 @@ pub struct ImageEvent {
 }
 
 enum FileState {
+    /// Asked for before it's drawn ([`Images::prefetch`]): behind the
+    /// others, and a failure isn't shown.
+    Ahead,
     Downloading,
     Ready(String),
     Failed,
@@ -302,6 +305,8 @@ pub struct Images {
     wanted: Vec<(Preview, u16, u16)>,
     /// Chat photos the last frame showed, with their size.
     wanted_avatars: Vec<(ChatPhoto, u16, u16)>,
+    /// Photos about to come into view, by file id: see [`Images::prefetch`].
+    ahead: Vec<i32>,
 }
 
 impl Images {
@@ -322,6 +327,7 @@ impl Images {
             files: HashMap::new(),
             wanted: Vec::new(),
             wanted_avatars: Vec::new(),
+            ahead: Vec::new(),
         }
     }
 
@@ -433,6 +439,14 @@ impl Images {
         self.wanted.push((photo.clone(), cols, rows));
     }
 
+    /// Called while drawing, for a photo about to come into view, such as
+    /// the next posts' in the feed: its file downloads now, behind the ones
+    /// on screen, so it's there once it's drawn. Only drawing makes it into
+    /// an image, so the ones kept stay the ones shown.
+    pub fn prefetch(&mut self, photo: &Preview) {
+        self.ahead.push(photo.file_id);
+    }
+
     /// The best chat photo ready to draw, as for [`get`](Self::get). While
     /// `covered` (a popup may be over it), only one that has been drawn before
     /// is returned; see [`Avatar::shown`].
@@ -495,7 +509,9 @@ impl Images {
                     self.build(full, move || Ok(open_within(&path, limits)?));
                 }
                 Some(FileState::Downloading | FileState::Failed) => {}
-                None => {
+                // One asked for ahead is on screen now: it goes before the
+                // others.
+                Some(FileState::Ahead) | None => {
                     self.files.insert(photo.file_id, FileState::Downloading);
                     meta.download(photo.file_id);
                 }
@@ -507,6 +523,12 @@ impl Images {
                 };
                 self.build(key, move || Ok(decode_bytes(&data)?));
             }
+        }
+        for file_id in std::mem::take(&mut self.ahead) {
+            self.files.entry(file_id).or_insert_with(|| {
+                meta.download_quiet(file_id);
+                FileState::Ahead
+            });
         }
     }
 
@@ -935,6 +957,38 @@ mod tests {
         images.on_built(rx.recv().await.unwrap());
         assert!(images.get(&photo, 4, 2).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_photo_coming_up_downloads_behind_the_others_until_it_is_drawn() {
+        let mut images = Images::new(
+            Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let meta = Meta::detached(tokio::sync::mpsc::unbounded_channel().0);
+        let downloads = || -> Vec<String> {
+            meta.sent()
+                .into_iter()
+                .filter(|(method, _)| method == "download")
+                .map(|(_, p)| format!("{} {}", p["file_id"], p["priority"].as_str().unwrap()))
+                .collect()
+        };
+        images.want(&preview(1), 4, 2);
+        images.prefetch(&preview(1));
+        images.prefetch(&preview(2));
+        images.fetch(&meta);
+        assert_eq!(downloads(), ["1 high", "2 low"]);
+        images.prefetch(&preview(2));
+        images.fetch(&meta);
+        assert_eq!(downloads().len(), 2, "asked for once");
+        images.want(&preview(2), 4, 2);
+        images.fetch(&meta);
+        assert_eq!(downloads()[2], "2 high", "on screen now: it goes first");
+        images.on_downloaded(3, Some("/data/helper/files/3.jpg".into()));
+        images.prefetch(&preview(3));
+        images.fetch(&meta);
+        assert!(images.building.is_empty(), "only drawing makes an image");
+        assert_eq!(downloads().len(), 3);
     }
 
     #[test]

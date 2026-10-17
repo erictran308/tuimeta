@@ -1010,27 +1010,37 @@ impl Meta {
 
     /// Asks for the next page of a network's home feed, or with `fresh` its
     /// newest posts again, answered by [`MetaEvent::Feed`] numbered `load`.
-    pub fn load_feed(&self, network: Network, limit: i32, fresh: bool, load: u64) {
-        self.then(
-            "load_feed",
-            json!({"network": network, "limit": limit, "fresh": fresh}),
-            move |answer| {
-                let page = answer.map(|mut result| {
-                    // A post that doesn't read costs that post.
-                    let posts = serde_json::from_value::<Vec<Value>>(result["posts"].take())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|p| serde_json::from_value(p).ok())
-                        .collect();
-                    (posts, result["has_more"].as_bool().unwrap_or(false))
-                });
-                Some(MetaEvent::Feed {
-                    network,
-                    load,
-                    page,
-                })
-            },
-        );
+    /// `picture` is the largest box, in pixels, a post's picture is drawn
+    /// in: the helper then sends none bigger than that needs.
+    pub fn load_feed(
+        &self,
+        network: Network,
+        limit: i32,
+        fresh: bool,
+        picture: Option<(u32, u32)>,
+        load: u64,
+    ) {
+        let mut params = json!({"network": network, "limit": limit, "fresh": fresh});
+        if let Some((width, height)) = picture {
+            params["width"] = width.into();
+            params["height"] = height.into();
+        }
+        self.then("load_feed", params, move |answer| {
+            let page = answer.map(|mut result| {
+                // A post that doesn't read costs that post.
+                let posts = serde_json::from_value::<Vec<Value>>(result["posts"].take())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|p| serde_json::from_value(p).ok())
+                    .collect();
+                (posts, result["has_more"].as_bool().unwrap_or(false))
+            });
+            Some(MetaEvent::Feed {
+                network,
+                load,
+                page,
+            })
+        });
     }
 
     /// Asks for a page of a feed post's comments, or of a comment's replies
@@ -1565,7 +1575,7 @@ mod tests {
 
         // Instagram's feed: a page of posts, each one shown, and a video
         // that downloads to a file a player can open.
-        meta.load_feed(Network::Messenger, 10, false, 1);
+        meta.load_feed(Network::Messenger, 10, false, None, 1);
         let refused = next(&mut rx, |e| match e {
             MetaEvent::Feed { page, .. } => Some(page),
             _ => None,
@@ -1587,7 +1597,7 @@ mod tests {
             _ => None,
         })
         .await;
-        meta.load_feed(Network::Instagram, 10, false, 2);
+        meta.load_feed(Network::Instagram, 10, false, Some((600, 600)), 2);
         let (posts, more) = next(&mut rx, |e| match e {
             MetaEvent::Feed { load: 2, page, .. } => Some(page.expect("a page")),
             _ => None,
@@ -1617,7 +1627,7 @@ mod tests {
         .await
         .expect("downloaded");
         assert!(Path::new(&path).is_absolute() && Path::new(&path).is_file());
-        meta.load_feed(Network::Instagram, 10, true, 3);
+        meta.load_feed(Network::Instagram, 10, true, None, 3);
         let (again, _) = next(&mut rx, |e| match e {
             MetaEvent::Feed { load: 3, page, .. } => Some(page.expect("a page")),
             _ => None,

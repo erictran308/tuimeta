@@ -28,7 +28,7 @@ const (
 var _ backend.Feeder = (*Fake)(nil)
 
 // LoadFeed gives the next FeedPage posts; only Instagram has a feed.
-func (f *Fake) LoadFeed(ctx context.Context, _ int, fresh bool) ([]proto.Post, bool, error) {
+func (f *Fake) LoadFeed(ctx context.Context, _ int, fresh bool, _ backend.Box) ([]proto.Post, bool, error) {
 	if f.net != proto.Instagram {
 		return nil, false, proto.Err(proto.Unsupported, f.net.Title()+" has no feed in tuimeta.")
 	}

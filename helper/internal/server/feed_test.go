@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -25,14 +26,16 @@ type feeder struct {
 	mu      sync.Mutex
 	asked   []int
 	fresh   []bool
+	boxes   []backend.Box
 	running int
 	most    int
 }
 
-func (f *feeder) LoadFeed(ctx context.Context, limit int, fresh bool) ([]proto.Post, bool, error) {
+func (f *feeder) LoadFeed(ctx context.Context, limit int, fresh bool, box backend.Box) ([]proto.Post, bool, error) {
 	f.mu.Lock()
 	f.asked = append(f.asked, limit)
 	f.fresh = append(f.fresh, fresh)
+	f.boxes = append(f.boxes, box)
 	f.running++
 	f.most = max(f.most, f.running)
 	f.mu.Unlock()
@@ -113,6 +116,18 @@ func TestOnlyANetworkWithAFeedLoadsOne(t *testing.T) {
 	if asked, _ := fd.seen(); asked[1] != DefaultFeedLimit || asked[2] != MaxFeedLimit {
 		t.Errorf("limits %v", asked)
 	}
+	// The box a picture is drawn in, kept within bounds; none without both
+	// sides.
+	h.c.Call("load_feed", map[string]any{"network": "instagram", "width": 600, "height": 99999})
+	h.c.Call("load_feed", map[string]any{"network": "instagram", "width": 600})
+	h.c.Call("load_feed", map[string]any{"network": "instagram", "width": -1, "height": 400})
+	fd.mu.Lock()
+	boxes := fd.boxes
+	fd.mu.Unlock()
+	want := []backend.Box{{}, {}, {}, {Width: 600, Height: MaxBoxSide}, {}, {}}
+	if !slices.Equal(boxes, want) {
+		t.Errorf("boxes %v", boxes)
+	}
 
 	// Messenger and WhatsApp have none.
 	for _, n := range []string{"messenger", "whatsapp"} {
@@ -141,7 +156,7 @@ func TestALoggedOutNetworksFeedIsRefused(t *testing.T) {
 
 type loggedOutFeeder struct{ backend.Unavailable }
 
-func (*loggedOutFeeder) LoadFeed(context.Context, int, bool) ([]proto.Post, bool, error) {
+func (*loggedOutFeeder) LoadFeed(context.Context, int, bool, backend.Box) ([]proto.Post, bool, error) {
 	panic("a logged-out network was asked for its feed")
 }
 
