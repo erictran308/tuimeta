@@ -242,8 +242,8 @@ func TestTheFirstLineIsHello(t *testing.T) {
 	if first.Seq != 0 || first.Event != "hello" {
 		t.Fatalf("first line = %s", first.Raw)
 	}
-	// Version 6: Threads, a network with a feed and no chats.
-	if v := wiretest.Field[int](t, first, "version"); v != 6 || proto.Version != 6 {
+	// Version 7: load_post, a post by its link.
+	if v := wiretest.Field[int](t, first, "version"); v != 7 || proto.Version != 7 {
 		t.Errorf("version = %d", v)
 	}
 	nets := wiretest.Field[[]string](t, first, "networks")

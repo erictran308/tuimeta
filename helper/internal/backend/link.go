@@ -62,6 +62,47 @@ func ParseFeedKind(s string) (FeedKind, bool) {
 	return "", false
 }
 
+// PostLoader is a network whose posts open by their links (Instagram,
+// Threads): the server sends load_post to it.
+type PostLoader interface {
+	// LoadPost is the post a link names by its code (PostCode's) and, on
+	// Threads, its author's username, when the link has one. box is
+	// LoadFeed's. The post has the id LoadFeed gives it, so LoadComments
+	// takes it. It never tells the network more than the post's page on
+	// the website would. Errors: not_found for a post the account can't
+	// see or that has nothing to show.
+	LoadPost(ctx context.Context, code, username string, box Box) (proto.Post, error)
+}
+
+// PostCode reports whether s can be a post's code in a link: Instagram's
+// shortcodes and Threads' are letters, digits, '-' and '_' (a private
+// account's longer than a public one's).
+func PostCode(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// Username reports whether s is a username as Instagram and Threads make
+// them: letters, digits, '.' and '_', at most 30.
+func Username(s string) bool {
+	if s == "" || len(s) > 30 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // Box is the largest box, in pixels, tuimeta draws a post's picture in
 // (load_feed's width and height); zero when it didn't say.
 type Box struct {

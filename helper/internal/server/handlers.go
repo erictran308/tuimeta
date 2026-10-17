@@ -43,6 +43,7 @@ func init() {
 		"mute":          (*Server).mute,
 		"load_feed":     (*Server).loadFeed,
 		"load_comments": (*Server).loadComments,
+		"load_post":     (*Server).loadPost,
 	}
 }
 

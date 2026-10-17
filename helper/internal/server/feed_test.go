@@ -253,6 +253,7 @@ type commenter struct {
 
 	cmu    sync.Mutex
 	casked [][3]int64 // post, replies_of, more (0 or 1)
+	posted []string   // "code username" of each load_post
 	crun   int
 	cmost  int
 }
@@ -281,6 +282,63 @@ func (c *commenter) LoadComments(ctx context.Context, post, of int64, more bool)
 	}
 	likes := int64(-1)
 	return []proto.Comment{{ID: 100 + of, Author: proto.FeedAuthor{Username: "sam", Photo: &proto.Image{FileID: 9}}, Text: "hi", Likes: &likes, Replies: 2, ReplyTo: of}}, true, nil
+}
+
+// LoadPost gives post 41 for any code but "Gone", which it hasn't.
+func (c *commenter) LoadPost(_ context.Context, code, username string, _ backend.Box) (proto.Post, error) {
+	c.cmu.Lock()
+	c.posted = append(c.posted, code+" "+username)
+	c.cmu.Unlock()
+	if code == "Gone" {
+		return proto.Post{}, proto.Err(proto.NotFound, "No such post.")
+	}
+	return proto.Post{ID: 41, Author: proto.FeedAuthor{Username: "maya.lens"}, Caption: "linked",
+		Media: []proto.Media{{Kind: proto.Photo, FileID: 4}}, URL: "https://www.instagram.com/p/" + code + "/"}, nil
+}
+
+func TestAPostOpensByItsLinkAndThenItsCommentsLoad(t *testing.T) {
+	h, cm := withCommenter(t, nil)
+	l := h.c.Call("load_post", map[string]any{"network": "instagram", "code": "DAbc_-1", "username": "maya.lens", "width": 300, "height": 200})
+	if l.Error != nil {
+		t.Fatalf("got %s", l.Raw)
+	}
+	post := wiretest.Decode[struct {
+		Post map[string]any `json:"post"`
+	}](t, l.Result).Post
+	if post["id"] != 41.0 || post["caption"] != "linked" {
+		t.Errorf("post %v", post)
+	}
+	// Its network is known, as a feed's post's is.
+	if l := h.c.Call("load_comments", map[string]any{"post_id": 41}); l.Error != nil {
+		t.Errorf("comments: %s", l.Raw)
+	}
+	if l := h.c.Call("load_post", map[string]any{"network": "instagram", "code": "Gone"}); l.Error == nil || l.Error.Code != proto.NotFound {
+		t.Errorf("gone: %s", l.Raw)
+	}
+	for _, params := range []any{
+		map[string]any{"network": "instagram"},
+		map[string]any{"network": "instagram", "code": "a/b"},
+		map[string]any{"network": "instagram", "code": "a.b"},
+		map[string]any{"network": "instagram", "code": strings.Repeat("a", 65)},
+		map[string]any{"network": "instagram", "code": "abc", "username": "no way"},
+		map[string]any{"network": "instagram", "code": "abc", "username": strings.Repeat("a", 31)},
+		map[string]any{"network": "myspace", "code": "abc"},
+		"x",
+	} {
+		if l := h.c.Call("load_post", params); l.Error == nil || l.Error.Code != proto.BadRequest {
+			t.Errorf("%v: %s", params, l.Raw)
+		}
+	}
+	for _, n := range []string{"messenger", "whatsapp"} {
+		if l := h.c.Call("load_post", map[string]any{"network": n, "code": "abc"}); l.Error == nil || l.Error.Code != proto.Unsupported {
+			t.Errorf("%s: %s", n, l.Raw)
+		}
+	}
+	cm.cmu.Lock()
+	defer cm.cmu.Unlock()
+	if strings.Join(cm.posted, ",") != "DAbc_-1 maya.lens,Gone " {
+		t.Errorf("asked %q", cm.posted)
+	}
 }
 
 func (c *commenter) asked() ([][3]int64, int) {

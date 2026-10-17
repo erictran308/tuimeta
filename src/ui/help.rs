@@ -63,7 +63,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("j / k", "Newer / older message"),
             ("gg / G", "Oldest / newest message"),
             ("Ctrl-d / Ctrl-u", "Half a page newer / older"),
-            ("Enter", "Show the photo, or open the file or link"),
+            (
+                "Enter",
+                "Show the photo, or open the file or link (an Instagram or Threads post's here)",
+            ),
             ("y", "Copy the text, a link, or the photo or file"),
             ("r", "Reply"),
             ("e", "Edit your message, while the network allows"),
@@ -113,7 +116,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "The post's comments (on Threads, replies), in a pane beside it (again to close)",
             ),
             ("l", "Over to the comments pane, while it's open"),
-            ("Esc", "Stop the video, or go back"),
+            (
+                "Esc",
+                "Stop the video, or go back (from a post a link opened: its feed)",
+            ),
         ],
     ),
     (

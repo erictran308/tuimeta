@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 7;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper, twice what it writes at most. A
@@ -593,6 +593,13 @@ pub enum MetaEvent {
         load: u64,
         page: Result<(Vec<CommentInfo>, bool), String>,
     },
+    /// A post asked for by its link, for the load numbered `load`, or why
+    /// it didn't come.
+    Post {
+        network: Network,
+        load: u64,
+        post: Result<Box<FeedPost>, String>,
+    },
     /// The helper stopped or broke the protocol; nothing more will come.
     Gone(String),
 }
@@ -1108,6 +1115,39 @@ impl Meta {
                 post_id,
                 load,
                 page,
+            })
+        });
+    }
+
+    /// Asks for the post a link names by its `code` (and, on Threads, its
+    /// author's `username`, when the link has one), answered by
+    /// [`MetaEvent::Post`] numbered `load`. `picture` is `load_feed`'s.
+    pub fn load_post(
+        &self,
+        network: Network,
+        code: &str,
+        username: Option<&str>,
+        picture: Option<(u32, u32)>,
+        load: u64,
+    ) {
+        let mut params = json!({"network": network, "code": code});
+        if let Some(username) = username {
+            params["username"] = username.into();
+        }
+        if let Some((width, height)) = picture {
+            params["width"] = width.into();
+            params["height"] = height.into();
+        }
+        self.then("load_post", params, move |answer| {
+            let post = answer.and_then(|mut result| {
+                serde_json::from_value::<FeedPost>(result["post"].take())
+                    .map(Box::new)
+                    .map_err(|_| "The helper's post didn't read".to_string())
+            });
+            Some(MetaEvent::Post {
+                network,
+                load,
+                post,
             })
         });
     }
@@ -1808,6 +1848,24 @@ mod tests {
         })
         .await;
         assert!(!replies.is_empty());
+        // A post opened by its link: the feed's own, with its id.
+        let linked = &threads[3];
+        let code = linked.url.rsplit('/').next().unwrap();
+        meta.load_post(Network::Threads, code, None, None, 11);
+        let post = next(&mut rx, |e| match e {
+            MetaEvent::Post { load: 11, post, .. } => Some(post),
+            _ => None,
+        })
+        .await
+        .expect("the post");
+        assert_eq!((post.id, &post.caption), (linked.id, &linked.caption));
+        meta.load_post(Network::Instagram, "FAKEPOST99", None, None, 12);
+        let none = next(&mut rx, |e| match e {
+            MetaEvent::Post { load: 12, post, .. } => Some(post),
+            _ => None,
+        })
+        .await;
+        assert!(none.is_err());
 
         // WhatsApp links a device instead: a code to type on the phone,
         // given up, then a QR code, which the fake takes as scanned.
@@ -1921,13 +1979,14 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":6,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":7}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":7,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":8}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
         // Version 3 read `send_files` by path alone, so a file swapped after
-        // the composer checked it would go out; version 4 has no feed, and
-        // version 5 no Threads.
-        for older in [3, 4, 5] {
+        // the composer checked it would go out; version 4 has no feed,
+        // version 5 no Threads, and version 6 doesn't open posts by their
+        // links.
+        for older in [3, 4, 5, 6] {
             let line = format!(r#"{{"event":"hello","version":{older}}}"#);
             let older = check_hello(line.as_bytes()).unwrap_err();
             assert!(older.to_string().contains("same release"), "{older}");

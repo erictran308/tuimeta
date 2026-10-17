@@ -224,13 +224,26 @@ func (t *Threads) wait(ctx context.Context) error {
 // redirects, and reads it: a fresh page for the session's requests. t.net
 // is held.
 func (t *Threads) load(ctx context.Context, s *threadsSession, page, from string) (*threadsPage, error) {
+	p, _, err := t.open(ctx, s, page, from)
+	if errors.Is(err, errPageGone) {
+		err = errThreadsPage
+	}
+	return p, err
+}
+
+// errPageGone is threads.com saying it has no such page: a post deleted,
+// or a code of none.
+var errPageGone = errors.New("threads: no such page")
+
+// open is load's, with the page as it came. t.net is held.
+func (t *Threads) open(ctx context.Context, s *threadsSession, page, from string) (*threadsPage, string, error) {
 	for range maxRedirects + 1 {
 		if err := t.wait(ctx); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		r, err := http.NewRequestWithContext(ctx, http.MethodGet, page, nil)
 		if err != nil {
-			return nil, errThreadsPage
+			return nil, "", errThreadsPage
 		}
 		h := r.Header
 		hints(h, s.as, true)
@@ -248,37 +261,40 @@ func (t *Threads) load(ctx context.Context, s *threadsSession, page, from string
 		h.Set("cookie", s.header())
 		resp, err := t.web.Do(r)
 		if err != nil {
-			return nil, netError(ctx, err)
+			return nil, "", netError(ctx, err)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxThreadsPage+1))
 		resp.Body.Close()
 		s.take(resp, time.Now())
 		if err != nil {
-			return nil, netError(ctx, err)
+			return nil, "", netError(ctx, err)
 		}
 		switch {
 		case resp.StatusCode >= 300 && resp.StatusCode < 400:
 			next, err := redirect(resp)
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			from, page = page, next
 			continue
 		case resp.StatusCode == http.StatusTooManyRequests:
-			return nil, errThreadsRateLimited
+			return nil, "", errThreadsRateLimited
+		case resp.StatusCode == http.StatusNotFound:
+			return nil, "", errPageGone
 		case resp.StatusCode != http.StatusOK || len(body) > maxThreadsPage:
-			return nil, errThreadsPage
+			return nil, "", errThreadsPage
 		}
-		p, ok := parseThreadsPage(string(body))
+		html := string(body)
+		p, ok := parseThreadsPage(html)
 		if !ok {
-			return nil, errLoggedOutPage
+			return nil, "", errLoggedOutPage
 		}
 		s.page, s.pageAt = &p, time.Now()
 		s.requests = 0
 		s.sid = methods.GenerateWebsessionID(true)
-		return &p, nil
+		return &p, html, nil
 	}
-	return nil, errThreadsPage
+	return nil, "", errThreadsPage
 }
 
 // redirect is where threads.com sent a page: another of its own pages, or

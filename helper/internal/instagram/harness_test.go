@@ -170,6 +170,8 @@ type fakeAPI struct {
 	feed func(maxID string) ([]byte, error)
 	// comments answers Comments: the body for the path and query.
 	comments func(path string, query url.Values) ([]byte, error)
+	// mediaInfo answers MediaInfo: the body for the pk.
+	mediaInfo func(pk string) ([]byte, error)
 }
 
 func newFakeAPI(t testing.TB) *fakeAPI {
@@ -379,6 +381,19 @@ func (f *fakeAPI) Comments(ctx context.Context, path string, query url.Values, r
 		return []byte(`{"comments":[],"has_more_comments":false,"status":"ok"}`), nil
 	}
 	return f.comments(path, query)
+}
+
+// mediaCall is a MediaInfo request as it was asked.
+type mediaCall struct {
+	pk, referer string
+}
+
+func (f *fakeAPI) MediaInfo(ctx context.Context, pk, referer string) ([]byte, error) {
+	f.record("MediaInfo", mediaCall{pk, referer})
+	if f.mediaInfo == nil {
+		return []byte(`{"message":"Media not found or unavailable","status":"fail"}`), errors.New("status 400")
+	}
+	return f.mediaInfo(pk)
 }
 
 func sentMessage(id string, ms int64) slidetypes.SentMessage {

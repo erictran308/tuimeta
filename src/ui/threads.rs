@@ -16,7 +16,9 @@ use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
-use super::feed::{COMMENT, HEART, PLAY, VERIFIED, View, ago, count, draw_still, seek_bar};
+use super::feed::{
+    COMMENT, HEART, PLAY, VERIFIED, View, ago, count, draw_still, empty_feed, feed_end, seek_bar,
+};
 use super::{border, bordered, truncate};
 use crate::feed::{self, Feed, Item, LinkCard, Post};
 use crate::images::Images;
@@ -63,10 +65,10 @@ pub fn draw(
     colors: &Colors,
 ) -> Option<Rect> {
     let feed = view.feed;
-    let which = if feed.following {
-        "Following"
-    } else {
-        "For you"
+    let which = match (&feed.linked, feed.following) {
+        (Some(_), _) => "Post",
+        (None, true) => "Following",
+        (None, false) => "For you",
     };
     let mut title = format!(" Threads · {which} ");
     if feed.loading.is_some() {
@@ -78,11 +80,10 @@ pub fn draw(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if feed.posts.is_empty() {
-        let what = match (&feed.error, feed.loading.is_some()) {
-            (_, true) => "Loading the feed…".to_string(),
-            (Some(why), _) => format!("{why}\nPress r to try again"),
-            _ => "Nothing in the feed yet\nf switches between For you and Following".to_string(),
-        };
+        let what = empty_feed(
+            feed,
+            "Nothing in the feed yet\nf switches between For you and Following",
+        );
         let rows = what.lines().count() as u16;
         let middle = Rect {
             y: inner.y + inner.height.saturating_sub(rows) / 2,
@@ -217,12 +218,7 @@ pub fn draw(
         }
     }
     if i == feed.posts.len() && y < inner.height {
-        let end = match (&feed.error, feed.loading.is_some(), feed.has_more) {
-            (_, true, _) => Some("Loading more…".to_string()),
-            (Some(why), ..) => Some(format!("Couldn't load more: {why}")),
-            (None, false, false) => Some("You're all caught up".to_string()),
-            _ => None,
-        };
+        let end = feed_end(feed);
         if let Some(end) = end {
             let row = Rect::new(inner.x, inner.y + y, inner.width, 1);
             frame.render_widget(

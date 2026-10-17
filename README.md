@@ -117,7 +117,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 | | `m` | Mute or unmute |
 | | `H` | Highlight the chat |
 | Messages | `j` / `k` | Newer, older |
-| | `Enter` | Show the photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app, `y` copies it, `Esc` closes it), or open the file or link |
+| | `Enter` | Show the photo as big as the window allows (`h` / `l` the one before / after it, `j` / `k` zoom in / out, up to filling the window, `o` opens it in your default app, `y` copies it, `Esc` closes it), or open the file or link; a link to an Instagram or Threads post opens the post here (see [Posts people send you](#posts-people-send-you)) |
 | | `r` | Reply |
 | | `e` | Edit your message |
 | | `d` | Unsend your message |
@@ -134,6 +134,7 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 | | `r` | Reload, for the newest posts |
 | | `f` | Threads: For you, or Following (only the accounts you follow) |
 | | `c` | The post's comments (Threads' replies), in a pane beside it while its video plays on (`Enter` shows a comment's replies, `y` copies one, `h` / `l` go between post and comments, `Esc` closes) |
+| | `Esc` | On a post a link opened: on to the feed (`Ctrl-o` goes back to the chat) |
 | Writing | `Enter` | Send |
 | | `Alt-Enter` / `Ctrl-j` | New line |
 | | `:` and a few letters, `Tab` | An emoji by its shortcode |
@@ -150,6 +151,10 @@ When you're logged in to Instagram, the first row of its chats (of every chat, i
 - **Nothing about what you look at goes to Instagram:** the feed is asked for a page at a time, without the "seen" and viewing reports Instagram's own apps send, and comments are only read. Videos and photos download from Instagram's servers like any other file, when you open them.
 
 Instagram's feed and comments aren't something Meta lets other apps use: tuimeta asks for them the way instagram.com itself does, so a change on Instagram's side can break them until tuimeta follows, and they're one more thing an unofficial client does with your account. The [warning](#tuimeta) at the top applies here too.
+
+### Posts people send you
+
+`Enter` on a link to an Instagram post or reel (`instagram.com/p/…`, `/reel/…`) or a Threads post (`threads.com/@…/post/…`) in any chat opens that post here, in the feed's place, while you're logged in to that network: its photos, its video (playing in Pepper), its comments or replies with `c`, all as in the feed. `Esc` goes on to the feed itself, as you left it, and `Ctrl-o` back to the chat. tuimeta asks for the post as the website does when you open its link (on Threads, it loads the post's page), and nothing more. A link of a network you're not logged in to, or one to anything else on those sites (a profile, a story), opens in your browser as any link does.
 
 ### Videos in the terminal: Pepper
 

@@ -188,6 +188,13 @@ What goes to Instagram without tuimeta asking, and why it's kept:
   forth between the feed and comments pages no faster than either. The
   preview replies inside a comment are never read; replies come only when
   asked for. `helper.log` says how many came, never who wrote them or what.
+- A post opened by its link (`load_post`, when you press Enter on an
+  Instagram post's link in a chat) is the request its page on
+  instagram.com makes for it, a GET from that page:
+  `/api/v1/media/<media pk>/info/`, the pk worked out from the link's code
+  (its letters are the pk's digits in base 64), and the answer kept only
+  if it's the post of that code. It shares the feed's lock and gap, and
+  tells Instagram nothing more than opening the post on its website.
 
 instameow itself sends no presence, "active now", foreground or app state,
 and registers no push; it marks nothing read and sends no typing on its own
@@ -239,6 +246,14 @@ Everything sent to threads.com, at most one request at a time and at least
   (`fb_dtsg`, `lsd`, the app id, the revision, `__hsi`, `__spin_*`,
   `haste_session`, the account's id as `av`), who's logged in, and the
   gates, experiments and settings the website's feature flags read.
+- A post's page, `GET https://www.threads.com/@<username>/post/<code>`
+  (`/t/<code>` for a link without the username), as a navigation from
+  another app, when you press Enter on a Threads post's link in a chat
+  (`load_post`): the post is read from the answers to its own queries that
+  the page comes with, and its tokens are the session's from then on, as a
+  browser's would be. Only the code and username go into its address, and
+  only if they're made of what Threads' are. A post's page that answers as
+  to nobody logged in doesn't end the session; the home page decides that.
 - GraphQL queries, `POST https://www.threads.com/api/graphql`, with the
   form and headers the page's own code sends (`x-ig-app-id`, `x-fb-lsd`,
   `x-csrftoken`, `x-asbd-id`, `x-fb-friendly-name`, the page as referer):

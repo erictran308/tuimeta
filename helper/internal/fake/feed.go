@@ -55,6 +55,35 @@ func (f *Fake) LoadFeed(ctx context.Context, _ int, fresh bool, _ backend.Box, k
 	return posts, end < len(feed), nil
 }
 
+var _ backend.PostLoader = (*Fake)(nil)
+
+// LoadPost finds a post of the made-up feeds by the code its url ends
+// with, as the feed gives it.
+func (f *Fake) LoadPost(ctx context.Context, code, _ string, _ backend.Box) (proto.Post, error) {
+	if f.net != proto.Instagram && f.net != proto.Threads {
+		return proto.Post{}, proto.Err(proto.Unsupported, f.net.Title()+" has no posts in tuimeta.")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w, err := f.world()
+	if err != nil {
+		return proto.Post{}, err
+	}
+	for _, p := range slices.Concat(w.feed, w.following) {
+		if postCode(p.URL) == code {
+			p.Context, p.Continues, p.Suggested = "", false, false
+			return p, nil
+		}
+	}
+	return proto.Post{}, proto.Err(proto.NotFound, "There's no such post; o opens it on the website.")
+}
+
+// postCode is the code a made-up post's url ends with.
+func postCode(url string) string {
+	url = strings.TrimSuffix(url, "/")
+	return url[strings.LastIndex(url, "/")+1:]
+}
+
 // feedAuthor is who posted: one of the network's people, or a page only
 // the feed knows.
 type feedAuthor struct {

@@ -207,7 +207,8 @@ func mayaChat() map[int]spec {
 	}
 }
 
-// crewChat: a group of five with an album and an edit.
+// crewChat: a group of five with an album, an edit, and links to a post of
+// each feed, which tuimeta opens in place.
 func crewChat() map[int]spec {
 	return map[int]spec{
 		0:  event(0, "You created the group"),
@@ -218,6 +219,10 @@ func crewChat() map[int]spec {
 		36: spec{from: 1, unsup: "[Poll]"},
 		41: say(3, "Bringing the new rope").edit(),
 		45: say(0, "Count me in 💪").reply(33),
+		50: say(2, "This reel 😂 https://www.instagram.com/reel/FAKEPOST02/").
+			with(link("https://www.instagram.com/reel/FAKEPOST02/")),
+		53: say(3, "Same energy: https://www.threads.com/@product.notes/post/FAKETHFY02").
+			with(link("https://www.threads.com/@product.notes/post/FAKETHFY02")),
 	}
 }
 

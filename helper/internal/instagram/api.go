@@ -63,6 +63,11 @@ type api interface {
 	// www.instagram.com with query, as from the post's page (referer), and
 	// returns the answer's body, also with an error when Instagram said why.
 	Comments(ctx context.Context, path string, query url.Values, referer string) ([]byte, error)
+
+	// MediaInfo GETs one post, by its media pk (digits), on
+	// www.instagram.com, as from the post's page (referer), and returns the
+	// answer's body, also with an error when Instagram said why.
+	MediaInfo(ctx context.Context, pk, referer string) ([]byte, error)
 }
 
 // realAPI is instameow itself.
@@ -134,6 +139,16 @@ func (r realAPI) Comments(ctx context.Context, path string, query url.Values, re
 	h := cli.BuildHeaders(true, false)
 	commentHeaders(h, base, referer)
 	_, body, err := cli.MakeRequest(ctx, commentsURL(base, path, query), http.MethodGet, h, nil, types.NONE)
+	return body, err
+}
+
+// MediaInfo is the web client's request for one post, made as Comments is.
+func (r realAPI) MediaInfo(ctx context.Context, pk, referer string) ([]byte, error) {
+	cli := r.GetHTTP()
+	base := r.GetEndpoint("base_url")
+	h := cli.BuildHeaders(true, false)
+	commentHeaders(h, base, referer)
+	_, body, err := cli.MakeRequest(ctx, base+mediaInfoPath(pk), http.MethodGet, h, nil, types.NONE)
 	return body, err
 }
 

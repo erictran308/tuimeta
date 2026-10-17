@@ -32,6 +32,8 @@ const MAX_ITEMS: usize = 20;
 const MAX_CONTEXT: usize = 120;
 /// And a link card's title.
 const MAX_TITLE: usize = 300;
+/// The longest code of a post in a link the helper takes.
+const MAX_CODE: usize = 64;
 
 /// A post of the feed, made safe to show.
 #[derive(Clone)]
@@ -193,6 +195,69 @@ fn post_url(url: &str, network: Network) -> Option<String> {
     (url.starts_with("https://") && ours).then_some(url)
 }
 
+/// A link to an Instagram or Threads post, by what names the post in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PostLink {
+    pub network: Network,
+    /// The post's code, as the link has it.
+    pub code: String,
+    /// Threads: the author the link names, if it does.
+    pub username: Option<String>,
+    /// The link itself, a web address, for `o` and `y`.
+    pub url: String,
+}
+
+/// `url` if it's a link to an Instagram or Threads post: on instagram.com
+/// `/p/<code>`, `/reel/<code>`, `/reels/<code>` or `/tv/<code>`, with an
+/// account's name before it or not; on threads.com (or threads.net)
+/// `/@<username>/post/<code>` or `/t/<code>`. Only on the sites
+/// themselves, with nothing else before the path (no `@`, no port), so the
+/// post shown is the one a browser would open.
+pub fn post_link(url: &str) -> Option<PostLink> {
+    let url = messages::web_url(url)?;
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let network = match &rest[..end] {
+        "instagram.com" | "www.instagram.com" | "m.instagram.com" => Network::Instagram,
+        "threads.com" | "www.threads.com" | "threads.net" | "www.threads.net" => Network::Threads,
+        _ => return None,
+    };
+    // The path as written: codes are told apart by case.
+    let path = &url[url.len() - rest.len() + end..];
+    let path = &path[..path.find(['?', '#']).unwrap_or(path.len())];
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let post_kind = |kind: &str| matches!(kind, "p" | "reel" | "reels" | "tv");
+    // A name before the kind is an account's, not a page of the site's own
+    // (`/share/p/…` is a share link, whose code isn't the post's).
+    let account =
+        |name: &str| username(name) == name && !matches!(name, "share" | "stories" | "explore");
+    let (code, username) = match (network, parts.as_slice()) {
+        (Network::Instagram, [kind, code, ..]) if post_kind(kind) => (*code, None),
+        (Network::Instagram, [name, kind, code, ..]) if post_kind(kind) && account(name) => {
+            (*code, None)
+        }
+        (Network::Threads, [name, "post", code, ..]) => {
+            let name = name.strip_prefix('@')?;
+            (*code, Some(username(name)).filter(|u| u == name))
+        }
+        (Network::Threads, ["t", code, ..]) => (*code, None),
+        _ => return None,
+    };
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if code.is_empty() || code.len() > MAX_CODE || !code.chars().all(allowed) {
+        return None;
+    }
+    Some(PostLink {
+        network,
+        code: code.to_string(),
+        username,
+        url,
+    })
+}
+
 /// A link card, if its address is a web address.
 fn link_card(preview: &meta::LinkPreview) -> Option<LinkCard> {
     let url = messages::web_url(&preview.url)?;
@@ -289,6 +354,9 @@ pub struct Feed {
     pub following: bool,
     /// Why the last load failed.
     pub error: Option<String>,
+    /// The one post a link names, instead of the feed: Esc goes on to the
+    /// feed.
+    pub linked: Option<PostLink>,
 }
 
 impl Feed {
@@ -306,7 +374,25 @@ impl Feed {
             has_more: true,
             following: false,
             error: None,
+            linked: None,
         }
+    }
+
+    /// The post `link` names, alone: loaded with [`Feed::start_load`]
+    /// (always fresh) and [`Feed::on_post`], with nothing after it.
+    pub fn linked(link: PostLink) -> Self {
+        let network = link.network;
+        Self {
+            has_more: false,
+            linked: Some(link),
+            ..Self::new(network)
+        }
+    }
+
+    /// The answer to load `load` of a linked post: it, in the place of what
+    /// was there. True if it was the load waited for.
+    pub fn on_post(&mut self, load: u64, post: Result<FeedPost, String>) -> bool {
+        self.on_page(load, post.map(|post| (vec![post], false)))
     }
 
     /// Starts a load: the next page, or with `fresh` the newest posts
@@ -718,5 +804,100 @@ pub(crate) mod tests {
         let (post_id, _) = feed.next_photo(2, 20, false).unwrap();
         assert_eq!((post_id, feed.selected), (1, 0));
         assert_eq!(feed.shown_item().unwrap().1.file.as_ref().unwrap().id, 13);
+    }
+
+    #[test]
+    fn a_link_to_an_instagram_or_threads_post_names_the_post() {
+        let link = |url: &str| post_link(url).map(|l| (l.network, l.code, l.username));
+        let ig = |code: &str| Some((Network::Instagram, code.to_string(), None));
+        for (url, code) in [
+            ("https://www.instagram.com/p/DAbc_12-x/", "DAbc_12-x"),
+            ("https://instagram.com/reel/DAbc12?igsh=MTc4", "DAbc12"),
+            ("http://m.instagram.com/reels/DAbc12/", "DAbc12"),
+            ("https://www.instagram.com/tv/DAbc12#top", "DAbc12"),
+            ("https://www.instagram.com/maya.lens/p/DAbc12/", "DAbc12"),
+            (
+                "https://www.instagram.com/p/DAbc12/c/17900000000000001/",
+                "DAbc12",
+            ),
+            ("HTTPS://WWW.INSTAGRAM.COM/p/DAbc12/", "DAbc12"),
+            ("www.instagram.com/p/DAbc12", "DAbc12"),
+        ] {
+            assert_eq!(link(url), ig(code), "{url}");
+        }
+        assert_eq!(
+            link("https://www.threads.com/@maya.lens/post/C8xYz-1"),
+            Some((Network::Threads, "C8xYz-1".into(), Some("maya.lens".into())))
+        );
+        assert_eq!(
+            link("https://threads.net/t/C8xYz?xmt=1"),
+            Some((Network::Threads, "C8xYz".into(), None))
+        );
+        // A name that isn't one is left out; the code still names the post.
+        assert_eq!(
+            link("https://www.threads.com/@ma%79a/post/C8xYz"),
+            Some((Network::Threads, "C8xYz".into(), None))
+        );
+        assert_eq!(
+            post_link("https://www.instagram.com/p/DAbc12/?igsh=1").map(|l| l.url),
+            Some("https://www.instagram.com/p/DAbc12/?igsh=1".into()),
+            "the link itself, for o"
+        );
+        for url in [
+            // Not the site itself, or something before its host.
+            "https://instagram.com.evil.example/p/DAbc12/",
+            "https://evil.example/www.instagram.com/p/DAbc12/",
+            "https://instagram.com@evil.example/p/DAbc12/",
+            "https://evil.example@www.instagram.com/p/DAbc12/",
+            "https://www.instagram.com:8443/p/DAbc12/",
+            "https://l.instagram.com/?u=https%3A%2F%2Fwww.instagram.com%2Fp%2FDAbc12",
+            "https://www.facebook.com/p/DAbc12/",
+            "javascript:alert(1)//www.instagram.com/p/DAbc12/",
+            // Not a post's page.
+            "https://www.instagram.com/maya.lens/",
+            "https://www.instagram.com/stories/maya.lens/3400000000000000001/",
+            "https://www.instagram.com/share/p/BAxyzShare/",
+            "https://www.instagram.com/explore/p/DAbc12/",
+            "https://www.threads.com/@maya.lens",
+            "https://www.threads.com/maya.lens/post/C8xYz",
+            "https://www.instagram.com/@maya.lens/post/C8xYz",
+            // Not a code.
+            "https://www.instagram.com/p/DA%62c/",
+            "https://www.instagram.com/p/DA.bc/",
+            "https://www.instagram.com/p/",
+        ] {
+            assert_eq!(link(url), None, "{url}");
+        }
+        let long = format!("https://www.instagram.com/p/{}/", "a".repeat(MAX_CODE + 1));
+        assert_eq!(link(&long), None);
+    }
+
+    #[test]
+    fn a_linked_post_is_the_feed_of_one_post() {
+        let link = post_link("https://www.threads.com/@alice.example/post/ABC").unwrap();
+        let mut feed = Feed::linked(link.clone());
+        assert_eq!(
+            (feed.network, feed.linked.as_ref()),
+            (Network::Threads, Some(&link))
+        );
+        assert!(!feed.wants_more(), "nothing after it");
+        let load = feed.start_load(true).unwrap();
+        assert!(!feed.on_post(load + 1, Err("old news".into())));
+        assert!(feed.on_post(load, Ok(post(4, serde_json::json!({})))));
+        assert_eq!(feed.posts.len(), 1);
+        assert!(!feed.has_more && !feed.wants_more());
+        // Asked for again, it takes the place of what was there.
+        let load = feed.start_load(true).unwrap();
+        assert!(feed.on_post(load, Ok(post(4, serde_json::json!({"caption": "edited"})))));
+        assert_eq!(
+            feed.posts
+                .iter()
+                .map(|p| p.caption.as_str())
+                .collect::<Vec<_>>(),
+            ["edited"]
+        );
+        let load = feed.start_load(true).unwrap();
+        assert!(feed.on_post(load, Err("gone".into())));
+        assert_eq!((feed.posts.len(), feed.error.as_deref()), (1, Some("gone")));
     }
 }

@@ -1410,6 +1410,11 @@ impl App {
                 load,
                 page,
             } => self.on_comments_page(post_id, load, page),
+            MetaEvent::Post {
+                network,
+                load,
+                post,
+            } => self.on_linked_post(network, load, post),
             MetaEvent::ChatsFound {
                 network,
                 query,
@@ -2831,12 +2836,15 @@ impl App {
         if self.open.take().is_some() {
             self.images.clear();
         }
-        // Its video stops; the posts are kept to come back to.
+        // Its video stops; the posts are kept to come back to, but not a
+        // linked post's: the feed's row opens the feed.
         if let Some(feed) = self.feed.take() {
             self.stop_video();
             self.close_comments();
             self.images.clear();
-            self.feeds_kept.insert(feed.network, feed);
+            if feed.linked.is_none() {
+                self.feeds_kept.insert(feed.network, feed);
+            }
         }
     }
 
@@ -3265,7 +3273,9 @@ impl App {
         }
     }
 
-    /// Files open in their default app once downloaded; links in the browser.
+    /// Files open in their default app once downloaded; links in the
+    /// browser, but a link to an Instagram or Threads post here, in its
+    /// feed's place, while that account is in.
     fn open_target(&mut self, target: Target) {
         match target {
             Target::Photo { message_id, file } => self.view_photo(message_id, file),
@@ -3275,7 +3285,12 @@ impl App {
                     self.meta.download(file.id);
                 }
             }
-            Target::Link(link) => self.open_link_outside(link),
+            Target::Link(link) => match feed::post_link(&link.url)
+                .filter(|post| self.ready_networks().contains(&post.network))
+            {
+                Some(post) => self.open_linked_post(post),
+                None => self.open_link_outside(link),
+            },
             Target::Text(_) => {}
         }
     }
@@ -4063,7 +4078,11 @@ impl App {
     /// Opens `network`'s feed in the chat's place: as it was left, or its
     /// first page.
     fn open_feed(&mut self, network: Network) {
-        if self.feed.as_ref().is_some_and(|f| f.network == network) {
+        if self
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.network == network && f.linked.is_none())
+        {
             return;
         }
         let picture = self.feed_picture(network);
@@ -4083,6 +4102,87 @@ impl App {
         self.feed = Some(feed);
     }
 
+    /// Enter on a link to an Instagram or Threads post: the post alone, in
+    /// its network's feed's place, loaded as the feed's posts are (only
+    /// read). Esc goes on to the feed as it was left, Ctrl-o back to the
+    /// chat.
+    fn open_linked_post(&mut self, link: feed::PostLink) {
+        let Some(row) = chats::feed_id(link.network) else {
+            return;
+        };
+        if let Some(here) = self.here() {
+            self.jumps.leave(here);
+        }
+        self.close_chat_popups();
+        // The chat, or the feed, is kept as it was.
+        self.leave_chat();
+        // The list's cursor goes to the feed's row, even if the filter hid it.
+        if !self.chats.ids().contains(&row) {
+            self.chats.set_filter("");
+        }
+        self.selected = Some(row);
+        self.focus = Focus::Messages;
+        self.feed = Some(Feed::linked(link));
+        self.load_linked_post();
+    }
+
+    /// Asks for the linked post shown, again if it's there.
+    fn load_linked_post(&mut self) {
+        let Some(network) = self
+            .feed
+            .as_ref()
+            .filter(|f| f.linked.is_some())
+            .map(|f| f.network)
+        else {
+            return;
+        };
+        let picture = self.feed_picture(network);
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        if let Some(load) = feed.start_load(true)
+            && let Some(link) = &feed.linked
+        {
+            self.meta
+                .load_post(network, &link.code, link.username.as_deref(), picture, load);
+        }
+    }
+
+    /// The linked post came, or why it didn't.
+    fn on_linked_post(&mut self, network: Network, load: u64, post: Result<Box<FeedPost>, String>) {
+        let Some(feed) = self
+            .feed
+            .as_mut()
+            .filter(|f| f.network == network && f.linked.is_some())
+        else {
+            return;
+        };
+        let failed = post.as_ref().err().map(|why| text::clean(why));
+        if !feed.on_post(load, post.map(|post| *post)) {
+            return;
+        }
+        if let Some(why) = failed {
+            self.status = Some(format!("Post: {why}"));
+            return;
+        }
+        // It's under the cursor now, maybe just as a key went down.
+        self.stop_video();
+        self.close_comments();
+        self.feed_changed = Some(Instant::now());
+    }
+
+    /// Esc on a linked post: its network's feed, as it was left.
+    fn back_to_feed(&mut self) {
+        if let Some(network) = self
+            .feed
+            .as_ref()
+            .filter(|f| f.linked.is_some())
+            .map(|f| f.network)
+        {
+            self.open_feed(network);
+        }
+    }
+
     /// A key in the feed's pane, before the keys every pane has. False if
     /// it's one of those: quitting, help, commands, the picker, jumps,
     /// going back to the list.
@@ -4091,6 +4191,7 @@ impl App {
             Side::Left => 'h',
             Side::Right => 'l',
         };
+        let linked = self.feed.as_ref().is_some_and(|f| f.linked.is_some());
         let motion = match key.code {
             KeyCode::Char('j') | KeyCode::Down => Some(1),
             KeyCode::Char('k') | KeyCode::Up => Some(-1),
@@ -4116,6 +4217,9 @@ impl App {
             KeyCode::Char('o') => self.open_post_outside(),
             KeyCode::Char('y') => self.copy_post_link(),
             KeyCode::Char('r') => self.reload_feed(),
+            KeyCode::Char('f') if linked => {
+                self.status = Some("This is one post: Esc goes on to the feed".into())
+            }
             KeyCode::Char('f') => self.switch_threads_feed(),
             KeyCode::Char('c') => self.toggle_comments(),
             // The comments pane is on the post's right.
@@ -4123,6 +4227,7 @@ impl App {
                 self.comments_focus = true
             }
             KeyCode::Esc if self.playing.is_some() => self.stop_video(),
+            KeyCode::Esc if linked => self.back_to_feed(),
             KeyCode::Char('q' | '?' | ':' | 's' | 'g') | KeyCode::Esc | KeyCode::Tab => {
                 return false;
             }
@@ -4188,8 +4293,11 @@ impl App {
         }
     }
 
-    /// `r`: the newest posts again.
+    /// `r`: the newest posts again, or the linked post.
     fn reload_feed(&mut self) {
+        if self.feed.as_ref().is_some_and(|f| f.linked.is_some()) {
+            return self.load_linked_post();
+        }
         let Some(network) = self.feed.as_ref().map(|f| f.network) else {
             return;
         };
@@ -4247,14 +4355,17 @@ impl App {
     }
 
     /// A page of the feed came, or why it didn't. One for a feed left for
-    /// a chat goes in it, for when it's opened again.
+    /// a chat (or a linked post) goes in it, for when it's opened again.
     fn on_feed_page(
         &mut self,
         network: Network,
         load: u64,
         page: Result<(Vec<FeedPost>, bool), String>,
     ) {
-        let open = self.feed.as_ref().is_some_and(|f| f.network == network);
+        let open = self
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.network == network && f.linked.is_none());
         let feed = match open {
             true => self.feed.as_mut(),
             false => self.feeds_kept.get_mut(&network),
@@ -4551,7 +4662,12 @@ impl App {
     }
 
     fn feed_link(&self) -> Option<Link> {
-        let url = self.feed.as_ref()?.selected_post()?.url.as_deref()?;
+        let feed = self.feed.as_ref()?;
+        // A linked post that didn't come is still at its link.
+        let url = feed
+            .selected_post()
+            .and_then(|p| p.url.as_deref())
+            .or(feed.linked.as_ref().map(|l| l.url.as_str()))?;
         Some(Link::from(url))
     }
 
@@ -8023,5 +8139,201 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         let confirm = app.confirm.as_ref().expect("asks before opening it");
         assert_eq!(confirm.site.as_deref(), Some("evil.example"));
+    }
+
+    /// A message from someone else in the open chat, settled under the
+    /// cursor, with `text`.
+    fn settled_message(app: &mut App, text: &str) {
+        let id = app.open.as_ref().unwrap().newest_id().unwrap_or(1 << 40) + 1_000_000;
+        app.on_meta(MetaEvent::Message(Box::new(incoming(app, id, text))));
+        settled(app, id);
+        app.focus = Focus::Messages;
+    }
+
+    #[test]
+    fn enter_on_an_instagram_posts_link_shows_the_post_here_and_esc_goes_on_to_the_feed() {
+        let mut app = test_app("linked-post");
+        let none = KeyModifiers::NONE;
+        instagram_in(&mut app);
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        settled_message(
+            &mut app,
+            "look https://www.instagram.com/reel/DAbc_12-x/?igsh=abc",
+        );
+        press(&mut app, KeyCode::Enter, none);
+        assert!(app.confirm.is_none() && app.open.is_none());
+        let feed = app.feed.as_ref().expect("the post in the chat's place");
+        assert_eq!(
+            feed.linked.as_ref().map(|l| l.code.as_str()),
+            Some("DAbc_12-x")
+        );
+        assert_eq!(app.selected, Some(FEED));
+        let asked = sent_with(&app, "load_post");
+        assert_eq!(
+            (
+                &asked[0]["network"],
+                &asked[0]["code"],
+                asked[0].get("username")
+            ),
+            (
+                &serde_json::json!("instagram"),
+                &serde_json::json!("DAbc_12-x"),
+                None
+            )
+        );
+        assert!(sent_with(&app, "load_feed").is_empty(), "not the feed yet");
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Loading the post…")),
+            "{rows:#?}"
+        );
+        // An answer to another load is old news.
+        let load = app.feed.as_ref().unwrap().loading.unwrap();
+        app.on_meta(MetaEvent::Post {
+            network: Network::Instagram,
+            load: load + 1,
+            post: Err("late".into()),
+        });
+        assert!(app.feed.as_ref().unwrap().loading.is_some());
+        app.on_meta(MetaEvent::Post {
+            network: Network::Instagram,
+            load,
+            post: Ok(Box::new(post(
+                30,
+                serde_json::json!({"caption": "the reel"}),
+            ))),
+        });
+        let rows = screen(&mut app);
+        for shown in ["Instagram · Post", "the reel", "Esc goes on to the feed"] {
+            assert!(rows.iter().any(|r| r.contains(shown)), "{shown}: {rows:#?}");
+        }
+        // Its comments open as a feed post's.
+        press(&mut app, KeyCode::Char('c'), none);
+        assert_eq!(sent_with(&app, "load_comments")[0]["post_id"], 30);
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.comments.is_none(), "Esc closes them first");
+        // `r` asks for it again, not for the feed.
+        press(&mut app, KeyCode::Char('r'), none);
+        assert_eq!(sent_with(&app, "load_post").len(), 2);
+        assert!(sent_with(&app, "load_feed").is_empty());
+        // Esc: the feed itself, its first page.
+        press(&mut app, KeyCode::Esc, none);
+        let feed = app.feed.as_ref().unwrap();
+        assert!(feed.linked.is_none() && feed.network == Network::Instagram);
+        assert_eq!(sent_with(&app, "load_feed").len(), 1);
+        // Ctrl-o goes back to the chat it was opened from.
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(app.open.as_ref().map(|o| o.chat_id), Some(chat_id));
+        assert!(app.feeds_kept.contains_key(&Network::Instagram));
+    }
+
+    #[test]
+    fn a_linked_post_leaves_the_feed_as_it_was_and_goes_when_left() {
+        let mut app = test_app("linked-keeps-feed");
+        let none = KeyModifiers::NONE;
+        let chat_id = app.open.as_ref().unwrap().chat_id;
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            (1..=3).map(|i| post(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        press(&mut app, KeyCode::Char('j'), none);
+        // Back in the chat, a link to one.
+        app.focus = Focus::Chats;
+        app.chats.show(List::Main);
+        app.chats.refresh();
+        app.selected = Some(chat_id);
+        press(&mut app, KeyCode::Enter, none);
+        settled_message(&mut app, "https://instagram.com/maya.lens/p/DAbc12/");
+        press(&mut app, KeyCode::Enter, none);
+        assert_eq!(
+            app.feed
+                .as_ref()
+                .and_then(|f| f.linked.as_ref())
+                .map(|l| l.code.as_str()),
+            Some("DAbc12")
+        );
+        // A page for the feed meanwhile goes to the feed, not the post.
+        let kept = app
+            .feeds_kept
+            .get(&Network::Instagram)
+            .expect("the feed, kept");
+        assert_eq!((kept.selected, kept.posts.len()), (1, 3));
+        // The feed's row opens the feed as it was; the post is gone.
+        app.focus = Focus::Chats;
+        app.chats.show(List::Network(Network::Instagram));
+        app.chats.refresh();
+        app.selected = Some(FEED);
+        let loads = sent_with(&app, "load_feed").len();
+        press(&mut app, KeyCode::Enter, none);
+        let feed = app.feed.as_ref().unwrap();
+        assert!(feed.linked.is_none());
+        assert_eq!((feed.selected, feed.posts.len()), (1, 3));
+        assert_eq!(sent_with(&app, "load_feed").len(), loads);
+    }
+
+    #[test]
+    fn a_threads_link_names_its_author_and_a_post_that_cant_come_says_why() {
+        let mut app = test_app("linked-thread");
+        let none = KeyModifiers::NONE;
+        threads_in(&mut app);
+        settled_message(&mut app, "https://www.threads.net/@maya.lens/post/C8xYz-1");
+        press(&mut app, KeyCode::Enter, none);
+        let asked = sent_with(&app, "load_post");
+        assert_eq!(
+            (
+                &asked[0]["network"],
+                &asked[0]["code"],
+                &asked[0]["username"]
+            ),
+            (
+                &serde_json::json!("threads"),
+                &serde_json::json!("C8xYz-1"),
+                &serde_json::json!("maya.lens")
+            )
+        );
+        assert_eq!(app.selected, Some(chats::THREADS_FEED));
+        let load = app.feed.as_ref().unwrap().loading.unwrap();
+        app.on_meta(MetaEvent::Post {
+            network: Network::Threads,
+            load,
+            post: Err("Threads has no post of this link that this account can see; o opens it on threads.com.".into()),
+        });
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Threads · Post")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("Esc goes on to the feed")),
+            "{rows:#?}"
+        );
+        // `o` would open the link itself.
+        assert_eq!(
+            app.feed_link().map(|l| l.url),
+            Some("https://www.threads.net/@maya.lens/post/C8xYz-1".to_string())
+        );
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(
+            sent_with(&app, "load_feed").is_empty(),
+            "f isn't for one post"
+        );
+    }
+
+    #[test]
+    fn a_post_link_of_a_network_not_logged_into_opens_as_any_link() {
+        let mut app = test_app("linked-logged-out");
+        app.focus = Focus::Messages;
+        let id = app.open.as_ref().unwrap().newest_id().unwrap() + 1_000_000;
+        // The demo is logged into Instagram, not Threads.
+        let url = "https://www.threads.com/@maya.lens/post/C8xYz";
+        app.on_meta(MetaEvent::Message(Box::new(incoming_disguised(
+            &app, id, url,
+        ))));
+        settled(&mut app, id);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.feed.is_none() && sent_with(&app, "load_post").is_empty());
+        assert_eq!(opened_link(&app).as_deref(), Some(url));
     }
 }

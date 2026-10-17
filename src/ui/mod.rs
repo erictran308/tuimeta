@@ -2098,6 +2098,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             normal,
             "  `Space` pause · `,/.` back/on 5 s · `m` mute · `Esc` stop · `j/k` next/previous post · `[ ]` carousel · `o` open on the website · `h` back",
         ),
+        Focus::Messages if app.feed.as_ref().is_some_and(|f| f.linked.is_some()) => (
+            normal,
+            "  `Esc` on to the feed · `Enter` photo, video or link · `[ ]` photos · `c` comments · `o` open on the website · `y` copy link · `r` reload · `Ctrl-o` back · `?` help · `q` quit",
+        ),
         Focus::Messages
             if app
                 .feed

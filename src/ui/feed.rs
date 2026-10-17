@@ -66,7 +66,12 @@ pub fn draw(
     colors: &Colors,
 ) -> Option<Rect> {
     let feed = view.feed;
-    let mut title = format!(" {} · Feed ", feed.network.name());
+    let what = if feed.linked.is_some() {
+        "Post"
+    } else {
+        "Feed"
+    };
+    let mut title = format!(" {} · {what} ", feed.network.name());
     if feed.loading.is_some() {
         title.push_str("loading… ");
     }
@@ -76,11 +81,7 @@ pub fn draw(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if feed.posts.is_empty() {
-        let what = match (&feed.error, feed.loading.is_some(), feed.has_more) {
-            (_, true, _) => "Loading the feed…".to_string(),
-            (Some(why), ..) => format!("{why}\nPress r to try again"),
-            _ => "Nothing in the feed yet".to_string(),
-        };
+        let what = empty_feed(feed, "Nothing in the feed yet");
         let rows = what.lines().count() as u16;
         let middle = Rect {
             y: inner.y + inner.height.saturating_sub(rows) / 2,
@@ -209,12 +210,7 @@ pub fn draw(
         }
     }
     if i == feed.posts.len() && y < inner.height {
-        let end = match (&feed.error, feed.loading.is_some(), feed.has_more) {
-            (_, true, _) => Some("Loading more…".to_string()),
-            (Some(why), ..) => Some(format!("Couldn't load more: {why}")),
-            (None, false, false) => Some("You're all caught up".to_string()),
-            _ => None,
-        };
+        let end = feed_end(feed);
         if let Some(end) = end {
             let row = Rect::new(inner.x, inner.y + y, inner.width, 1);
             frame.render_widget(
@@ -226,6 +222,29 @@ pub fn draw(
         }
     }
     video_box
+}
+
+/// What an empty feed's pane says: loading, why it didn't, or `nothing`.
+pub(super) fn empty_feed(feed: &Feed, nothing: &str) -> String {
+    match (&feed.error, feed.loading.is_some(), &feed.linked) {
+        (_, true, Some(_)) => "Loading the post…".to_string(),
+        (_, true, None) => "Loading the feed…".to_string(),
+        (Some(why), _, Some(_)) => format!("{why}\nr tries again · Esc goes on to the feed"),
+        (Some(why), _, None) => format!("{why}\nPress r to try again"),
+        _ => nothing.to_string(),
+    }
+}
+
+/// What's said under the last post: more coming, why they didn't, that
+/// there are none, or, under a post a link opened, where Esc goes.
+pub(super) fn feed_end(feed: &Feed) -> Option<String> {
+    match (&feed.error, feed.loading.is_some(), feed.has_more) {
+        _ if feed.linked.is_some() => Some("Esc goes on to the feed".to_string()),
+        (_, true, _) => Some("Loading more…".to_string()),
+        (Some(why), ..) => Some(format!("Couldn't load more: {why}")),
+        (None, false, false) => Some("You're all caught up".to_string()),
+        _ => None,
+    }
 }
 
 /// The room a post's photo has inside the feed's pane `inner`: the columns

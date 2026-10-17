@@ -151,6 +151,44 @@ func (s *Server) loadFeed(c *call) (any, error) {
 	return map[string]any{"posts": raw, "has_more": more}, nil
 }
 
+// loadPost is the post a link names. The network's own answer is checked
+// by it; here only that the code and username can be ones.
+func (s *Server) loadPost(c *call) (any, error) {
+	p, err := decode[struct {
+		Network  string `json:"network"`
+		Code     string `json:"code"`
+		Username string `json:"username"`
+		Width    int    `json:"width"`
+		Height   int    `json:"height"`
+	}](c.params)
+	if err != nil {
+		return nil, err
+	}
+	if !backend.PostCode(p.Code) {
+		return nil, proto.Err(proto.BadRequest, "code isn't a post's code.")
+	}
+	if p.Username != "" && !backend.Username(p.Username) {
+		return nil, proto.Err(proto.BadRequest, "username isn't a username.")
+	}
+	n, b, err := s.network(p.Network)
+	if err != nil {
+		return nil, err
+	}
+	pl, ok := b.(backend.PostLoader)
+	if !ok {
+		return nil, proto.Err(proto.Unsupported, n.Title()+" has no posts in tuimeta.")
+	}
+	if err := s.ready(n); err != nil {
+		return nil, err
+	}
+	post, err := pl.LoadPost(c.ctx, p.Code, p.Username, feedBox(p.Width, p.Height))
+	if err != nil {
+		return nil, err
+	}
+	s.notePosts(n, []proto.Post{post})
+	return map[string]any{"post": post}, nil
+}
+
 // notePosts keeps which network gave the posts, so load_comments, which
 // names only a post, goes to it; a post it didn't give is not_found.
 func (s *Server) notePosts(n proto.Network, posts []proto.Post) {

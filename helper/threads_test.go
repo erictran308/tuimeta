@@ -8,6 +8,7 @@ import (
 
 	"github.com/erictran308/tuimeta/helper/internal/fake"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
+	"github.com/erictran308/tuimeta/helper/internal/wiretest"
 )
 
 func TestFakeThreadsHasTwoFeedsOfEverythingAThreadsPostCanBeAndNoChats(t *testing.T) {
@@ -127,5 +128,47 @@ func TestFakeThreadsHasTwoFeedsOfEverythingAThreadsPostCanBeAndNoChats(t *testin
 	deeper := h.comments(map[string]any{"post_id": post.ID, "replies_of": nested.ID}).Comments
 	if len(deeper) != int(nested.Replies) || deeper[0].ReplyTo != nested.ID {
 		t.Errorf("replies to a reply: %+v", deeper)
+	}
+}
+
+func TestFakePostsOpenByTheCodeInTheirLinks(t *testing.T) {
+	h := startHelper(t, t.TempDir())
+	h.login(proto.Threads)
+	h.login(proto.Instagram)
+	h.login(proto.Messenger)
+	linked := func(network, code string) (proto.Post, *proto.Error) {
+		l := h.c.Call("load_post", map[string]any{"network": network, "code": code})
+		if l.Error != nil {
+			return proto.Post{}, l.Error
+		}
+		return wiretest.Decode[struct {
+			Post proto.Post `json:"post"`
+		}](t, l.Result).Post, nil
+	}
+	forYou := h.feed(map[string]any{"network": "threads", "limit": 10}).Posts
+	repost := forYou[7]
+	if repost.Context == "" {
+		t.Fatalf("post 7 isn't the repost: %+v", repost)
+	}
+	code := repost.URL[strings.LastIndex(repost.URL, "/")+1:]
+	p, err := linked("threads", code)
+	if err != nil || p.ID != repost.ID || p.Caption != repost.Caption || p.Context != "" {
+		t.Errorf("%s: %+v %v", code, p, err)
+	}
+	// A post of the other feed, not loaded yet, and its replies.
+	if p, err := linked("threads", "FAKETHFL03"); err != nil || p.ID != fake.ThreadsFeedLen+4 {
+		t.Errorf("following: %+v %v", p, err)
+	} else if r := h.comments(map[string]any{"post_id": p.ID}); len(r.Comments) == 0 {
+		t.Error("no replies")
+	}
+	// Instagram's, never suggested when asked for.
+	if p, err := linked("instagram", "FAKEPOST07"); err != nil || p.ID != 8 || p.Suggested || len(p.Media) == 0 {
+		t.Errorf("instagram: %+v %v", p, err)
+	}
+	if _, err := linked("instagram", "FAKEPOST99"); err == nil || err.Code != proto.NotFound {
+		t.Errorf("no such post: %v", err)
+	}
+	if _, err := linked("messenger", "FAKEPOST07"); err == nil || err.Code != proto.Unsupported {
+		t.Errorf("messenger: %v", err)
 	}
 }
