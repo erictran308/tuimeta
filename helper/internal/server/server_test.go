@@ -218,6 +218,7 @@ func startWith(t *testing.T, setup func(*harness)) *harness {
 	srv.Add(ig)
 	wa := &linkRecorder{Unavailable: backend.Unavailable{Net: proto.WhatsApp, Events: srv.Events}, accepted: make(chan struct{}, 4)}
 	srv.Add(wa)
+	srv.Add(&backend.Unavailable{Net: proto.Threads, Events: srv.Events})
 	h := &harness{t: t, srv: srv, stdin: inW, done: make(chan struct{}), stub: st, ig: ig, wa: wa, logBuf: logBuf}
 	if setup != nil {
 		setup(h)
@@ -241,12 +242,12 @@ func TestTheFirstLineIsHello(t *testing.T) {
 	if first.Seq != 0 || first.Event != "hello" {
 		t.Fatalf("first line = %s", first.Raw)
 	}
-	// Version 5: Instagram's home feed, load_feed.
-	if v := wiretest.Field[int](t, first, "version"); v != 5 || proto.Version != 5 {
+	// Version 6: Threads, a network with a feed and no chats.
+	if v := wiretest.Field[int](t, first, "version"); v != 6 || proto.Version != 6 {
 		t.Errorf("version = %d", v)
 	}
 	nets := wiretest.Field[[]string](t, first, "networks")
-	if strings.Join(nets, ",") != "messenger,instagram,whatsapp" {
+	if strings.Join(nets, ",") != "messenger,instagram,whatsapp,threads" {
 		t.Errorf("networks = %v", nets)
 	}
 	// Then each network's account.

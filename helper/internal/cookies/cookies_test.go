@@ -50,6 +50,29 @@ func TestInstagramNeedsItsOwnCookies(t *testing.T) {
 	}
 }
 
+func TestThreadsTakesThreadsComsCookiesInTheOrderGiven(t *testing.T) {
+	export := `[{"domain":".instagram.com","name":"sessionid","value":"ig"},` +
+		`{"domain":".threads.com","name":"csrftoken","value":"c"},{"domain":".threads.com","name":"sessionid","value":"th"},` +
+		`{"domain":"www.threads.com","name":"ds_user_id","value":"5"}]`
+	s, err := Parse(proto.Threads, export)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Get("sessionid") != "th" || s.Len() != 3 {
+		t.Errorf("instagram.com's session was taken: %d cookies", s.Len())
+	}
+	var names []string
+	for _, c := range s.List() {
+		names = append(names, c.Name)
+	}
+	if strings.Join(names, ",") != "csrftoken,sessionid,ds_user_id" {
+		t.Errorf("order %v", names)
+	}
+	if _, err := Parse(proto.Threads, "sessionid=1; csrftoken=2"); err == nil || !strings.Contains(err.Error(), "ds_user_id") {
+		t.Errorf("missing ds_user_id: %v", err)
+	}
+}
+
 func TestCookiesFromOtherSitesInAnExportAreIgnored(t *testing.T) {
 	input := `[{"domain":"example.com","name":"sessionid","value":"WRONG"},{"domain":".instagram.com","name":"sessionid","value":"right"},{"domain":"www.instagram.com","name":"ds_user_id","value":"2"},{"domain":"instagram.com","name":"csrftoken","value":"c"}]`
 	s, err := Parse(proto.Instagram, input)

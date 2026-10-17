@@ -1,7 +1,7 @@
-# tuimeta helper protocol, version 5
+# tuimeta helper protocol, version 6
 
 `tuimeta-helper` is a separate program (Go, AGPL-3.0-or-later) that speaks
-Messenger, Instagram and WhatsApp for tuimeta (Rust, MIT). tuimeta starts it as a child
+Messenger, Instagram, WhatsApp and Threads for tuimeta (Rust, MIT). tuimeta starts it as a child
 process and talks to it over stdin/stdout. The helper is "a tiny TDLib for
 Meta": it hides each network's ids and protocols behind one small model, so
 tuimeta's UI code works the way it did with TDLib.
@@ -41,7 +41,7 @@ raw newline (JSON escapes them).
   `timeout`, `cancelled`, `internal`. `message` is one sentence a person can act on; tuimeta may show
   it in its status bar.
 - The helper's first line is always:
-  `{"event":"hello","version":5,"helper":"<semver>","networks":["messenger","instagram","whatsapp"]}`.
+  `{"event":"hello","version":6,"helper":"<semver>","networks":["messenger","instagram","whatsapp","threads"]}`.
   tuimeta refuses to go on if `version` isn't one it knows. (Version 2 added
   `login_cookies`' `browser`: a helper that ignored it would log in as
   another browser than the user asked for. Version 3 added WhatsApp, which
@@ -50,7 +50,10 @@ raw newline (JSON escapes them).
   what tuimeta checked when it was listed: a helper that read only paths
   would upload a file swapped since. Version 5 added Instagram's home feed,
   `load_feed` and its posts: tuimeta lists the feed only with a helper that
-  has it.)
+  has it. Version 6 added Threads, a network with a feed and replies and no
+  chats, and what its posts have that Instagram's don't: `reposts`,
+  `shares`, `context`, `continues`, `quoted`, `link_preview`, posts without
+  media, and a comment's `attachment`.)
 - No line the helper writes is longer than 8 MiB. An answer that would be
   is sent as an `internal` error for its `id` instead, and an event that would
   be is dropped; `history` stops a page short to fit (see `history`).
@@ -70,8 +73,9 @@ raw newline (JSON escapes them).
 All ids are numbers the helper assigns, so tuimeta never sees a network's own
 ids.
 
-- `network`: `"messenger"`, `"instagram"` or `"whatsapp"`. One account per
-  network.
+- `network`: `"messenger"`, `"instagram"`, `"whatsapp"` or `"threads"`. One
+  account per network. Threads has no chats, only its feed (`load_feed`)
+  and its posts' replies (`load_comments`).
 - `chat_id` (i64 > 0): unique across all networks, stable across runs
   (the helper persists the mapping).
 - `user_id` (i64 > 0): people, including yourself; unique across networks,
@@ -208,8 +212,9 @@ message.
 
 ### Post
 
-A post of the home feed (`load_feed`): photos and videos from the people and
-pages the account follows, in the order the network puts them.
+A post of a home feed (`load_feed`): photos, videos and, on Threads, text
+from the people and pages the account follows, in the order the network
+puts them.
 
 ```json
 {
@@ -219,11 +224,17 @@ pages the account follows, in the order the network puts them.
              "photo": {"file_id": 40, "width": 150, "height": 150}},   // photo ?
   "date": 1759912345,           // unix seconds
   "caption": "sunset over the lake",   // "" when there's none
-  "media": [Media],             // in order, 1 to 20: several are a carousel
+  "media": [Media],             // in order, up to 20: several are a carousel
   "likes": 120,                 // ? absent when the author hides the count
-  "comments": 8,                // ?
+  "comments": 8,                // ? on Threads, its replies
+  "reposts": 3,                 // ? Threads: reposts and quotes of it
+  "shares": 18,                 // ? Threads: times it was sent on
   "url": "https://www.instagram.com/p/DAbc123/",  // the post on the network's website
-  "suggested": false            // Instagram's pick from an account you don't follow
+  "suggested": false,           // Instagram's pick from an account you don't follow
+  "context": "sam reposted",    // ? Threads: the line over the post
+  "continues": false,           // Threads: it goes on from the post before it
+  "quoted": {Post},             // ? Threads: the post it quotes
+  "link_preview": {LinkPreview} // ? Threads: the card of a link in its text
 }
 ```
 
@@ -231,7 +242,10 @@ pages the account follows, in the order the network puts them.
   people seen only in the feed aren't added to anyone's chats or users.
   `name` may be empty (then `username` is what to show).
 - `caption` is plain text (no `entities`): at most 2200 characters, as
-  Instagram allows, longer ones cut.
+  Instagram allows, longer ones cut. On Threads it's the post's text, with
+  links and mentions as the plain words the post shows.
+- An Instagram post has 1 to 20 `media`; a Threads post 0 (text alone) to
+  20.
 - Each `media` is a `photo` or a `video` (a reel too). For a photo,
   `file_id` is the picture about 1080 px wide (the smallest at least that
   wide, else the largest), for the photo viewer, and `thumbnail` the one
@@ -248,16 +262,33 @@ pages the account follows, in the order the network puts them.
   each a whole file (a representation's `BaseURL`). A video with neither
   still comes, with `file_id` 0, so its post and cover show. `width` and
   `height` are the media's own. Nothing is downloaded until asked for.
-- `url` is always `https://www.instagram.com/p/<code>/` or
-  `https://www.instagram.com/reel/<code>/`.
+- `url` is, on Instagram, always `https://www.instagram.com/p/<code>/` or
+  `https://www.instagram.com/reel/<code>/`; on Threads always
+  `https://www.threads.com/@<username>/post/<code>`.
 - `suggested` posts are the ones Instagram mixes into the feed from accounts
   the user doesn't follow ("Suggested for you": the timeline's
   `explore_story` rows, and any other row holding a post), in the feed's
-  order with the rest.
+  order with the rest. Threads doesn't mark its picks: its "For you" feed
+  is all picks.
+- Threads only:
+  - `context` is the line Threads puts over a post, one line of plain text
+    ("sam reposted", "First thread"). A repost comes as the post reposted,
+    with `context` naming who reposted it.
+  - `continues` is set on a post that goes on from the one before it in the
+    feed: a thread of several posts comes as consecutive posts, the first
+    without `continues`.
+  - `quoted` is the post this one quotes, as a Post with `id` 0 (it isn't
+    one of the feed's: it has no comments to load) and no `quoted`,
+    `context` or `continues` of its own.
+  - `link_preview` is the card Threads made for a link in the post: its
+    `url` the link's own address (Threads' `l.threads.com` redirect taken
+    off), `title`, and `image` when the card has one on Meta's CDN.
+    `description` is empty.
 
 ### Comment
 
-A comment on a post of the feed, or a reply to one (`load_comments`).
+A comment on a post of the feed, or a reply to one (`load_comments`). On
+Threads, a reply to the post, or a reply to a reply.
 
 ```json
 {
@@ -266,8 +297,9 @@ A comment on a post of the feed, or a reply to one (`load_comments`).
   "date": 1759912345,           // unix seconds
   "text": "so good 😍",
   "likes": 4,                   // ? absent when the network doesn't say
-  "replies": 2,                 // replies it has; 0 for a reply
-  "reply_to": 7                 // ? the comment a reply answers
+  "replies": 2,                 // replies it has; on Instagram 0 for a reply
+  "reply_to": 7,                // ? the comment a reply answers
+  "attachment": "photo"         // ? Threads: what it holds besides its text
 }
 ```
 
@@ -275,6 +307,9 @@ A comment on a post of the feed, or a reply to one (`load_comments`).
 - `text` is plain text (no `entities`), at most 2200 characters, longer
   ones cut. A comment can mention people (`@name`) and tags (`#tag`) as
   plain words.
+- `attachment` is `photo`, `video` or `carousel` (several), for a Threads
+  reply that has them: only named, not downloadable. On Threads a reply to
+  a reply can have replies of its own; `replies` counts the ones it has.
 
 ### File
 
@@ -307,11 +342,11 @@ A comment on a post of the feed, or a reply to one (`load_comments`).
 
 | method | params | result |
 |---|---|---|
-| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken`. `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version; WhatsApp, which logs in with `login_link`), `bad_cookies`, `checkpoint`, `network`, `cancelled` (a newer `login_cookies` or a `logout` for the network came before it was done; nothing of it is saved). |
+| `login_cookies` | `network`, `cookies`, `browser?` | `{}` once logged in and connected. `cookies` is what the user pasted: a `Cookie:` header value (`c_user=…; xs=…`) or the JSON browser extensions export (an array of `{name, value}` or an object). Required: Messenger `c_user`, `xs`, `datr`; Instagram `sessionid`, `ds_user_id`, `csrftoken` (instagram.com's); Threads `sessionid`, `ds_user_id`, `csrftoken` (threads.com's, which aren't instagram.com's). `browser` is the browser the cookies came from, Chrome and its full version (`"Chrome 150.0.7712.45"`; "Google Chrome" and chrome://version's "(Official Build)" notes are accepted too): the helper then says it's that Chrome on this computer's system (user agent and client hints, see below). Absent, it says what the libraries say (Chrome 141 on Linux). Saved with the session, so the session never changes browser; logging in again is the only way to change it. Errors: `bad_request` (`browser` isn't Chrome with a full version; WhatsApp, which logs in with `login_link`), `bad_cookies`, `checkpoint`, `network`, `cancelled` (a newer `login_cookies` or a `logout` for the network came before it was done; nothing of it is saved). |
 | `login_link` | `network`, `phone?`, `attempt?` | `{}` once linked and connected (account `ready`): WhatsApp, which logs in by linking tuimeta as a new device of the account (on the phone: Settings → Linked devices → Link a device). Without `phone`, `login_code` events with `qr` follow: the first at once and good for a minute, then a fresh one about every 20 seconds, for about 2½ minutes in all. With `phone` (the account's number in international form: digits, with an optional leading `+`, spaces and dashes), one `login_code` with `pairing` follows, to type on the phone under "Link with phone number instead". `attempt` is a number tuimeta picks for this login, given back in its `login_code` events and named by `cancel_login`. A newer `login_link`, `cancel_login` or `logout` for the network ends a waiting one, until the phone has confirmed the link: from then on it completes (only `logout` ends it), rather than leaving a device in the phone's list that nothing here can use. Errors: `bad_request` (not a linking network, `phone` isn't a number, or a device that still works is linked: log out first), `timeout` (nothing was scanned or typed in time), `cancelled`, `network`, `unsupported` (WhatsApp asked for something tuimeta can't do, like a passkey). |
 | `cancel_login` | `network`, `attempt?` | `{}`: ends the waiting `login_link` of that attempt (any, without one), so no code shown for it works any more; it answers `cancelled`. A `login_link` of that attempt, or an older one, that comes after it isn't started, and answers `cancelled` too. A link of another attempt, or one the phone has already confirmed, goes on. |
-| `logout` | `network` | `{}`. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). For Messenger and Instagram it's local: it never ends the session on Meta's side, and the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). For WhatsApp, where tuimeta is a linked device of its own, it also unlinks that device, as "Log out" in the phone's list of linked devices does; the phone and any other linked devices stay logged in. |
-| `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. A network's loads run one at a time, and one network's don't wait for another's. |
+| `logout` | `network` | `{}`. Disconnects and deletes everything stored for that network (for Messenger, its encrypted-chat device store too). For Messenger, Instagram and Threads it's local: it never ends the session on Meta's side, and the web session the cookies belong to stays valid until the user ends it themselves (in the browser, or in the site's list of logged-in devices). For WhatsApp, where tuimeta is a linked device of its own, it also unlinks that device, as "Log out" in the phone's list of linked devices does; the phone and any other linked devices stay logged in. |
+| `load_chats` | `network?`, `limit` | `{"has_more": bool}`; sends `chat` (and `user`) events for up to `limit` more chats, newest activity first, beyond those already sent. tuimeta calls it again until `has_more` is false. A network's loads run one at a time, and one network's don't wait for another's. Threads has no chats: `{"has_more": false}`, and no events. |
 | `history` | `chat_id`, `before?`, `after?`, `around?`, `limit` | `{"messages": [Message], "has_more": bool}`, oldest first. With no `before`/`after`/`around`: the newest. They are positions in time, not lookups: any id works, a message's or not (`ms << 8` order), so `before` gives messages with smaller ids, `after` larger ones, and `around` about `limit/2` on each side of it (including one with that id). WhatsApp keeps no history on its servers: a chat has what this device received since it was linked and what the phone sent it then, and older messages are asked of the phone, which must be online (a page may take up to 20 s; without an answer, what's here is the answer). A page whose messages would come to more than 6 MiB is cut short to fit a line, whole albums at a time and never below one message: from its far end (the oldest, or the newest for `after`; for `around`, the end farther from its message, which stays), and `has_more` is then true (for `around`, only when the older end was cut). |
 | `get_message` | `chat_id`, `message_id` | `{"message": Message}` (e.g. one a reply answers that isn't loaded) |
 | `send_text` | `chat_id`, `text`, `reply_to?` | `{"message_id": i64}` (temporary). The text goes as typed: all three networks read `*bold*`-style formatting themselves. |
@@ -322,11 +357,11 @@ A comment on a post of the feed, or a reply to one (`load_comments`).
 | `mark_read` | `chat_id`, `message_id` | `{}`: marks the chat read up to that message. tuimeta doesn't ask it for a chat with `request: true` (a receipt would tell a stranger you read them before you chose to answer); Messenger and Instagram answer `{}` for one and mark and send nothing, so it stays unread until it's accepted. |
 | `typing` | `chat_id`, `typing` | `{}`. A chat's changes go out one at a time, in the order they were requested: one whose turn comes after a later-requested one went out is dropped (answered `{}`), so a start can't overtake its stop. |
 | `download` | `file_id`, `priority` (`high`/`low`) | `{}`, then `file` events. |
-| `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. On WhatsApp: the contacts and groups this device knows, and, for a query that is a phone number written with `+` and its country code, that number if it's on WhatsApp. |
-| `open_dm` | `network`, `user_id` | `{"chat_id": i64}`: the chat with that person, made if needed. |
+| `search` | `network`, `query` | `{"results": [{"chat_id?", "user_id?", "title", "username?", "kind"}]}`: people and groups to start or open a chat with. On WhatsApp: the contacts and groups this device knows, and, for a query that is a phone number written with `+` and its country code, that number if it's on WhatsApp. Threads answers `unsupported`. |
+| `open_dm` | `network`, `user_id` | `{"chat_id": i64}`: the chat with that person, made if needed. Threads answers `unsupported`. |
 | `mute` | `chat_id`, `muted` | `{}` |
-| `load_feed` | `network`, `limit`, `fresh?`, `width?`, `height?` | `{"posts": [Post], "has_more": bool}`: the next posts of the account's home feed, about `limit` of them (the network gives pages of its own size, so fewer or more can come), after those already given. `fresh: true` starts again from the top, as pulling the feed down does: the newest posts, whatever was loaded before. `width` and `height` are the largest box, in pixels, tuimeta draws a post's picture in, so each `thumbnail` is no bigger than it needs to be (see Post); without both above 0 there's no box, and a side past 8192 counts as 8192. Suggested posts come too, marked `suggested`; ads are left out. A network's loads run one at a time, in the order asked. Only Instagram has one: Messenger and WhatsApp answer `unsupported`. Errors: `not_logged_in`, `network`, `checkpoint`. |
-| `load_comments` | `post_id`, `replies_of?`, `more?` | `{"comments": [Comment], "has_more": bool}`: the comments on a post that `load_feed` gave, a page at a time, in the network's order (the post's page shows its top comments first). Without `more`, the first page, again if asked again; with `more: true`, the page after the last one given. With `replies_of` (a `comment_id`), that comment's replies instead, oldest first, paged the same way. A post's loads run one at a time, in the order asked. Errors: `not_found` (a post or comment this run didn't give), `not_logged_in`, `network`, `checkpoint`. |
+| `load_feed` | `network`, `limit`, `fresh?`, `width?`, `height?`, `feed?` | `{"posts": [Post], "has_more": bool}`: the next posts of the account's home feed, about `limit` of them (the network gives pages of its own size, so fewer or more can come), after those already given. `fresh: true` starts again from the top, as pulling the feed down does: the newest posts, whatever was loaded before. `width` and `height` are the largest box, in pixels, tuimeta draws a post's picture in, so each `thumbnail` is no bigger than it needs to be (see Post); without both above 0 there's no box, and a side past 8192 counts as 8192. Suggested posts come too, marked `suggested`; ads are left out. A network's loads run one at a time, in the order asked. `feed` picks Threads' feed: `for_you` (the default) or `following` (only the accounts you follow, newest first); switching starts it from the top, as `fresh` does, and Instagram ignores it. Instagram and Threads have one: Messenger and WhatsApp answer `unsupported`. Errors: `bad_request` (a `feed` that isn't one of those), `not_logged_in`, `network`, `checkpoint`. |
+| `load_comments` | `post_id`, `replies_of?`, `more?` | `{"comments": [Comment], "has_more": bool}`: the comments on a post that `load_feed` gave, a page at a time, in the network's order (the post's page shows its top comments first). Without `more`, the first page, again if asked again; with `more: true`, the page after the last one given. With `replies_of` (a `comment_id`), that comment's replies instead, oldest first, paged the same way (on Threads in Threads' order, which puts the best first). On Threads the comments are the post's replies, top ones first. A post's loads run one at a time, in the order asked. Errors: `not_found` (a post or comment this run didn't give), `not_logged_in`, `network`, `checkpoint`. |
 
 `send_text` and `send_files` first send a `message` event for each new
 message, with `"state": "pending"`, its temporary id, `outgoing: true`, your
@@ -370,9 +405,15 @@ when tuimeta asks.
   WhatsApp's servers to work (the helper's README lists them).
 - No URL from a message is ever fetched.
 - The feed is only read: `load_feed` and `load_comments` send Instagram
-  nothing about what was looked at (no seen posts, view, impression or
-  video-play logging) and never like, follow or comment. Files of its posts
-  download only on `download`, like any other.
+  and Threads nothing about what was looked at (no seen posts, view,
+  impression or video-play logging: on Threads the list of posts seen goes
+  out empty, as from a page just opened, and none of the website's logging
+  requests are made) and never like, repost, follow or reply. Files of its
+  posts download only on `download`, like any other. On Threads, the only
+  requests are the website's own pages and queries (GraphQL requests the
+  website's code marks as queries, never a mutation) and, when Threads
+  stops taking a query as it was, the website's own JavaScript, fetched
+  without cookies, to find how it's asked now.
 - No message text, names, cookies, tokens or keys in logs, errors or panics.
 
 ## `--fake` mode
@@ -413,5 +454,12 @@ access at all.
   of them verified, one comment of many lines, one with a mention and a
   tag, and some with replies (up to 12, 5 per page). The same post gives
   the same comments every time.
+- Threads has no chats. Its `load_feed` gives 30 made-up posts, 10 per
+  page (the `following` feed another 30, of fewer people), among them text
+  alone (one of many lines, one at Threads' 500 characters), a photo, a
+  carousel of four photos, a video, a quote of another post, a link with
+  its card, a repost (with `context`), and a thread of three posts (the
+  later two `continues`). Its `load_comments` gives replies as Instagram's
+  gives comments, some with an `attachment`, and replies to replies.
 - The run is deterministic apart from timing: the same ids, names and texts
   every time.

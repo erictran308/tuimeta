@@ -59,6 +59,7 @@ mod comments;
 pub(crate) mod feed;
 mod help;
 mod messages;
+pub(crate) mod threads;
 mod viewer;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -379,12 +380,17 @@ fn draw_login(
             format!("{} cookies", network.name()),
             format!(
                 "Log in on {site} in your browser, open its developer tools \
-                 (Application or Storage → Cookies → {site}) and copy {names}. Paste them \
+                 (Application or Storage → Cookies → {site}) and copy {names}{own}. Paste them \
                  here as name=value; name=value…, or paste a cookie export (JSON). They're \
                  your whole session: keep them to yourself. tuimeta keeps them only in \
                  its data folder, readable by you alone.\n{as_browser}",
                 site = network.site(),
                 names = network.cookie_names().join(", "),
+                // Threads' have Instagram's names, but are threads.com's own.
+                own = match network {
+                    Network::Threads => " (threads.com's own: instagram.com's don't work there)",
+                    _ => "",
+                },
                 as_browser = browser_note(browser),
             ),
         ),
@@ -684,7 +690,12 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                         .as_ref()
                         .and_then(|p| Some((p.position?, p.duration?))),
                 };
-                app.video_box = feed::draw(frame, feed_area, view, &mut app.images, colors);
+                app.video_box = match view.feed.network {
+                    Network::Threads => {
+                        threads::draw(frame, feed_area, view, &mut app.images, colors)
+                    }
+                    _ => feed::draw(frame, feed_area, view, &mut app.images, colors),
+                };
                 if let (Some(area), Some(comments)) = (comments_area, app.comments.as_mut()) {
                     let focused = app.focus == Focus::Messages && in_comments;
                     comments::draw(frame, area, comments, focused, colors);
@@ -2070,7 +2081,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages if app.comments.is_some() && app.comments_focus => (
             normal,
-            "  `j/k` comments · `Enter` show or hide replies · `y` copy · `Space` pause · `,/.` seek · `m` mute · `h` the post · `g/G` first/last · `c` or `Esc` close",
+            "  `j/k` move · `Enter` show or hide replies · `y` copy · `Space` pause · `,/.` seek · `m` mute · `h` the post · `g/G` first/last · `c` or `Esc` close",
         ),
         Focus::Messages if app.feed.is_some() && app.comments.is_some() => (
             normal,
@@ -2078,8 +2089,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages if app.feed.is_some() && app.playing.is_some() => (
             normal,
-            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `Esc` stop · `j/k` next/previous post · `[ ]` carousel · `o` open on instagram.com · `h` back",
+            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `Esc` stop · `j/k` next/previous post · `[ ]` carousel · `o` open on the website · `h` back",
         ),
+        Focus::Messages
+            if app
+                .feed
+                .as_ref()
+                .is_some_and(|f| f.network == Network::Threads) =>
+        {
+            (
+                normal,
+                "  `j/k` next/previous post · `[ ]` photos · `Enter` photo, video or link · `c` replies · `f` For you/Following · `o` open on threads.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `?` help · `q` quit",
+            )
+        }
         Focus::Messages if app.feed.is_some() => (
             normal,
             "  `j/k` next/previous post · `[ ]` carousel · `Enter` photo or video · `o` open on instagram.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `s` find anyone · `:` commands · `?` help · `q` quit",

@@ -10,22 +10,26 @@ import (
 )
 
 // Version is the protocol version the hello line announces.
-const Version = 5
+const Version = 6
 
-// Network is "messenger", "instagram" or "whatsapp".
+// Network is "messenger", "instagram", "whatsapp" or "threads".
 type Network string
 
 const (
 	Messenger Network = "messenger"
 	Instagram Network = "instagram"
 	WhatsApp  Network = "whatsapp"
+	// Threads has no chats: only its feed and its posts' replies.
+	Threads Network = "threads"
 )
 
 // Networks lists every network, in the order hello names them.
-var Networks = []Network{Messenger, Instagram, WhatsApp}
+var Networks = []Network{Messenger, Instagram, WhatsApp, Threads}
 
 // Valid reports whether n is one of Networks.
-func (n Network) Valid() bool { return n == Messenger || n == Instagram || n == WhatsApp }
+func (n Network) Valid() bool {
+	return n == Messenger || n == Instagram || n == WhatsApp || n == Threads
+}
 
 // Links reports whether n logs in by linking a device (login_link) rather
 // than with cookies.
@@ -251,8 +255,8 @@ type File struct {
 	Error      string  `json:"error,omitempty"`
 }
 
-// Post is a post of a home feed (load_feed): photos and videos from the
-// people and pages the account follows.
+// Post is a post of a home feed (load_feed): photos, videos and, on
+// Threads, text from the people and pages the account follows.
 type Post struct {
 	ID       int64      `json:"id"`
 	Author   FeedAuthor `json:"author"`
@@ -261,9 +265,23 @@ type Post struct {
 	Media    []Media    `json:"media"`
 	Likes    *int64     `json:"likes,omitempty"`
 	Comments *int64     `json:"comments,omitempty"`
-	URL      string     `json:"url"`
+	// Reposts (reposts and quotes) and Shares (times sent on) are
+	// Threads'.
+	Reposts *int64 `json:"reposts,omitempty"`
+	Shares  *int64 `json:"shares,omitempty"`
+	URL     string `json:"url"`
 	// Suggested is Instagram's pick from an account not followed.
 	Suggested bool `json:"suggested"`
+	// Context is the line Threads puts over the post ("sam reposted").
+	Context string `json:"context,omitempty"`
+	// Continues says the post goes on from the one before it in the feed:
+	// a later post of the same thread.
+	Continues bool `json:"continues"`
+	// Quoted is the post a Threads post quotes, with id 0 and none of
+	// Quoted, Context or Continues of its own.
+	Quoted *Post `json:"quoted,omitempty"`
+	// LinkPreview is Threads' card of a link in the post.
+	LinkPreview *LinkPreview `json:"link_preview,omitempty"`
 }
 
 // FeedAuthor is a post's owner as the feed describes them: not a user, so
@@ -294,7 +312,14 @@ func (p Post) MarshalJSON() ([]byte, error) {
 		return &v
 	}
 	p.Likes, p.Comments = clamp(p.Likes), clamp(p.Comments)
+	p.Reposts, p.Shares = clamp(p.Reposts), clamp(p.Shares)
 	p.Date = max(p.Date, 0)
+	if p.Quoted != nil {
+		// One level only: a quote of a quote is the network's to show.
+		q := *p.Quoted
+		q.ID, q.Quoted, q.Context, q.Continues = 0, nil, "", false
+		p.Quoted = &q
+	}
 	return json.Marshal(plain(p))
 }
 
@@ -308,7 +333,18 @@ type Comment struct {
 	Likes   *int64     `json:"likes,omitempty"`
 	Replies int64      `json:"replies"`
 	ReplyTo int64      `json:"reply_to,omitempty"`
+	// Attachment names what a Threads reply holds besides its text.
+	Attachment Attachment `json:"attachment,omitempty"`
 }
+
+// Attachment is what a Threads reply holds besides its text: only named.
+type Attachment string
+
+const (
+	AttachPhoto    Attachment = "photo"
+	AttachVideo    Attachment = "video"
+	AttachCarousel Attachment = "carousel"
+)
 
 // MarshalJSON keeps counts within what every reader takes, and the author
 // without a photo.

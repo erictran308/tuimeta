@@ -68,6 +68,7 @@ func startHelper(t *testing.T, dir string) *helper {
 var goodCookies = map[proto.Network]string{
 	proto.Messenger: "c_user=1; xs=2; datr=3",
 	proto.Instagram: `[{"name":"sessionid","value":"a"},{"name":"ds_user_id","value":"2"},{"name":"csrftoken","value":"c"}]`,
+	proto.Threads:   "sessionid=t; ds_user_id=5; csrftoken=c",
 }
 
 func (h *helper) login(n proto.Network) {

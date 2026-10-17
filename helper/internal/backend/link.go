@@ -27,16 +27,39 @@ type Linker interface {
 	CancelLink(attempt uint64)
 }
 
-// Feeder is a network with a home feed (Instagram): the server sends
-// load_feed to it, one load at a time.
+// Feeder is a network with a home feed (Instagram, Threads): the server
+// sends load_feed to it, one load at a time.
 type Feeder interface {
 	// LoadFeed is the next posts of the feed, after those it gave since the
 	// last fresh load (or login), and whether more remain. limit is a hint:
 	// the network gives pages of its own size. fresh starts again from the
 	// newest posts. box is what each picture is drawn in, so its thumbnail
-	// is no bigger than that needs. It never tells the network what was
-	// looked at.
-	LoadFeed(ctx context.Context, limit int, fresh bool, box Box) (posts []proto.Post, more bool, err error)
+	// is no bigger than that needs. kind is which of the network's feeds
+	// (Threads'; "" is the default, and Instagram has only one): another
+	// than the last load's starts from the top, as fresh does. It never
+	// tells the network what was looked at.
+	LoadFeed(ctx context.Context, limit int, fresh bool, box Box, kind FeedKind) (posts []proto.Post, more bool, err error)
+}
+
+// FeedKind is one of a network's feeds: Threads has two.
+type FeedKind string
+
+const (
+	// ForYou is Threads' default feed: its picks, from everyone.
+	ForYou FeedKind = "for_you"
+	// Following is only the accounts followed, newest first.
+	Following FeedKind = "following"
+)
+
+// ParseFeedKind reads load_feed's feed: absent is ForYou.
+func ParseFeedKind(s string) (FeedKind, bool) {
+	switch FeedKind(s) {
+	case "", ForYou:
+		return ForYou, true
+	case Following:
+		return Following, true
+	}
+	return "", false
 }
 
 // Box is the largest box, in pixels, tuimeta draws a post's picture in

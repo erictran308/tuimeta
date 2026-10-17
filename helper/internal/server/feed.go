@@ -119,9 +119,14 @@ func (s *Server) loadFeed(c *call) (any, error) {
 		Fresh   bool   `json:"fresh"`
 		Width   int    `json:"width"`
 		Height  int    `json:"height"`
+		Feed    string `json:"feed"`
 	}](c.params)
 	if err != nil {
 		return nil, err
+	}
+	kind, ok := backend.ParseFeedKind(p.Feed)
+	if !ok {
+		return nil, proto.Err(proto.BadRequest, "feed is for_you or following.")
 	}
 	n, b, err := s.network(p.Network)
 	if err != nil {
@@ -134,7 +139,7 @@ func (s *Server) loadFeed(c *call) (any, error) {
 	if err := s.ready(n); err != nil {
 		return nil, err
 	}
-	posts, more, err := f.LoadFeed(c.ctx, feedLimit(p.Limit), p.Fresh, feedBox(p.Width, p.Height))
+	posts, more, err := f.LoadFeed(c.ctx, feedLimit(p.Limit), p.Fresh, feedBox(p.Width, p.Height), kind)
 	if err != nil {
 		return nil, err
 	}

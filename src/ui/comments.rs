@@ -55,7 +55,7 @@ pub fn draw(
     focused: bool,
     colors: &Colors,
 ) {
-    let title = format!(" Comments · {} ", truncate(&comments.author, 40));
+    let title = format!(" {} · {} ", comments.what, truncate(&comments.author, 40));
     let block = bordered(colors)
         .title(title)
         .border_style(border(focused, colors));
@@ -194,6 +194,10 @@ fn header(comment: &Comment, width: usize, now: i64, colors: &Colors) -> Vec<Spa
 fn meta(comments: &Comments, i: usize, icons: bool) -> String {
     let comment = &comments.rows[i];
     let mut parts = Vec::new();
+    // A Threads reply's photo or video isn't shown here, only named.
+    if let Some(what) = comment.attachment {
+        parts.push(format!("[{what}]"));
+    }
     if let Some(likes) = comment.likes.filter(|&n| n > 0) {
         parts.push(match icons {
             true => format!("{HEART} {}", count(likes)),

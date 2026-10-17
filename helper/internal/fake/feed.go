@@ -27,9 +27,10 @@ const (
 
 var _ backend.Feeder = (*Fake)(nil)
 
-// LoadFeed gives the next FeedPage posts; only Instagram has a feed.
-func (f *Fake) LoadFeed(ctx context.Context, _ int, fresh bool, _ backend.Box) ([]proto.Post, bool, error) {
-	if f.net != proto.Instagram {
+// LoadFeed gives the next FeedPage posts; only Instagram and Threads have
+// a feed, and only Threads two (kind).
+func (f *Fake) LoadFeed(ctx context.Context, _ int, fresh bool, _ backend.Box, kind backend.FeedKind) ([]proto.Post, bool, error) {
+	if f.net != proto.Instagram && f.net != proto.Threads {
 		return nil, false, proto.Err(proto.Unsupported, f.net.Title()+" has no feed in tuimeta.")
 	}
 	f.mu.Lock()
@@ -38,13 +39,20 @@ func (f *Fake) LoadFeed(ctx context.Context, _ int, fresh bool, _ backend.Box) (
 	if err != nil {
 		return nil, false, err
 	}
-	if fresh {
-		w.feedAt = 0
+	if f.net != proto.Threads || kind == "" {
+		kind = backend.ForYou
 	}
-	end := min(w.feedAt+FeedPage, len(w.feed))
-	posts := slices.Clone(w.feed[w.feedAt:end])
+	if fresh || kind != w.feedKind {
+		w.feedAt, w.feedKind = 0, kind
+	}
+	feed := w.feed
+	if kind == backend.Following {
+		feed = w.following
+	}
+	end := min(w.feedAt+FeedPage, len(feed))
+	posts := slices.Clone(feed[w.feedAt:end])
 	w.feedAt = end
-	return posts, end < len(w.feed), nil
+	return posts, end < len(feed), nil
 }
 
 // feedAuthor is who posted: one of the network's people, or a page only
@@ -85,6 +93,11 @@ var feedCaptions = []string{
 // the last week, registering their files in a fixed order; f.mu is held
 // (or the world is being built).
 func (f *Fake) buildFeed(w *world) {
+	w.feedKind = backend.ForYou
+	if f.net == proto.Threads {
+		f.buildThreads(w)
+		return
+	}
 	if f.net != proto.Instagram {
 		return
 	}

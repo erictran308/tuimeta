@@ -496,7 +496,7 @@ func unwrapRedirect(raw string) string {
 		}
 		inner := ""
 		switch strings.ToLower(u.Hostname()) {
-		case "l.facebook.com", "l.instagram.com", "lm.facebook.com":
+		case "l.facebook.com", "l.instagram.com", "lm.facebook.com", "l.threads.com", "l.threads.net":
 			inner = u.Query().Get("u")
 		}
 		if inner == "" {

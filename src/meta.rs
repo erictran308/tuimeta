@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 6;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper, twice what it writes at most. A
@@ -37,16 +37,24 @@ pub enum Network {
     Messenger,
     Instagram,
     WhatsApp,
+    /// No chats: only its feed and the replies to its posts.
+    Threads,
 }
 
 impl Network {
-    pub const ALL: [Network; 3] = [Network::Messenger, Network::Instagram, Network::WhatsApp];
+    pub const ALL: [Network; 4] = [
+        Network::Messenger,
+        Network::Instagram,
+        Network::WhatsApp,
+        Network::Threads,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Network::Messenger => "Messenger",
             Network::Instagram => "Instagram",
             Network::WhatsApp => "WhatsApp",
+            Network::Threads => "Threads",
         }
     }
 
@@ -56,12 +64,17 @@ impl Network {
         self == Network::WhatsApp
     }
 
+    /// The network has chats; Threads has only its feed.
+    pub fn has_chats(self) -> bool {
+        self != Network::Threads
+    }
+
     /// The cookies login needs, as the login screen asks for them; none
     /// for a network that [`links`](Self::links).
     pub fn cookie_names(self) -> &'static [&'static str] {
         match self {
             Network::Messenger => &["c_user", "xs", "datr"],
-            Network::Instagram => &["sessionid", "ds_user_id", "csrftoken"],
+            Network::Instagram | Network::Threads => &["sessionid", "ds_user_id", "csrftoken"],
             Network::WhatsApp => &[],
         }
     }
@@ -73,6 +86,7 @@ impl Network {
             Network::Messenger => "facebook.com",
             Network::Instagram => "instagram.com",
             Network::WhatsApp => "WhatsApp on your phone",
+            Network::Threads => "threads.com",
         }
     }
 }
@@ -379,6 +393,24 @@ pub struct FeedPost {
     /// Instagram's pick from an account the user doesn't follow.
     #[serde(default)]
     pub suggested: bool,
+    /// Threads: reposts and quotes of it.
+    #[serde(default, deserialize_with = "lenient")]
+    pub reposts: Option<i64>,
+    /// Threads: times it was sent on.
+    #[serde(default, deserialize_with = "lenient")]
+    pub shares: Option<i64>,
+    /// Threads: the line over the post ("sam reposted").
+    #[serde(default, deserialize_with = "lenient")]
+    pub context: Option<String>,
+    /// Threads: it goes on from the post before it, in one thread.
+    #[serde(default)]
+    pub continues: bool,
+    /// Threads: the post it quotes.
+    #[serde(default, deserialize_with = "lenient")]
+    pub quoted: Option<Box<FeedPost>>,
+    /// Threads: the card of a link in its text.
+    #[serde(default, deserialize_with = "lenient")]
+    pub link_preview: Option<LinkPreview>,
 }
 
 /// Whose post it is, as the feed describes them.
@@ -390,6 +422,8 @@ pub struct FeedAuthor {
     pub username: String,
     #[serde(default)]
     pub verified: bool,
+    #[serde(default, deserialize_with = "lenient")]
+    pub photo: Option<PhotoRef>,
 }
 
 /// A comment on a post of the feed, or a reply to one (`load_comments`).
@@ -407,6 +441,10 @@ pub struct CommentInfo {
     pub replies: i64,
     #[serde(default, deserialize_with = "lenient")]
     pub reply_to: Option<i64>,
+    /// Threads: what the reply holds besides its text (`photo`, `video`,
+    /// `carousel`), only named.
+    #[serde(default, deserialize_with = "lenient")]
+    pub attachment: Option<String>,
 }
 
 /// The items of a list that read, the others left out.
@@ -1011,19 +1049,24 @@ impl Meta {
     /// Asks for the next page of a network's home feed, or with `fresh` its
     /// newest posts again, answered by [`MetaEvent::Feed`] numbered `load`.
     /// `picture` is the largest box, in pixels, a post's picture is drawn
-    /// in: the helper then sends none bigger than that needs.
+    /// in: the helper then sends none bigger than that needs. On Threads,
+    /// `following` asks for the accounts followed rather than For you.
     pub fn load_feed(
         &self,
         network: Network,
         limit: i32,
         fresh: bool,
         picture: Option<(u32, u32)>,
+        following: bool,
         load: u64,
     ) {
         let mut params = json!({"network": network, "limit": limit, "fresh": fresh});
         if let Some((width, height)) = picture {
             params["width"] = width.into();
             params["height"] = height.into();
+        }
+        if network == Network::Threads {
+            params["feed"] = if following { "following" } else { "for_you" }.into();
         }
         self.then("load_feed", params, move |answer| {
             let page = answer.map(|mut result| {
@@ -1577,7 +1620,7 @@ mod tests {
 
         // Instagram's feed: a page of posts, each one shown, and a video
         // that downloads to a file a player can open.
-        meta.load_feed(Network::Messenger, 10, false, None, 1);
+        meta.load_feed(Network::Messenger, 10, false, None, false, 1);
         let refused = next(&mut rx, |e| match e {
             MetaEvent::Feed { page, .. } => Some(page),
             _ => None,
@@ -1599,7 +1642,7 @@ mod tests {
             _ => None,
         })
         .await;
-        meta.load_feed(Network::Instagram, 10, false, Some((600, 600)), 2);
+        meta.load_feed(Network::Instagram, 10, false, Some((600, 600)), false, 2);
         let (posts, more) = next(&mut rx, |e| match e {
             MetaEvent::Feed { load: 2, page, .. } => Some(page.expect("a page")),
             _ => None,
@@ -1629,7 +1672,7 @@ mod tests {
         .await
         .expect("downloaded");
         assert!(Path::new(&path).is_absolute() && Path::new(&path).is_file());
-        meta.load_feed(Network::Instagram, 10, true, None, 3);
+        meta.load_feed(Network::Instagram, 10, true, None, false, 3);
         let (again, _) = next(&mut rx, |e| match e {
             MetaEvent::Feed { load: 3, page, .. } => Some(page.expect("a page")),
             _ => None,
@@ -1683,6 +1726,88 @@ mod tests {
         })
         .await;
         assert!(unknown.is_err(), "a comment this run didn't give");
+
+        // Threads: no chats, a feed of its own (For you and Following), and
+        // its posts' replies.
+        meta.login_cookies(
+            Network::Threads,
+            "sessionid=1; ds_user_id=2; csrftoken=3".into(),
+            None,
+            6,
+        );
+        next(&mut rx, |e| match e {
+            MetaEvent::Account {
+                network: Network::Threads,
+                state: AccountState::Ready,
+                ..
+            } => Some(()),
+            _ => None,
+        })
+        .await;
+        meta.load_feed(Network::Threads, 10, false, Some((600, 600)), false, 8);
+        let (threads, more) = next(&mut rx, |e| match e {
+            MetaEvent::Feed {
+                network: Network::Threads,
+                load: 8,
+                page,
+            } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert!(more && !threads.is_empty());
+        let shown: Vec<crate::feed::Post> = threads
+            .iter()
+            .map(|p| crate::feed::Post::new(p, Network::Threads))
+            .collect();
+        assert!(shown.iter().all(|p| p.url.is_some()), "threads.com links");
+        assert!(shown.iter().any(|p| p.media.is_empty()), "text alone");
+        assert!(shown.iter().any(|p| p.quoted.is_some()), "a quote");
+        assert!(shown.iter().any(|p| p.link.is_some()), "a link card");
+        assert!(shown.iter().any(|p| p.context.is_some()), "a repost");
+        meta.load_feed(Network::Threads, 10, false, None, false, 10);
+        let (next_page, _) = next(&mut rx, |e| match e {
+            MetaEvent::Feed {
+                network: Network::Threads,
+                load: 10,
+                page,
+            } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert!(
+            next_page
+                .iter()
+                .all(|p| threads.iter().all(|t| t.id != p.id))
+        );
+        assert!(next_page.iter().any(|p| p.continues), "a thread");
+        meta.load_feed(Network::Threads, 10, true, None, true, 9);
+        let (following, _) = next(&mut rx, |e| match e {
+            MetaEvent::Feed {
+                network: Network::Threads,
+                load: 9,
+                page,
+            } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert!(!following.is_empty());
+        assert_ne!(
+            following.iter().map(|p| p.id).collect::<Vec<_>>(),
+            threads.iter().map(|p| p.id).collect::<Vec<_>>(),
+            "another feed"
+        );
+        let replied = following
+            .iter()
+            .chain(&threads)
+            .find(|p| p.comments.unwrap_or(0) > 0)
+            .expect("a post with replies");
+        meta.load_comments(replied.id, None, false, 8);
+        let (replies, _) = next(&mut rx, |e| match e {
+            MetaEvent::Comments { load: 8, page, .. } => Some(page.expect("a page")),
+            _ => None,
+        })
+        .await;
+        assert!(!replies.is_empty());
 
         // WhatsApp links a device instead: a code to type on the phone,
         // given up, then a QR code, which the fake takes as scanned.
@@ -1796,12 +1921,13 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":5,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":6}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":6,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":7}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
         // Version 3 read `send_files` by path alone, so a file swapped after
-        // the composer checked it would go out; version 4 has no feed.
-        for older in [3, 4] {
+        // the composer checked it would go out; version 4 has no feed, and
+        // version 5 no Threads.
+        for older in [3, 4, 5] {
             let line = format!(r#"{{"event":"hello","version":{older}}}"#);
             let older = check_hello(line.as_bytes()).unwrap_err();
             assert!(older.to_string().contains("same release"), "{older}");
@@ -1985,8 +2111,14 @@ mod tests {
         .unwrap();
         assert!(rx.try_recv().is_err(), "a network this build doesn't know");
 
-        assert_eq!(Network::ALL.len(), 3);
+        assert_eq!(Network::ALL.len(), 4);
         assert!(Network::WhatsApp.links() && !Network::Messenger.links());
+        assert!(!Network::Threads.links() && !Network::Threads.has_chats());
+        assert_eq!(
+            Network::Threads.cookie_names(),
+            Network::Instagram.cookie_names()
+        );
+        assert_eq!(serde_json::to_value(Network::Threads).unwrap(), "threads");
         assert!(Network::WhatsApp.cookie_names().is_empty());
         assert_eq!(serde_json::to_value(Network::WhatsApp).unwrap(), "whatsapp");
     }

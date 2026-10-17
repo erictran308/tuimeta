@@ -73,9 +73,35 @@ pub struct Tab {
 /// are all above 0), and nothing that acts on a chat (muting, marking read)
 /// goes to the helper for it.
 pub const FEED: i64 = -1;
-/// What its row says.
+/// And Threads', which is all Threads has.
+pub const THREADS_FEED: i64 = -2;
+/// What their rows say.
 const FEED_TITLE: &str = "Feed";
 const FEED_PREVIEW: &str = "Photos and videos from accounts you follow";
+const THREADS_PREVIEW: &str = "For you, and the accounts you follow";
+
+/// The row of `network`'s feed, if it has one.
+pub fn feed_id(network: Network) -> Option<i64> {
+    match network {
+        Network::Instagram => Some(FEED),
+        Network::Threads => Some(THREADS_FEED),
+        Network::Messenger | Network::WhatsApp => None,
+    }
+}
+
+/// The network whose feed row `id` is, if it's one.
+pub fn feed_network(id: i64) -> Option<Network> {
+    match id {
+        FEED => Some(Network::Instagram),
+        THREADS_FEED => Some(Network::Threads),
+        _ => None,
+    }
+}
+
+/// `id` is a feed's row, not a chat.
+pub fn is_feed(id: i64) -> bool {
+    feed_network(id).is_some()
+}
 
 /// What the tab of every chat is called.
 const ALL_CHATS: &str = "All";
@@ -306,14 +332,14 @@ impl Chats {
             return;
         }
         let list = self.shown;
-        // The feed is in the Instagram tab, and in the list of every chat
+        // A feed is in its network's tab, and in the list of every chat
         // only while there's no such tab.
         let feed_in_main = self.networks().len() < 2;
         self.sorted = self
             .by_id
             .iter()
             .filter(|&(&id, chat)| {
-                chat.in_list(list) && (id != FEED || list != List::Main || feed_in_main)
+                chat.in_list(list) && (!is_feed(id) || list != List::Main || feed_in_main)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -331,7 +357,7 @@ impl Chats {
         self.sorted.sort_unstable_by_key(|&id| {
             let chat = &by_id[&id];
             let unread = chat.unread > 0 || held == Some(id);
-            std::cmp::Reverse((id == FEED, unread, chat.order, id))
+            std::cmp::Reverse((is_feed(id), unread, chat.order, id))
         });
         self.dirty = false;
     }
@@ -392,7 +418,7 @@ impl Chats {
         if tabs.len() == 1 { Vec::new() } else { tabs }
     }
 
-    /// The networks with chats in the list (Instagram's feed counts).
+    /// The networks with chats in the list (a feed counts).
     fn networks(&self) -> Vec<Network> {
         Network::ALL
             .into_iter()
@@ -400,21 +426,28 @@ impl Chats {
             .collect()
     }
 
-    /// Lists Instagram's home feed, as a row of its own at the top of the
-    /// Instagram chats, while the account is in.
-    pub fn add_feed(&mut self) {
-        if self.by_id.contains_key(&FEED) {
+    /// Lists a network's home feed, as a row of its own at the top of its
+    /// chats, while the account is in. A network without one has none.
+    pub fn add_feed(&mut self, network: Network) {
+        let Some(id) = feed_id(network) else {
+            return;
+        };
+        if self.by_id.contains_key(&id) {
             return;
         }
+        let preview = match network {
+            Network::Threads => THREADS_PREVIEW,
+            _ => FEED_PREVIEW,
+        };
         let feed = Chat {
             title: FEED_TITLE.into(),
-            network: Network::Instagram,
+            network,
             is_channel: false,
             is_private: false,
             unread: 0,
             read_outbox: 0,
             read_inbox: 0,
-            preview: FEED_PREVIEW.into(),
+            preview: preview.into(),
             order: 0,
             archived: false,
             photo: None,
@@ -425,7 +458,7 @@ impl Chats {
             request: false,
             can_send: false,
         };
-        self.by_id.insert(FEED, feed);
+        self.by_id.insert(id, feed);
         self.dirty = true;
     }
 

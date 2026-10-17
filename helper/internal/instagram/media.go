@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 
+	"github.com/erictran308/tuimeta/helper/internal/browser"
 	"github.com/erictran308/tuimeta/helper/internal/download"
 	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
@@ -128,11 +129,28 @@ func (b *Instagram) Fetch(ctx context.Context, ref ids.FileRef, w io.Writer) err
 
 // download writes the file at raw to w.
 func (b *Instagram) download(ctx context.Context, raw, mime string, w io.Writer) error {
+	b.mu.Lock()
+	as := b.as
+	b.mu.Unlock()
+	return cdnClient{client: b.media, as: as, who: "instagram"}.download(ctx, raw, mime, w)
+}
+
+// cdnClient downloads files from Meta's CDN for a backend (Instagram's, or
+// Threads', whose files are the same CDN's): through client, which follows
+// redirects only within the CDN, saying it's the browser as.
+type cdnClient struct {
+	client *http.Client
+	as     browser.Identity
+	who    string // the backend, for the log: "instagram" or "threads"
+}
+
+// download writes the file at raw to w.
+func (c cdnClient) download(ctx context.Context, raw, mime string, w io.Writer) error {
 	u, err := url.Parse(raw)
 	if err != nil || !onCDN(u) {
 		return errNotCDN
 	}
-	resp, err := b.get(ctx, http.MethodGet, raw, mime, "")
+	resp, err := c.get(ctx, http.MethodGet, raw, mime, "")
 	if err != nil {
 		return err
 	}
@@ -144,7 +162,7 @@ func (b *Instagram) download(ctx context.Context, raw, mime string, w io.Writer)
 		if lerr != nil || !onCDN(loc) {
 			return errNotCDN
 		}
-		return b.chunked(ctx, loc.String(), mime, w)
+		return c.chunked(ctx, loc.String(), mime, w)
 	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusGone:
 		return errExpired
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
@@ -156,8 +174,8 @@ func (b *Instagram) download(ctx context.Context, raw, mime string, w io.Writer)
 }
 
 // chunked downloads a video served in ranges.
-func (b *Instagram) chunked(ctx context.Context, raw, mime string, w io.Writer) error {
-	head, err := b.get(ctx, http.MethodHead, raw, mime, "")
+func (c cdnClient) chunked(ctx context.Context, raw, mime string, w io.Writer) error {
+	head, err := c.get(ctx, http.MethodHead, raw, mime, "")
 	if err != nil {
 		return err
 	}
@@ -167,12 +185,12 @@ func (b *Instagram) chunked(ctx context.Context, raw, mime string, w io.Writer) 
 	}
 	total := head.ContentLength
 	if head.StatusCode != http.StatusOK || total <= 0 || head.Header.Get("Accept-Ranges") != "bytes" {
-		return b.plain(ctx, raw, mime, w)
+		return c.plain(ctx, raw, mime, w)
 	}
 	download.SetSize(w, total)
 	for offset := int64(0); offset < total; offset += chunkSize {
 		end := min(offset+chunkSize, total) - 1
-		resp, err := b.get(ctx, http.MethodGet, raw, mime, fmt.Sprintf("bytes=%d-%d", offset, end))
+		resp, err := c.get(ctx, http.MethodGet, raw, mime, fmt.Sprintf("bytes=%d-%d", offset, end))
 		if err != nil {
 			return err
 		}
@@ -190,8 +208,8 @@ func (b *Instagram) chunked(ctx context.Context, raw, mime string, w io.Writer) 
 }
 
 // plain downloads raw in one piece, following no further redirect.
-func (b *Instagram) plain(ctx context.Context, raw, mime string, w io.Writer) error {
-	resp, err := b.get(ctx, http.MethodGet, raw, mime, "")
+func (c cdnClient) plain(ctx context.Context, raw, mime string, w io.Writer) error {
+	resp, err := c.get(ctx, http.MethodGet, raw, mime, "")
 	if err != nil {
 		return err
 	}
@@ -205,7 +223,7 @@ func (b *Instagram) plain(ctx context.Context, raw, mime string, w io.Writer) er
 }
 
 // get asks the CDN for raw, as the web client's media requests do.
-func (b *Instagram) get(ctx context.Context, method, raw, mime, byteRange string) (*http.Response, error) {
+func (c cdnClient) get(ctx context.Context, method, raw, mime, byteRange string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, raw, nil)
 	if err != nil {
 		return nil, errNotCDN
@@ -227,14 +245,11 @@ func (b *Instagram) get(ctx context.Context, method, raw, mime, byteRange string
 	req.Header.Set("User-Agent", useragent.UserAgent)
 	req.Header.Set("Sec-Ch-Ua", useragent.SecCHUserAgent)
 	req.Header.Set("Sec-Ch-Ua-Platform", useragent.SecCHPlatform)
-	b.mu.Lock()
-	as := b.as
-	b.mu.Unlock()
-	as.Rewrite(req.Header)
+	c.as.Rewrite(req.Header)
 	if byteRange != "" {
 		req.Header.Set("Range", byteRange)
 	}
-	resp, err := b.media.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		if errors.Is(err, errNotCDN) {
 			return nil, errNotCDN
@@ -242,7 +257,7 @@ func (b *Instagram) get(ctx context.Context, method, raw, mime, byteRange string
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		hlog.Warn("instagram: download failed", hlog.Kind(err))
+		hlog.Warn(c.who+": download failed", hlog.Kind(err))
 		return nil, errFetch
 	}
 	return resp, nil

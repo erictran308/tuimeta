@@ -1,12 +1,13 @@
-//! Instagram's home feed, opened from its row at the top of the Instagram
-//! chats: the posts of the people and pages the account follows, in
-//! Instagram's order, a page at a time as the cursor nears the end. One post
-//! is selected; a carousel shows one of its photos or videos at a time.
+//! A network's home feed, opened from its row at the top of its chats:
+//! Instagram's or Threads' posts, in the network's order, a page at a time
+//! as the cursor nears the end. One post is selected; a carousel shows one
+//! of its photos or videos at a time (Threads draws them side by side).
 //!
-//! Everything in a post is the author's: names and captions go through
-//! [`text::clean`], a username keeps only the letters Instagram allows in
-//! one, so it can't pass for another, and the post's link is kept only if
-//! it goes to instagram.com.
+//! Everything in a post is the author's: names, captions and the lines
+//! over posts go through [`text::clean`], a username keeps only the
+//! letters Instagram allows in one, so it can't pass for another, the
+//! post's link is kept only if it goes to its network's website, and a
+//! link card's only if it's a web address, shown by its host.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,6 +28,10 @@ const MAX_CAPTION: usize = 2200;
 const MAX_USERNAME: usize = 30;
 /// The posts of a carousel taken, as many as Instagram allows.
 const MAX_ITEMS: usize = 20;
+/// The line over a Threads post is cut after this many characters.
+const MAX_CONTEXT: usize = 120;
+/// And a link card's title.
+const MAX_TITLE: usize = 300;
 
 /// A post of the feed, made safe to show.
 #[derive(Clone)]
@@ -44,10 +49,35 @@ pub struct Post {
     pub media: Vec<Item>,
     pub likes: Option<i64>,
     pub comments: Option<i64>,
-    /// The post on instagram.com, for `o`.
+    /// The post on its network's website, for `o`.
     pub url: Option<String>,
     /// From an account the user doesn't follow: Instagram's suggestion.
     pub suggested: bool,
+    /// The author's picture, small.
+    pub avatar: Option<Preview>,
+    /// Threads: reposts and quotes of it, and times it was sent on.
+    pub reposts: Option<i64>,
+    pub shares: Option<i64>,
+    /// Threads: the line over the post ("sam reposted"), on one line.
+    pub context: Option<String>,
+    /// Threads: it goes on from the post before it, in one thread.
+    pub continues: bool,
+    /// Threads: the post it quotes, without one of its own.
+    pub quoted: Option<Box<Post>>,
+    /// Threads: the card of a link in its text.
+    pub link: Option<LinkCard>,
+}
+
+/// The card of a link in a post: where it goes, and what it says it is.
+#[derive(Clone)]
+pub struct LinkCard {
+    /// A web address (`messages::web_url`).
+    pub url: String,
+    /// Where it goes, as the card shows it.
+    pub host: String,
+    /// One line; may be empty.
+    pub title: String,
+    pub image: Option<Preview>,
 }
 
 /// A photo or video of a post.
@@ -78,12 +108,21 @@ impl Post {
 }
 
 impl From<&FeedPost> for Post {
+    /// An Instagram post.
     fn from(post: &FeedPost) -> Self {
-        let caption = text::clean(&post.caption);
-        let caption = match text::first_chars(&caption, MAX_CAPTION) {
-            start if start.len() < caption.len() => format!("{start}…"),
-            start => start.to_string(),
-        };
+        Post::new(post, Network::Instagram)
+    }
+}
+
+impl Post {
+    /// `network`'s post, made safe to show.
+    pub fn new(post: &FeedPost, network: Network) -> Self {
+        let caption = cut(&text::clean(&post.caption), MAX_CAPTION);
+        let context = post
+            .context
+            .as_deref()
+            .map(|c| cut(&messages::one_line(c), MAX_CONTEXT))
+            .filter(|c| !c.is_empty());
         Self {
             id: post.id,
             name: messages::one_line(&post.author.name),
@@ -94,9 +133,39 @@ impl From<&FeedPost> for Post {
             media: post.media.iter().filter_map(item).take(MAX_ITEMS).collect(),
             likes: post.likes.map(|n| n.max(0)),
             comments: post.comments.map(|n| n.max(0)),
-            url: instagram_url(&post.url),
+            url: post_url(&post.url, network),
             suggested: post.suggested,
+            avatar: post.author.photo.as_ref().and_then(|p| {
+                (p.file_id > 0).then_some(Preview {
+                    file_id: p.file_id,
+                    width: p.width.max(1),
+                    height: p.height.max(1),
+                    thumbnail: None,
+                    sticker: false,
+                })
+            }),
+            reposts: post.reposts.map(|n| n.max(0)),
+            shares: post.shares.map(|n| n.max(0)),
+            context,
+            continues: post.continues,
+            // A quote's own quote isn't drawn.
+            quoted: post.quoted.as_deref().map(|q| {
+                let mut quoted = Post::new(q, network);
+                quoted.quoted = None;
+                quoted.context = None;
+                quoted.continues = false;
+                Box::new(quoted)
+            }),
+            link: post.link_preview.as_ref().and_then(link_card),
         }
+    }
+}
+
+/// `text` cut after `max` characters, with `…` when it was longer.
+fn cut(text: &str, max: usize) -> String {
+    match text::first_chars(text, max) {
+        start if start.len() < text.len() => format!("{start}…"),
+        start => start.to_string(),
     }
 }
 
@@ -112,12 +181,37 @@ pub(crate) fn username(name: &str) -> String {
     name.to_string()
 }
 
-/// `url` if it's a web address on instagram.com.
-fn instagram_url(url: &str) -> Option<String> {
+/// `url` if it's a web address on `network`'s website: instagram.com, or
+/// threads.com.
+fn post_url(url: &str, network: Network) -> Option<String> {
     let url = messages::web_url(url)?;
     let host = messages::link_host(&url)?;
-    (url.starts_with("https://") && matches!(host.as_str(), "www.instagram.com" | "instagram.com"))
-        .then_some(url)
+    let ours = match network {
+        Network::Threads => matches!(host.as_str(), "www.threads.com" | "threads.com"),
+        _ => matches!(host.as_str(), "www.instagram.com" | "instagram.com"),
+    };
+    (url.starts_with("https://") && ours).then_some(url)
+}
+
+/// A link card, if its address is a web address.
+fn link_card(preview: &meta::LinkPreview) -> Option<LinkCard> {
+    let url = messages::web_url(&preview.url)?;
+    let host = messages::link_host(&url)?;
+    let image = preview.image.as_ref().and_then(|p| {
+        (p.file_id > 0 && p.width > 0 && p.height > 0).then_some(Preview {
+            file_id: p.file_id,
+            width: p.width,
+            height: p.height,
+            thumbnail: None,
+            sticker: false,
+        })
+    });
+    Some(LinkCard {
+        url,
+        host,
+        title: cut(&messages::one_line(&preview.title), MAX_TITLE),
+        image,
+    })
 }
 
 /// A photo or video of a post, as drawn; anything else is left out.
@@ -189,8 +283,10 @@ pub struct Feed {
     fresh: bool,
     /// Counts loads, to number them.
     loads: u64,
-    /// Instagram has more after the last post.
+    /// The network has more after the last post.
     pub has_more: bool,
+    /// Threads: the accounts followed, rather than For you.
+    pub following: bool,
     /// Why the last load failed.
     pub error: Option<String>,
 }
@@ -208,6 +304,7 @@ impl Feed {
             fresh: false,
             loads: 0,
             has_more: true,
+            following: false,
             error: None,
         }
     }
@@ -269,7 +366,7 @@ impl Feed {
         }
         for post in &posts {
             if self.ids.insert(post.id) {
-                self.posts.push(Post::from(post));
+                self.posts.push(Post::new(post, self.network));
             }
         }
         // A page that brought nothing new would be asked for again and
@@ -412,12 +509,77 @@ pub(crate) mod tests {
             "http://www.instagram.com/p/A/",
             "https://www.instagram.com.evil.example/p/A/",
         ] {
-            assert_eq!(instagram_url(url), None, "{url}");
+            assert_eq!(post_url(url, Network::Instagram), None, "{url}");
         }
         let long = "x".repeat(MAX_CAPTION + 50);
         let p = Post::from(&post(3, serde_json::json!({"caption": long})));
         assert_eq!(p.caption.chars().count(), MAX_CAPTION + 1);
         assert!(p.caption.ends_with('…'));
+    }
+
+    #[test]
+    fn a_threads_post_keeps_threads_links_and_its_quote_card_and_line_are_made_safe() {
+        let p = Post::new(
+            &post(
+                1,
+                serde_json::json!({
+                    "media": [],
+                    "url": "https://www.threads.com/@alice.example/post/ABC",
+                    "context": "sam\u{202E}reposted\nand more",
+                    "continues": true,
+                    "reposts": -3, "shares": 18,
+                    "author": {"username": "alice.example",
+                               "photo": {"file_id": 40, "width": 150, "height": 150}},
+                    "quoted": {"id": 0, "author": {"name": "Sam\u{1b}[2J", "username": "sam"},
+                               "caption": "quoted", "media": [], "url": "https://evil.example/",
+                               "quoted": {"id": 0, "author": {}, "caption": "deeper"},
+                               "context": "no"},
+                    "link_preview": {"url": "https://example.com/a?b=c", "title": "A\npage",
+                                     "image": {"file_id": 41, "width": 600, "height": 315}}
+                }),
+            ),
+            Network::Threads,
+        );
+        assert!(p.media.is_empty(), "text alone");
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://www.threads.com/@alice.example/post/ABC")
+        );
+        assert_eq!(p.context.as_deref(), Some("samreposted and more"));
+        assert!(p.continues);
+        assert_eq!((p.reposts, p.shares), (Some(0), Some(18)));
+        assert_eq!(p.avatar.as_ref().map(|a| a.file_id), Some(40));
+        let quoted = p.quoted.as_ref().expect("the quote");
+        assert_eq!(quoted.name, "Sam[2J");
+        assert_eq!(quoted.url, None, "only threads.com");
+        assert!(quoted.quoted.is_none() && quoted.context.is_none());
+        let card = p.link.as_ref().expect("the card");
+        assert_eq!(
+            (card.host.as_str(), card.title.as_str()),
+            ("example.com", "A page")
+        );
+        assert_eq!(card.image.as_ref().map(|i| i.file_id), Some(41));
+        // Instagram's addresses aren't Threads', nor the other way round.
+        for (url, network) in [
+            ("https://www.instagram.com/p/A/", Network::Threads),
+            ("https://www.threads.com/@a/post/A", Network::Instagram),
+            ("http://www.threads.com/@a/post/A", Network::Threads),
+            (
+                "https://www.threads.com.evil.example/@a/post/A",
+                Network::Threads,
+            ),
+        ] {
+            assert_eq!(post_url(url, network), None, "{url}");
+        }
+        // A card that isn't a web address isn't kept.
+        let p = Post::new(
+            &post(
+                2,
+                serde_json::json!({"link_preview": {"url": "javascript:alert(1)", "title": "x"}}),
+            ),
+            Network::Threads,
+        );
+        assert!(p.link.is_none());
     }
 
     #[test]

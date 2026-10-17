@@ -523,7 +523,13 @@ func (f *Fake) Mute(ctx context.Context, ref backend.ChatRef, muted bool) error 
 	return nil
 }
 
+// errNoChats is Threads' answer to what's about chats: it has none.
+var errNoChats = proto.Err(proto.Unsupported, "Threads has no chats in tuimeta: only its feed.")
+
 func (f *Fake) Search(ctx context.Context, query string) ([]proto.SearchResult, error) {
+	if f.net == proto.Threads {
+		return nil, errNoChats
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	w, err := f.world()
@@ -573,6 +579,9 @@ func (w *world) dmWith(p *person) *chat {
 }
 
 func (f *Fake) OpenDM(ctx context.Context, ref backend.UserRef) (int64, error) {
+	if f.net == proto.Threads {
+		return 0, errNoChats
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	w, err := f.world()

@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/imroc/req/v3 v3.56.0
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/mautrix-meta v0.2609.0
 	go.mau.fi/util v0.10.1
@@ -24,7 +25,6 @@ require (
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/icholy/digest v1.2.0 // indirect
-	github.com/imroc/req/v3 v3.56.0 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

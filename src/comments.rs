@@ -1,7 +1,8 @@
-//! The comments on a post of the feed, in a popup over it (`c`): the top
+//! The comments on a post of the feed, in a pane beside it (`c`): the top
 //! comments a page at a time as the cursor nears the end, and a comment's
-//! replies under it, indented, once Enter asks for them. Only read: nothing
-//! here likes or answers.
+//! replies under it, indented, once Enter asks for them. On Threads they're
+//! the post's replies, and a reply's replies. Only read: nothing here likes
+//! or answers.
 //!
 //! What people wrote is untrusted like a caption: names and text go through
 //! [`text::clean`], and a username keeps only the letters Instagram allows
@@ -37,6 +38,8 @@ pub struct Comment {
     pub replies: i64,
     /// The comment it answers, for a reply.
     pub reply_to: Option<i64>,
+    /// What a Threads reply holds besides its text, as a label ("Photo").
+    pub attachment: Option<&'static str>,
 }
 
 impl Comment {
@@ -68,7 +71,19 @@ impl From<&CommentInfo> for Comment {
             likes: comment.likes.map(|n| n.max(0)),
             replies: comment.replies.max(0),
             reply_to: comment.reply_to,
+            attachment: comment.attachment.as_deref().and_then(attachment),
         }
+    }
+}
+
+/// The label of a Threads reply's attachment, if it's one the protocol
+/// names.
+fn attachment(kind: &str) -> Option<&'static str> {
+    match kind {
+        "photo" => Some("Photo"),
+        "video" => Some("Video"),
+        "carousel" => Some("Photos and videos"),
+        _ => None,
     }
 }
 
@@ -84,11 +99,13 @@ pub enum Replies {
     Nothing,
 }
 
-/// The comments popup over a post.
+/// The comments pane beside a post.
 pub struct Comments {
     pub post_id: i64,
-    /// Whose post it is, for the popup's title.
+    /// Whose post it is, for the pane's title.
     pub author: String,
+    /// What the pane calls them: comments, or Threads' replies.
+    pub what: &'static str,
     /// Top comments in order, each followed by its replies when shown.
     pub rows: Vec<Comment>,
     ids: HashSet<i64>,
@@ -100,7 +117,7 @@ pub struct Comments {
     /// is. Answers to any other are old news.
     pub loading: Option<(u64, Option<i64>)>,
     loads: u64,
-    /// Instagram has more top comments after the last one.
+    /// The network has more top comments after the last one.
     pub has_more: bool,
     /// Comments whose replies are shown, and whether more of them come.
     pub open: HashMap<i64, bool>,
@@ -113,6 +130,7 @@ impl Comments {
         Self {
             post_id,
             author: author.to_string(),
+            what: "Comments",
             rows: Vec::new(),
             ids: HashSet::new(),
             selected: 0,

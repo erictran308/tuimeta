@@ -31,7 +31,7 @@ const FRAME_ROWS: u16 = 5;
 /// instead: emoji and text symbols come in different sizes and styles.
 pub(super) const HEART: &str = "\u{f004}";
 pub(super) const COMMENT: &str = "\u{f075}";
-const PLAY: &str = "\u{f04b}";
+pub(super) const PLAY: &str = "\u{f04b}";
 /// The widest a post is drawn, in columns, centered in a wider pane:
 /// instagram.com's feed is a 470 px column, about 60 cells of 8 px, so a
 /// wide window shows more posts rather than bigger ones.
@@ -355,7 +355,7 @@ fn counts(
 
 /// `0:12 ━━━━━━●───────── 0:30`: where the video playing is, as wide as
 /// the video; only the times when that's too narrow for a bar.
-fn seek_bar(position: f64, length: f64, width: usize, colors: &Colors) -> Line<'static> {
+pub(super) fn seek_bar(position: f64, length: f64, width: usize, colors: &Colors) -> Line<'static> {
     let position = position.clamp(0.0, length.max(0.0));
     let (at, all) = (
         duration(position.floor() as i32),
@@ -467,7 +467,7 @@ fn media_cells(item: Option<&Item>, width: u16, max_rows: u16, font: FontSize) -
 /// Paints a photo at `at` (inside `area`) over `size` cells, or says it's
 /// coming. Under a popup, sixel and iTerm2 pictures wait, as in a chat.
 #[allow(clippy::too_many_arguments)]
-fn draw_still(
+pub(super) fn draw_still(
     frame: &mut Frame,
     area: Rect,
     still: &Preview,

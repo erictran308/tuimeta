@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Command tuimeta-helper speaks Messenger, Instagram and WhatsApp for tuimeta, which
+// Command tuimeta-helper speaks Messenger, Instagram, WhatsApp and Threads for tuimeta, which
 // runs it as a child process and talks to it in newline-delimited JSON over
 // stdin and stdout (see PROTOCOL.md).
 //
@@ -132,6 +132,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, quiet func())
 			srv.Add(instagram.New(srv.Deps(n)))
 		case n == proto.WhatsApp:
 			srv.Add(whatsapp.New(srv.Deps(n)))
+		case n == proto.Threads:
+			srv.Add(instagram.NewThreads(srv.Deps(n)))
 		default:
 			srv.Add(&backend.Unavailable{Net: n, Events: srv.Events})
 		}

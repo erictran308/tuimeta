@@ -1,11 +1,14 @@
 # tuimeta-helper
 
-The part of [tuimeta](..) that speaks Messenger, Instagram and WhatsApp.
+The part of [tuimeta](..) that speaks Messenger, Instagram, WhatsApp and
+Threads.
 Meta's protocols are only implemented well in Go, in
 [mautrix-meta](https://github.com/mautrix/meta) (`messagix` for Messenger,
 `whatsmeow` for its end-to-end encrypted chats, `instameow` for Instagram)
 and [whatsmeow](https://github.com/tulir/whatsmeow) (WhatsApp, which
-mautrix-whatsapp drives), so tuimeta runs this program as a child process
+mautrix-whatsapp drives); Threads, which no library speaks, is read through
+threads.com's own website the way its pages read it (see Privacy →
+Threads). So tuimeta runs this program as a child process
 and talks to it in newline-delimited JSON over stdin and stdout. The
 contract is [PROTOCOL.md](PROTOCOL.md): a "tiny TDLib for Meta" that hides
 each network's ids and protocols behind one small model.
@@ -14,10 +17,10 @@ each network's ids and protocols behind one small model.
 tuimeta-helper --data-dir <absolute dir> [--fake]
 ```
 
-`--fake` runs three made-up accounts with no network access at all, for
+`--fake` runs four made-up accounts with no network access at all, for
 tuimeta's tests and for trying the app without an account. Without it, the
 helper speaks the real networks: see Privacy → Instagram, Privacy →
-Messenger and Privacy → WhatsApp for what each sends.
+Threads, Privacy → Messenger and Privacy → WhatsApp for what each sends.
 
 ## Building
 
@@ -87,7 +90,7 @@ link or another user's; every file 0600, umask 077 on Unix):
 |---|---|
 | `helper.log` | connection states and error kinds; moved to `helper.log.1` at startup once past 4 MB; opened only as a plain file of yours, never through a link in its place |
 | `ids.json` | the chat and person ids handed to tuimeta, by network-side id |
-| `<network>/` | the login session (cookies; for Messenger, the encrypted chats' keys and messages; for WhatsApp, the linked device's keys and the chats and messages it has) |
+| `<network>/` | the login session (cookies; for Messenger, the encrypted chats' keys and messages; for WhatsApp, the linked device's keys and the chats and messages it has; for Threads, also `catalog.json`, how threads.com's queries are asked once they had to be read again from its JavaScript) |
 | `files/<network>/` | downloads, named by a hash and a cleaned-up file name (a picture, video or recording never under another kind's extension: its type's, a media one, or `.bin`) |
 | `fake/<network>/` | downloads in `--fake` mode |
 
@@ -208,6 +211,81 @@ dropped), so only those people get ids; outgoing text goes as typed.
 instameow logs message contents and URLs at debug level, so it gets a logger
 that writes nothing (and mautrix-meta's global logger is silenced); no proxy
 is taken from the environment.
+
+### Threads
+
+Threads runs on Instagram's servers, but its website keeps a session of its
+own on threads.com, which an instagram.com session isn't: login is by
+threads.com's cookies (`sessionid`, `ds_user_id` and `csrftoken`, and
+whatever else the paste has from threads.com), never a password, and never
+the "Continue with Instagram" hand-off, which would make a new session. No
+library speaks Threads, so the helper (`internal/instagram/threads*.go`)
+uses the website as the browser the cookies came from does, through the
+libraries' Chrome handshake (uTLS), with that browser's user agent and
+client hints (threads.com asks for them all), its cookies by hand (no jar),
+no proxy from the environment, and no redirect followed but threads.com's
+own. The cookies, as threads.com changes them (`rur`, `csrftoken` and the
+like, through `Set-Cookie`), are saved in `threads/session.json` once a page
+has loaded as the account's, and deleted when threads.com answers as to
+nobody logged in. `logout` deletes them here only: end the session on
+threads.com too if you want it gone there.
+
+Everything sent to threads.com, at most one request at a time and at least
+2 s apart:
+
+- Its home page, `GET https://www.threads.com/`, as a navigation typed in:
+  at login, at each start, every hour (its tokens expire) and when an
+  answer says its tokens did. From it come the tokens every query carries
+  (`fb_dtsg`, `lsd`, the app id, the revision, `__hsi`, `__spin_*`,
+  `haste_session`, the account's id as `av`), who's logged in, and the
+  gates, experiments and settings the website's feature flags read.
+- GraphQL queries, `POST https://www.threads.com/api/graphql`, with the
+  form and headers the page's own code sends (`x-ig-app-id`, `x-fb-lsd`,
+  `x-csrftoken`, `x-asbd-id`, `x-fb-friendly-name`, the page as referer):
+  only three, and only ever a query, never a mutation (the one function
+  that sends GraphQL refuses anything the website's code doesn't mark
+  `query`, and any name with `Mutation` in it, before a request is made):
+  - `BarcelonaFeedPaginationDirectQuery`, the feed (`load_feed`): 10
+    posts a page, `variant` `for_you` or `following`, `after` the page
+    before's cursor, and `data`: `pagination_source`, from the second page
+    `reason: "pagination"` and the feed's `session_id`, `feed_state` (which
+    threads were given, by id and item type, and when the last page was
+    asked: what any page tells Threads to get the next one), and
+    `feed_view_info`, the list of posts seen and for how long, which the
+    helper always sends empty (`"[]"`), as a page just opened does. A load
+    asks for at most three pages, only while the ones before had nothing
+    to show.
+  - `BarcelonaPostPageDownwardQuery` and
+    `BarcelonaPostPageDirectRepliesRefetchQuery`, a post's replies and the
+    ones after them (`load_comments`), top ones first, from the post's
+    page (its address as referer); a reply's replies are the same queries
+    with the reply's id, as the reply's page asks them.
+  Each carries every feature flag the query declares, worked out as the
+  website's code works it out from the gates the page shipped (an unknown
+  one is off), so the request is the page's own. None of the website's
+  logging is ever sent (no `/ajax/bz`, no Falco, no impressions or
+  video-play events), and nothing is liked, reposted, followed or answered.
+- When Threads stops taking a query as sent (a variable it now needs, a
+  document it no longer knows), its definition is read again from the
+  website's JavaScript: the page is loaded again (the post's page, as a
+  navigation from home, for the replies' queries), then its scripts, in the
+  page's order, `GET https://static.cdninstagram.com/rsrc.php/…` without
+  cookies as a page's scripts are fetched, until the query and the flags
+  it reads are found: at most 60 MB, at most once in ten minutes, and the
+  query is tried once more. What was found, and which scripts held none of
+  it (by a hash of their address, at most 5000), is kept in
+  `threads/catalog.json`; the definitions as of 2026-10-17 are built in.
+
+The feed's and the replies' files (pictures, videos, avatars, link cards'
+pictures) download only on `download`, from Instagram's CDN as the
+Instagram feed's do (the same hosts, every redirect checked, no cookies).
+A post's text is plain text; a link card is Threads' own (its address with
+`l.threads.com`'s redirect taken off, at most 2048 characters, never
+fetched). Rows of people to follow are left out, and so is anything marked
+an ad (the page's own flags say it can't show sponsored posts). The posts
+and replies are kept only in memory, for the run. `helper.log` says which
+query went out of date and how much JavaScript was read for it, how many
+posts and rows were left out, and error kinds; never who posted or what.
 
 ### Messenger
 
@@ -536,8 +614,21 @@ with a mention and a tag; every fourth has replies (up to 12, five a page),
 oldest first. The same post gives the same comments every run. Messenger
 and WhatsApp answer `load_feed` with `unsupported`.
 
+Threads has no chats (`load_chats` gives none; `search` and `open_dm` are
+`unsupported`), only two feeds of 30 posts, ten a page: "for you", from
+its people and three accounts only the feed knows, and "following", from
+its people alone. Among them: text alone (one of many lines, one at Threads'
+500 characters), a photo, a carousel of four photos, a video (the same GIF
+as Instagram's), a quote of the post before it, a link with its card, a
+repost (`context` "… reposted"), a "First thread" line, and a thread of
+three posts (the later two `continues`). Every post has its likes, replies,
+reposts and shares; its replies come as Instagram's comments do, some with
+an `attachment` (a photo, a video, a carousel), and every third reply to a
+reply-bearing one has two replies of its own.
+
 Logging in takes any cookies with the required names (`c_user=1; xs=2;
-datr=3`, or `sessionid`, `ds_user_id` and `csrftoken` for Instagram), parsed
+datr=3`, or `sessionid`, `ds_user_id` and `csrftoken` for Instagram and
+Threads), parsed
 as real ones are. WhatsApp links instead: `login_link` shows a QR code
 starting `2@fake` (or, given a phone number, the pairing code `FAKE-C0DE`)
 and takes it as scanned 3 seconds later; `cancel_login`, `logout` or a newer
@@ -595,9 +686,11 @@ A network that logs in by linking a device (WhatsApp) also implements
 refuses `login_cookies` for it. `backend.PhoneDigits` reads a phone number in
 international form.
 
-A network with a home feed (Instagram) implements `backend.Feeder`
-(`LoadFeed(ctx, limit, fresh)`, the next posts and whether there are more,
-with post ids it keeps for the run); the server lines its `load_feed` calls
+A network with a home feed (Instagram, Threads) implements
+`backend.Feeder` (`LoadFeed(ctx, limit, fresh, box, kind)`, the next posts
+and whether there are more, with post ids it keeps for the run; `kind` is
+which of its feeds, `backend.ForYou` or `backend.Following`, and another
+than the last load's starts from the top); the server lines its `load_feed` calls
 up one at a time in the order they came, apart from its `load_chats`, and
 answers `unsupported` for a network without one. If its posts have
 comments it also implements `backend.Commenter` (`LoadComments(ctx, post,

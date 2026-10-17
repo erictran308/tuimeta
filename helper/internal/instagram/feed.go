@@ -114,7 +114,7 @@ var _ backend.Feeder = (*Instagram)(nil)
 // LoadFeed is the next page of the home feed. limit is only a hint:
 // Instagram's pages are their own size, and a page isn't cut, since the
 // cursor has moved past it.
-func (b *Instagram) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.Box) ([]proto.Post, bool, error) {
+func (b *Instagram) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.Box, _ backend.FeedKind) ([]proto.Post, bool, error) {
 	conn, err := b.waitReady(ctx)
 	if err != nil {
 		return nil, false, err
@@ -492,6 +492,8 @@ func parseFeed(body []byte) (feedPage, error) {
 // fixed names (hlog's rules), so what was wrong with a feed can be told
 // without anything of it in the log.
 type feedStats struct {
+	// threads is Threads' feed, whose lines say so.
+	threads         bool
 	rows            map[string]*rowCount
 	ads, unreadable int
 	// Videos by where their file came from: video_versions, DASH with
@@ -502,18 +504,22 @@ type feedStats struct {
 }
 
 func (st *feedStats) log() {
+	net := "instagram: "
+	if st.threads {
+		net = "threads: "
+	}
 	if st.ads+st.unreadable > 0 {
-		hlog.Info("instagram: feed items left out", hlog.Int("ads", int64(st.ads)), hlog.Int("unreadable", int64(st.unreadable)))
+		hlog.Info(net+"feed items left out", hlog.Int("ads", int64(st.ads)), hlog.Int("unreadable", int64(st.unreadable)))
 	}
 	if n := st.progressive + st.dash + st.dashSilent + st.unplayable; n > 0 {
-		hlog.Info("instagram: feed videos", hlog.Int("progressive", int64(st.progressive)), hlog.Int("dash", int64(st.dash)),
+		hlog.Info(net+"feed videos", hlog.Int("progressive", int64(st.progressive)), hlog.Int("dash", int64(st.dash)),
 			hlog.Int("dash_silent", int64(st.dashSilent)), hlog.Int("unplayable", int64(st.unplayable)))
 	}
 	if st.noMedia+st.noCode > 0 {
-		hlog.Info("instagram: feed posts dropped", hlog.Int("no_media", int64(st.noMedia)), hlog.Int("no_code", int64(st.noCode)))
+		hlog.Info(net+"feed posts dropped", hlog.Int("no_media", int64(st.noMedia)), hlog.Int("no_code", int64(st.noCode)))
 	}
 	if rows := rowAttrs(st.rows); len(rows) > 0 {
-		hlog.Info("instagram: feed rows", rows...)
+		hlog.Info(net+"feed rows", rows...)
 	}
 }
 
@@ -638,17 +644,31 @@ func (b *Instagram) feedPost(f *feedState, m *feedMedia, box backend.Box, st *fe
 // file 0, so its cover, picked as a photo's thumbnail is, shows, unless it
 // hasn't one either.
 func (b *Instagram) feedMediaOf(m *feedMedia, box backend.Box, st *feedStats) (proto.Media, bool) {
+	return b.feedFiles().mediaOf(m, box, st)
+}
+
+// feedFiles registers the feed's files under a network: Threads' posts are
+// Instagram's media dicts too, and their files are Threads'.
+type feedFiles struct {
+	files   *ids.Files
+	network proto.Network
+}
+
+func (b *Instagram) feedFiles() feedFiles { return feedFiles{b.d.Files, proto.Instagram} }
+
+// mediaOf is feedMediaOf's, for either network.
+func (fs feedFiles) mediaOf(m *feedMedia, box backend.Box, st *feedStats) (proto.Media, bool) {
 	video := m.MediaType == 2 || (m.MediaType != 1 && (len(m.Videos) > 0 || m.DashManifest != ""))
 	var full, cover *proto.Image
 	stillURL := ""
 	w, h := int(m.Width), int(m.Height)
 	if still, ok := atLeast(m.Images.Candidates, photoWidth); ok {
 		drawn := drawnIn(m.Images.Candidates, box, still)
-		cover = b.feedFile(drawn.URL, stillKey(drawn), proto.Photo, int(drawn.Width), int(drawn.Height))
+		cover = fs.file(drawn.URL, stillKey(drawn), proto.Photo, int(drawn.Width), int(drawn.Height))
 		full = cover
 		// A video's cover is only drawn: no larger one for the viewer.
 		if !video && drawn.URL != still.URL {
-			full = b.feedFile(still.URL, stillKey(still), proto.Photo, int(still.Width), int(still.Height))
+			full = fs.file(still.URL, stillKey(still), proto.Photo, int(still.Width), int(still.Height))
 		}
 		stillURL = still.URL
 		if w <= 0 || h <= 0 {
@@ -667,16 +687,16 @@ func (b *Instagram) feedMediaOf(m *feedMedia, box backend.Box, st *feedStats) (p
 	md := proto.Media{Kind: proto.Video, Thumbnail: cover, Width: w, Height: h, Mime: "video/mp4"}
 	seconds := float64(m.Duration)
 	if v, ok := nearest(m.Videos, videoWidth); ok {
-		if f := b.feedFile(v.URL, "feed-video", proto.Video, 0, 0); f != nil {
+		if f := fs.file(v.URL, "feed-video", proto.Video, 0, 0); f != nil {
 			md.FileID = f.FileID
 			st.progressive++
 		}
 	}
 	if md.FileID == 0 {
 		if pic, sound, length, ok := dashPick(string(m.DashManifest)); ok {
-			if f := b.feedFile(pic.url, "feed-video", proto.Video, 0, 0); f != nil {
+			if f := fs.file(pic.url, "feed-video", proto.Video, 0, 0); f != nil {
 				md.FileID = f.FileID
-				if a := b.feedFile(sound.url, "feed-audio", proto.Audio, 0, 0); a != nil {
+				if a := fs.file(sound.url, "feed-audio", proto.Audio, 0, 0); a != nil {
 					md.Audio = a.FileID
 				}
 				if md.Width <= 0 || md.Height <= 0 {
@@ -716,6 +736,11 @@ func stillKey(c feedCandidate) string {
 // unless it's on Instagram's CDN. There's no message to look a fresh
 // address up in once this one expires: a fresh load has new ones.
 func (b *Instagram) feedFile(raw, which string, kind proto.MediaKind, w, h int) *proto.Image {
+	return b.feedFiles().file(raw, which, kind, w, h)
+}
+
+// file is feedFile's, for either network.
+func (fs feedFiles) file(raw, which string, kind proto.MediaKind, w, h int) *proto.Image {
 	if !onCDNURL(raw) {
 		return nil
 	}
@@ -727,8 +752,8 @@ func (b *Instagram) feedFile(raw, which string, kind proto.MediaKind, w, h int) 
 		// A DASH stream's sound is an MP4 of its own, saved as .m4a.
 		mime = "audio/mp4"
 	}
-	id := b.d.Files.Register(ids.FileRef{
-		Network: proto.Instagram, Key: fileKey("", raw, which), Mime: mime,
+	id := fs.files.Register(ids.FileRef{
+		Network: fs.network, Key: fileKey("", raw, which), Mime: mime,
 		Source: &mediaSource{url: raw},
 	})
 	if id == 0 {

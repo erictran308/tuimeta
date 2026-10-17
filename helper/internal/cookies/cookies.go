@@ -24,6 +24,9 @@ const MaxInput = 1 << 20
 var Required = map[proto.Network][]string{
 	proto.Messenger: {"c_user", "xs", "datr"},
 	proto.Instagram: {"sessionid", "ds_user_id", "csrftoken"},
+	// Threads' are its own site's: an instagram.com session isn't sent to
+	// threads.com.
+	proto.Threads: {"sessionid", "ds_user_id", "csrftoken"},
 }
 
 // domains are the sites whose cookies a network's login may use, for exports
@@ -31,6 +34,7 @@ var Required = map[proto.Network][]string{
 var domains = map[proto.Network][]string{
 	proto.Messenger: {"facebook.com", "messenger.com"},
 	proto.Instagram: {"instagram.com"},
+	proto.Threads:   {"threads.com", "threads.net"},
 }
 
 // Cookie is one name and value.
@@ -76,8 +80,11 @@ func parse(n proto.Network, input string) (Set, error) {
 }
 
 func site(n proto.Network) string {
-	if n == proto.Instagram {
+	switch n {
+	case proto.Instagram:
 		return "instagram.com"
+	case proto.Threads:
+		return "threads.com"
 	}
 	return "facebook.com"
 }
@@ -265,6 +272,10 @@ func (s Set) Values() map[string]string {
 	}
 	return m
 }
+
+// List is the cookies in the order they were given, as a browser sends
+// them.
+func (s Set) List() []Cookie { return slices.Clone(s.list) }
 
 // Header is the cookies as a Cookie header's value.
 func (s Set) Header() string {

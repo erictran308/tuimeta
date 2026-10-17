@@ -59,6 +59,8 @@ func (n Network) Title() string {
 		return "Instagram"
 	case WhatsApp:
 		return "WhatsApp"
+	case Threads:
+		return "Threads"
 	}
 	return "that network"
 }

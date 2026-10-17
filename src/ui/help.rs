@@ -89,7 +89,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Instagram feed",
+        "Instagram and Threads feeds",
         &[
             ("j / k", "Next / previous post"),
             ("gg / G", "First / last post loaded"),
@@ -101,12 +101,16 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("Space / m", "Pause / mute the video playing"),
             (", / .", "Back / on 5 seconds in the video playing"),
-            ("o", "Open the post on instagram.com, to like or comment"),
+            (
+                "o",
+                "Open the post on instagram.com or threads.com, to like or answer",
+            ),
+            ("f", "Threads: For you, or the accounts you follow"),
             ("y", "Copy the post's link"),
             ("r", "Reload: the newest posts"),
             (
                 "c",
-                "The post's comments, in a pane beside it (again to close)",
+                "The post's comments (on Threads, replies), in a pane beside it (again to close)",
             ),
             ("l", "Over to the comments pane, while it's open"),
             ("Esc", "Stop the video, or go back"),
@@ -122,7 +126,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Show or hide a comment's replies; on a reply, more of them",
             ),
             ("y", "Copy the comment"),
-            ("o", "Open the post on instagram.com, to answer there"),
+            ("o", "Open the post on its website, to answer there"),
             (
                 "Space / m",
                 "Pause / mute the post's video, playing beside them",

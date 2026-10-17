@@ -42,9 +42,10 @@ var commentTexts = []string{
 var replyTexts = []string{"Right?!", "Agreed", "@sam.climbs you need to see this", "Haha yes", "😂", "Next time!", "Thank you!"}
 
 // LoadComments gives a post's comments CommentPage at a time, or a
-// comment's replies ReplyPage at a time; only Instagram has them.
+// comment's replies ReplyPage at a time; only Instagram and Threads have
+// them. On Threads a reply can have replies too.
 func (f *Fake) LoadComments(ctx context.Context, postID, repliesOf int64, more bool) ([]proto.Comment, bool, error) {
-	if f.net != proto.Instagram {
+	if f.net != proto.Instagram && f.net != proto.Threads {
 		return nil, false, proto.Err(proto.Unsupported, f.net.Title()+"'s posts have no comments in tuimeta.")
 	}
 	f.mu.Lock()
@@ -53,17 +54,17 @@ func (f *Fake) LoadComments(ctx context.Context, postID, repliesOf int64, more b
 	if err != nil {
 		return nil, false, err
 	}
-	i := int(postID) - 1
-	if i < 0 || i >= len(w.feed) || w.feed[i].ID != postID {
+	i, ok := w.postIndex(postID)
+	if !ok {
 		return nil, false, errNoPost
 	}
-	list, per := w.commentsOf(i), CommentPage
+	list, per := w.commentsOf(i, f.net == proto.Threads), CommentPage
 	if repliesOf != 0 {
-		at := slices.IndexFunc(list, func(c proto.Comment) bool { return c.ID == repliesOf })
-		if at < 0 {
+		parent, ok := w.findComment(i, repliesOf)
+		if !ok {
 			return nil, false, errNoComment
 		}
-		list, per = w.repliesOf(i, at), ReplyPage
+		list, per = w.repliesTo(i, parent, f.net == proto.Threads), ReplyPage
 	}
 	key := [2]int64{postID, repliesOf}
 	from := 0
@@ -75,10 +76,82 @@ func (f *Fake) LoadComments(ctx context.Context, postID, repliesOf int64, more b
 	return slices.Clone(list[from:end]), end < len(list), nil
 }
 
+// posts are both feeds' posts, "for you" first; a post's index in it is
+// its id less one.
+func (w *world) posts() []proto.Post { return slices.Concat(w.feed, w.following) }
+
+// postIndex is post id's index in posts.
+func (w *world) postIndex(id int64) (int, bool) {
+	i := int(id) - 1
+	all := w.posts()
+	return i, i >= 0 && i < len(all) && all[i].ID == id
+}
+
+// findComment is one of post i's comments, or a reply to one that has
+// been given.
+func (w *world) findComment(i int, id int64) (proto.Comment, bool) {
+	post := w.posts()[i]
+	for _, c := range w.comments[post.ID] {
+		if c.ID == id {
+			return c, true
+		}
+	}
+	for _, rs := range w.replies {
+		for _, r := range rs {
+			if r.ID == id && w.onPost(r, post.ID) {
+				return r, true
+			}
+		}
+	}
+	return proto.Comment{}, false
+}
+
+// onPost reports whether reply c is under post id's comments.
+func (w *world) onPost(c proto.Comment, id int64) bool {
+	for range 8 {
+		for _, top := range w.comments[id] {
+			if top.ID == c.ReplyTo {
+				return true
+			}
+		}
+		parent, ok := w.replyByID(c.ReplyTo)
+		if !ok {
+			return false
+		}
+		c = parent
+	}
+	return false
+}
+
+func (w *world) replyByID(id int64) (proto.Comment, bool) {
+	for _, rs := range w.replies {
+		for _, r := range rs {
+			if r.ID == id {
+				return r, true
+			}
+		}
+	}
+	return proto.Comment{}, false
+}
+
+// threadsReplyTexts are what Threads' made-up replies say.
+var threadsReplyTexts = []string{
+	"This is the take I needed today",
+	"Respectfully, no 😂",
+	"@sam.climbs thoughts?",
+	"Saving this thread",
+	"Same here. Took me years to figure it out.\nStill learning.",
+	"Source?",
+	"🔥",
+	"Okay but the second post in this thread is the real one",
+}
+
 // commentsOf is post i's comments, as many as it says it has (at most
-// MaxComments), from the feed's people in turn, a few minutes apart.
-func (w *world) commentsOf(i int) []proto.Comment {
-	p := w.feed[i]
+// MaxComments), from the feed's people in turn, a few minutes apart. On
+// Threads (threads), they're replies: some with a photo or a video, some
+// with replies of their own.
+func (w *world) commentsOf(i int, threads bool) []proto.Comment {
+	p := w.posts()[i]
 	if cs, ok := w.comments[p.ID]; ok {
 		return cs
 	}
@@ -94,6 +167,17 @@ func (w *world) commentsOf(i int) []proto.Comment {
 			Date:   p.Date + int64(j+1)*int64(11*time.Minute/time.Second),
 			Text:   commentTexts[(i+j)%len(commentTexts)],
 		}
+		if threads {
+			c.Text = threadsReplyTexts[(i+j)%len(threadsReplyTexts)]
+			switch j % 7 {
+			case 2:
+				c.Attachment = proto.AttachPhoto
+			case 5:
+				c.Attachment = proto.AttachVideo
+			case 6:
+				c.Attachment, c.Text = proto.AttachCarousel, ""
+			}
+		}
 		if j%6 != 5 { // some say no likes
 			likes := int64((i*7 + j*13) % 300)
 			c.Likes = &likes
@@ -107,23 +191,40 @@ func (w *world) commentsOf(i int) []proto.Comment {
 	return cs
 }
 
-// repliesOf is the replies to post i's comment at index j, oldest first.
-func (w *world) repliesOf(i, j int) []proto.Comment {
-	parent := w.comments[w.feed[i].ID][j]
+// repliesTo is the replies to parent, a comment on post i or (on Threads)
+// a reply under one, oldest first. On Threads, every third reply to a
+// comment has two replies of its own.
+func (w *world) repliesTo(i int, parent proto.Comment, threads bool) []proto.Comment {
 	if rs, ok := w.replies[parent.ID]; ok {
 		return rs
+	}
+	// j is the comment's place among its post's (as Instagram's made-up
+	// replies have always been numbered by), or for a reply its id's end.
+	post := w.posts()[i].ID
+	j := int(parent.ID%1000) - 1
+	if parent.ReplyTo != 0 {
+		j = int(parent.ID % 100)
 	}
 	rs := make([]proto.Comment, 0, parent.Replies)
 	for k := range int(parent.Replies) {
 		likes := int64((j + k*5) % 40)
-		rs = append(rs, proto.Comment{
-			ID:      1_000_000 + w.feed[i].ID*10_000 + int64(j+1)*100 + int64(k) + 1,
+		r := proto.Comment{
+			ID:      1_000_000 + post*10_000 + int64(j+1)*100 + int64(k) + 1,
 			Author:  w.feedAuthors[(i+j+k+1)%len(w.feedAuthors)],
 			Date:    parent.Date + int64(k+1)*int64(3*time.Minute/time.Second),
 			Text:    replyTexts[(j+k)%len(replyTexts)],
 			Likes:   &likes,
 			ReplyTo: parent.ID,
-		})
+		}
+		if parent.ReplyTo != 0 {
+			// Replies to a reply (Threads'): from 100 000 000 up, so they
+			// never meet a comment's.
+			r.ID = 100_000_000 + parent.ID*10 + int64(k) + 1
+		}
+		if threads && parent.ReplyTo == 0 && k%3 == 0 {
+			r.Replies = 2
+		}
+		rs = append(rs, r)
 	}
 	w.replies[parent.ID] = rs
 	return rs

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/erictran308/tuimeta/helper/internal/backend"
 	"github.com/erictran308/tuimeta/helper/internal/history"
 	"github.com/erictran308/tuimeta/helper/internal/ids"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
@@ -70,10 +71,14 @@ type world struct {
 	byUser map[int64]*person
 	chats  []*chat
 	byChat map[int64]*chat
-	// feed is Instagram's home feed, and feedAt how much of it load_feed
-	// has given since the login or the last fresh load.
-	feed   []proto.Post
-	feedAt int
+	// feed is the home feed (Threads': its "for you" one), and feedAt how
+	// much of it load_feed has given since the login or the last fresh
+	// load; following is Threads' other feed, and feedKind which is being
+	// paged.
+	feed      []proto.Post
+	feedAt    int
+	following []proto.Post
+	feedKind  backend.FeedKind
 	// feedAuthors are the people and pages the feed's posts and comments
 	// are by; comments and replies are made when first asked for, and
 	// commentAt is how far each list (a post's, or a comment's replies)
@@ -134,6 +139,8 @@ func definition(n proto.Network) networkDef {
 		return instagram()
 	case proto.WhatsApp:
 		return whatsapp()
+	case proto.Threads:
+		return threads()
 	}
 	return messenger()
 }

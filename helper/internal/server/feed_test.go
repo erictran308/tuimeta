@@ -27,15 +27,17 @@ type feeder struct {
 	asked   []int
 	fresh   []bool
 	boxes   []backend.Box
+	kinds   []backend.FeedKind
 	running int
 	most    int
 }
 
-func (f *feeder) LoadFeed(ctx context.Context, limit int, fresh bool, box backend.Box) ([]proto.Post, bool, error) {
+func (f *feeder) LoadFeed(ctx context.Context, limit int, fresh bool, box backend.Box, kind backend.FeedKind) ([]proto.Post, bool, error) {
 	f.mu.Lock()
 	f.asked = append(f.asked, limit)
 	f.fresh = append(f.fresh, fresh)
 	f.boxes = append(f.boxes, box)
+	f.kinds = append(f.kinds, kind)
 	f.running++
 	f.most = max(f.most, f.running)
 	f.mu.Unlock()
@@ -129,6 +131,19 @@ func TestOnlyANetworkWithAFeedLoadsOne(t *testing.T) {
 		t.Errorf("boxes %v", boxes)
 	}
 
+	// Which of a network's feeds: for you unless it says.
+	h.c.Call("load_feed", map[string]any{"network": "instagram", "feed": "following"})
+	h.c.Call("load_feed", map[string]any{"network": "instagram", "feed": "for_you"})
+	fd.mu.Lock()
+	kinds := fd.kinds
+	fd.mu.Unlock()
+	if !slices.Equal(kinds[len(kinds)-3:], []backend.FeedKind{backend.ForYou, backend.Following, backend.ForYou}) {
+		t.Errorf("kinds %v", kinds)
+	}
+	if l := h.c.Call("load_feed", map[string]any{"network": "instagram", "feed": "explore"}); l.Error == nil || l.Error.Code != proto.BadRequest {
+		t.Errorf("an unknown feed: %s", l.Raw)
+	}
+
 	// Messenger and WhatsApp have none.
 	for _, n := range []string{"messenger", "whatsapp"} {
 		if l := h.c.Call("load_feed", map[string]any{"network": n, "limit": 10}); l.Error == nil || l.Error.Code != proto.Unsupported {
@@ -156,7 +171,7 @@ func TestALoggedOutNetworksFeedIsRefused(t *testing.T) {
 
 type loggedOutFeeder struct{ backend.Unavailable }
 
-func (*loggedOutFeeder) LoadFeed(context.Context, int, bool, backend.Box) ([]proto.Post, bool, error) {
+func (*loggedOutFeeder) LoadFeed(context.Context, int, bool, backend.Box, backend.FeedKind) ([]proto.Post, bool, error) {
 	panic("a logged-out network was asked for its feed")
 }
 

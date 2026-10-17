@@ -127,7 +127,7 @@ func feedHarness(t *testing.T, pages map[string][]byte) (*harness, *[]time.Time)
 
 func load(t *testing.T, h *harness, fresh bool) ([]proto.Post, bool) {
 	t.Helper()
-	posts, more, err := h.b.LoadFeed(context.Background(), 10, fresh, backend.Box{})
+	posts, more, err := h.b.LoadFeed(context.Background(), 10, fresh, backend.Box{}, "")
 	if err != nil {
 		t.Fatalf("LoadFeed: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestFeedRequestsAreSpacedOut(t *testing.T) {
 	// Given up while it waits, a load asks for nothing.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, _, err := h.b.LoadFeed(ctx, 10, false, backend.Box{}); !errors.Is(err, context.DeadlineExceeded) || len(*at) != 3 {
+	if _, _, err := h.b.LoadFeed(ctx, 10, false, backend.Box{}, ""); !errors.Is(err, context.DeadlineExceeded) || len(*at) != 3 {
 		t.Errorf("got %v after %d requests", err, len(*at))
 	}
 	if feedGap < 2*time.Second {
@@ -497,7 +497,7 @@ func TestAFeedRefusalSaysWhatToDo(t *testing.T) {
 			h.b.feed.gap = time.Millisecond
 			h.api.feed = func(string) ([]byte, error) { return c.body, c.err }
 			h.login(mailbox(t, "", false))
-			_, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{})
+			_, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}, "")
 			var pe *proto.Error
 			if !errors.As(err, &pe) || pe.Code != c.want.Code || pe.Message != c.want.Message {
 				t.Errorf("got %v, want %v", err, c.want)
@@ -523,7 +523,7 @@ func TestAFeedRefusalSaysWhatToDo(t *testing.T) {
 		}
 		return feedPageJSON(false, ""), nil
 	}
-	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}); err == nil {
+	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}, ""); err == nil {
 		t.Fatal("no error")
 	}
 	if _, more := load(t, h, false); more {
@@ -533,7 +533,7 @@ func TestAFeedRefusalSaysWhatToDo(t *testing.T) {
 
 func TestTheFeedNeedsTheAccountConnected(t *testing.T) {
 	h := newHarness(t)
-	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}); err != errNotConnected {
+	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}, ""); err != errNotConnected {
 		t.Errorf("got %v", err)
 	}
 	if h.api.count("FeedTimeline") != 0 {
@@ -598,7 +598,7 @@ func TestTheFeedDrawsAPictureNoBiggerThanItsBoxAndTheViewerTheLargerOne(t *testi
 			photoPost("3400000000000000001", "DAbcPhoto1", mayaFeed, `{"pk":"1","text":"hi"}`, ""),
 			reelPost("3400000000000000002", "DAbcReel02")),
 	})
-	posts, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{Width: 600, Height: 600})
+	posts, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{Width: 600, Height: 600}, "")
 	if err != nil || len(posts) != 2 {
 		t.Fatalf("got %+v, %v", posts, err)
 	}
@@ -625,7 +625,7 @@ func TestEachSizeOfAPictureAtOnePathIsAFileOfItsOwn(t *testing.T) {
 	post := `{"pk":"3400000000000000013","code":"DAbcSame13","media_type":1,"user":` + mayaFeed + `,
 		"image_versions2":{"candidates":[` + at(1080, 1350) + `,` + at(640, 800) + `]}}`
 	h, _ := feedHarness(t, map[string][]byte{"": feedPageJSON(false, "", post)})
-	posts, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{Width: 600, Height: 600})
+	posts, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{Width: 600, Height: 600}, "")
 	if err != nil || len(posts) != 1 {
 		t.Fatalf("got %+v, %v", posts, err)
 	}
@@ -640,7 +640,7 @@ func TestEachSizeOfAPictureAtOnePathIsAFileOfItsOwn(t *testing.T) {
 		t.Errorf("viewer's %s", u)
 	}
 	// Without a box, the one size is one file.
-	again, _, _ := h.b.LoadFeed(context.Background(), 10, true, backend.Box{})
+	again, _, _ := h.b.LoadFeed(context.Background(), 10, true, backend.Box{}, "")
 	if m := again[0].Media[0]; m.Thumbnail.FileID != m.FileID || m.FileID != pm.FileID {
 		t.Errorf("again %+v, first %+v", m, pm)
 	}

@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, sleep_until};
 
 use crate::attach::{self, Attachment, Dropped};
-use crate::chats::{Chats, FEED, List, Presence};
+use crate::chats::{self, Chats, List, Presence};
 use crate::chime::{self, Ringer, Sounds};
 use crate::clipboard::{Clipboard, ClipboardEvent, Copied, Decoded, Paste, Pasted};
 use crate::comments::{Comments, Replies};
@@ -788,10 +788,11 @@ pub struct App {
     /// Counts the logins asked for: an answer to an earlier one (a link
     /// given up with Esc) is old news.
     login_attempt: u64,
-    /// Instagram's home feed, while it's open instead of a chat.
+    /// A network's home feed (Instagram's or Threads'), while it's open
+    /// instead of a chat.
     pub feed: Option<Feed>,
-    /// The feed as it was left for a chat, to come back to as it was.
-    feed_kept: Option<Feed>,
+    /// The feeds as they were left, to come back to as they were.
+    feeds_kept: HashMap<Network, Feed>,
     /// When a fresh page last took the place of the posts shown: an Enter
     /// that quick was meant for what was there before.
     feed_changed: Option<Instant>,
@@ -899,7 +900,7 @@ impl App {
             browser: None,
             login_attempt: 0,
             feed: None,
-            feed_kept: None,
+            feeds_kept: HashMap::new(),
             feed_changed: None,
             comments: None,
             comments_focus: false,
@@ -990,7 +991,8 @@ impl App {
                 .as_mut()
                 .and_then(|p| p.due_search(Instant::now()))
             {
-                for network in self.ready_networks() {
+                // Threads has no one to write to.
+                for network in self.ready_networks().into_iter().filter(|n| n.has_chats()) {
                     self.meta.find_chats(network, query.clone());
                 }
             }
@@ -1479,9 +1481,7 @@ impl App {
                         self.users.insert(id, name);
                     }
                 }
-                if network == Network::Instagram {
-                    self.chats.add_feed();
-                }
+                self.chats.add_feed(network);
                 if was != Some(AccountState::Ready) {
                     // Messages from before now came while tuimeta wasn't
                     // running, or another account was in.
@@ -1586,7 +1586,7 @@ impl App {
             }
         }
         self.chats.forget(network);
-        self.feed_kept = None;
+        self.feeds_kept.remove(&network);
         self.loading_chats.remove(&network);
         self.loaded_chats.remove(&network);
         self.picker = None;
@@ -2616,7 +2616,7 @@ impl App {
                 .open
                 .as_ref()
                 .map(|o| o.chat_id)
-                .or(self.feed.as_ref().map(|_| FEED)),
+                .or(self.feed.as_ref().and_then(|f| chats::feed_id(f.network))),
         }
     }
 
@@ -2641,7 +2641,7 @@ impl App {
             return;
         };
         let name = network.name();
-        // Logout is local on Messenger and Instagram: tuimeta drops the
+        // Logout is local on Messenger, Instagram and Threads: tuimeta drops the
         // connection and deletes what it keeps, but never ends the web
         // session the cookies belong to, so the browser you copied them from
         // stays logged in. On WhatsApp tuimeta is a linked device of its
@@ -2659,6 +2659,11 @@ impl App {
                 "Instagram on this computer. The session itself ends".into(),
                 "only once you log out in the browser you copied the".into(),
                 "cookies from.".into(),
+            ],
+            Network::Threads => vec![
+                "tuimeta deletes what it keeps for Threads on this".to_string(),
+                "computer. The session itself ends only once you log".into(),
+                "out in the browser you copied the cookies from.".into(),
             ],
             Network::WhatsApp => vec![
                 "tuimeta unlinks itself from your WhatsApp account and".to_string(),
@@ -2737,10 +2742,14 @@ impl App {
 
     /// Where the cursor is: the open chat, and the message it's on.
     fn here(&self) -> Option<Jump> {
-        let feed = self.feed.as_ref().map(|_| Jump {
-            chat_id: FEED,
-            message_id: None,
-        });
+        let feed = self
+            .feed
+            .as_ref()
+            .and_then(|f| chats::feed_id(f.network))
+            .map(|chat_id| Jump {
+                chat_id,
+                message_id: None,
+            });
         self.open
             .as_ref()
             .map(|o| Jump {
@@ -2788,8 +2797,8 @@ impl App {
             self.selected = Some(chat_id);
         }
         self.focus = Focus::Messages;
-        if chat_id == FEED {
-            self.open_feed();
+        if let Some(network) = chats::feed_network(chat_id) {
+            self.open_feed(network);
             return;
         }
         if self.open.as_ref().is_some_and(|o| o.chat_id == chat_id) {
@@ -2827,7 +2836,7 @@ impl App {
             self.stop_video();
             self.close_comments();
             self.images.clear();
-            self.feed_kept = Some(feed);
+            self.feeds_kept.insert(feed.network, feed);
         }
     }
 
@@ -3338,7 +3347,7 @@ impl App {
         let Some(view) = &self.photo_view else {
             return;
         };
-        if view.chat_id == FEED {
+        if chats::is_feed(view.chat_id) {
             self.view_next_feed_photo(view.message_id, view.photo.file_id, newer);
             return;
         }
@@ -3976,7 +3985,11 @@ impl App {
     /// Asks for the next page of a network's chats. Only as the list is
     /// read: asking for every chat at once is what a script would do.
     fn load_more_chats(&mut self, network: Network) {
-        if self.loading_chats.contains(&network) || self.loaded_chats.contains(&network) {
+        // Threads has only its feed.
+        if !network.has_chats()
+            || self.loading_chats.contains(&network)
+            || self.loaded_chats.contains(&network)
+        {
             return;
         }
         self.loading_chats.insert(network);
@@ -4007,7 +4020,7 @@ impl App {
         let Some(chat_id) = self.selected else {
             return;
         };
-        if chat_id == FEED {
+        if chats::is_feed(chat_id) {
             self.status = Some("The feed has no notifications to mute".into());
             return;
         }
@@ -4018,7 +4031,7 @@ impl App {
 
     /// `H`: marks the selected chat so it's easy to find, or unmarks it.
     fn toggle_highlight(&mut self) {
-        let Some(chat_id) = self.selected.filter(|&id| id != FEED) else {
+        let Some(chat_id) = self.selected.filter(|&id| !chats::is_feed(id)) else {
             return;
         };
         self.settings.highlighted_chats = self.chats.toggle_highlight(chat_id);
@@ -4045,24 +4058,24 @@ impl App {
     }
 }
 
-/// Instagram's home feed, and its videos inside Pepper.
+/// The networks' home feeds, and their videos inside Pepper.
 impl App {
-    /// Opens the feed in the chat's place: as it was left, or its first
-    /// page.
-    fn open_feed(&mut self) {
-        if self.feed.is_some() {
+    /// Opens `network`'s feed in the chat's place: as it was left, or its
+    /// first page.
+    fn open_feed(&mut self, network: Network) {
+        if self.feed.as_ref().is_some_and(|f| f.network == network) {
             return;
         }
-        let picture = self.feed_picture();
+        let picture = self.feed_picture(network);
+        // The chat, or the other network's feed, is kept as it was.
         self.leave_chat();
-        let network = Network::Instagram;
-        let feed = match self.feed_kept.take().filter(|f| f.network == network) {
+        let feed = match self.feeds_kept.remove(&network) {
             Some(feed) => feed,
             None => {
                 let mut feed = Feed::new(network);
                 if let Some(load) = feed.start_load(false) {
                     self.meta
-                        .load_feed(network, feed::PAGE, false, picture, load);
+                        .load_feed(network, feed::PAGE, false, picture, feed.following, load);
                 }
                 feed
             }
@@ -4103,6 +4116,7 @@ impl App {
             KeyCode::Char('o') => self.open_post_outside(),
             KeyCode::Char('y') => self.copy_post_link(),
             KeyCode::Char('r') => self.reload_feed(),
+            KeyCode::Char('f') => self.switch_threads_feed(),
             KeyCode::Char('c') => self.toggle_comments(),
             // The comments pane is on the post's right.
             KeyCode::Char('l') if self.comments.is_some() && !self.comments_focus => {
@@ -4153,35 +4167,83 @@ impl App {
     /// way. Only as the feed is read: loading all of it is what a script
     /// would do.
     fn load_more_feed(&mut self) {
-        let picture = self.feed_picture();
+        let Some(network) = self.feed.as_ref().map(|f| f.network) else {
+            return;
+        };
+        let picture = self.feed_picture(network);
         let Some(feed) = self.feed.as_mut() else {
             return;
         };
         if feed.wants_more()
             && let Some(load) = feed.start_load(false)
         {
-            self.meta
-                .load_feed(feed.network, feed::PAGE, false, picture, load);
+            self.meta.load_feed(
+                feed.network,
+                feed::PAGE,
+                false,
+                picture,
+                feed.following,
+                load,
+            );
         }
     }
 
     /// `r`: the newest posts again.
     fn reload_feed(&mut self) {
-        let picture = self.feed_picture();
+        let Some(network) = self.feed.as_ref().map(|f| f.network) else {
+            return;
+        };
+        let picture = self.feed_picture(network);
         let Some(feed) = self.feed.as_mut() else {
             return;
         };
         if let Some(load) = feed.start_load(true) {
-            self.meta
-                .load_feed(feed.network, feed::PAGE, true, picture, load);
+            self.meta.load_feed(
+                feed.network,
+                feed::PAGE,
+                true,
+                picture,
+                feed.following,
+                load,
+            );
         }
+    }
+
+    /// `f` on Threads: the accounts followed, newest first, or For you
+    /// again, from the top.
+    fn switch_threads_feed(&mut self) {
+        let picture = self.feed_picture(Network::Threads);
+        let Some(feed) = self.feed.as_mut().filter(|f| f.network == Network::Threads) else {
+            self.status = Some("Only Threads has another feed to switch to".into());
+            return;
+        };
+        feed.following = !feed.following;
+        // Whatever was on its way was the other feed's.
+        feed.loading = None;
+        if let Some(load) = feed.start_load(true) {
+            self.meta.load_feed(
+                Network::Threads,
+                feed::PAGE,
+                true,
+                picture,
+                feed.following,
+                load,
+            );
+        }
+        self.stop_video();
+        self.close_comments();
     }
 
     /// The largest box a post's picture is drawn in, in pixels, for
     /// `load_feed`: photos that come no bigger than they're shown are
-    /// downloaded and decoded sooner, in less memory.
-    fn feed_picture(&self) -> Option<(u32, u32)> {
-        ui::feed::picture_box(self.chat_area, self.images.font_size())
+    /// downloaded and decoded sooner, in less memory. Threads draws them
+    /// smaller, side by side.
+    fn feed_picture(&self, network: Network) -> Option<(u32, u32)> {
+        let font = self.images.font_size();
+        match network {
+            Network::Threads => ui::threads::picture_box(self.chat_area, font),
+            _ => ui::feed::picture_box(self.chat_area, font),
+        }
     }
 
     /// A page of the feed came, or why it didn't. One for a feed left for
@@ -4195,7 +4257,7 @@ impl App {
         let open = self.feed.as_ref().is_some_and(|f| f.network == network);
         let feed = match open {
             true => self.feed.as_mut(),
-            false => self.feed_kept.as_mut().filter(|f| f.network == network),
+            false => self.feeds_kept.get_mut(&network),
         };
         let Some(feed) = feed else {
             return;
@@ -4219,35 +4281,49 @@ impl App {
     }
 
     /// Enter on a post: its photo in the viewer; its video over the post
-    /// inside Pepper, or in the system's player anywhere else.
+    /// inside Pepper, or in the system's player anywhere else; on a Threads
+    /// post with no photo or video but a link's card, the link, as a chat's
+    /// links open.
     fn open_feed_item(&mut self) {
         let Some(feed) = self.feed.as_ref() else {
             return;
         };
+        let network = feed.network;
+        let card = feed
+            .selected_post()
+            .filter(|p| p.media.is_empty())
+            .and_then(|p| p.link.as_ref())
+            .map(|card| Link::from(card.url.as_str()));
         let Some((post, item)) = feed.shown_item() else {
-            self.status = Some("Nothing to open in this post".into());
+            match card {
+                Some(link)
+                    if !Self::feed_just_changed(&mut self.feed_changed, &mut self.status) =>
+                {
+                    self.open_link_outside(link)
+                }
+                Some(_) => {}
+                None => self.status = Some("Nothing to open in this post".into()),
+            }
             return;
         };
         // The posts were replaced a moment ago, maybe just as the key went
         // down: the one under the cursor isn't what the user meant to open.
-        if self
-            .feed_changed
-            .take()
-            .is_some_and(|at| at.elapsed() < CONFIRM_GRACE)
-        {
-            self.status = Some("The feed just changed: press Enter again to open it".into());
+        if Self::feed_just_changed(&mut self.feed_changed, &mut self.status) {
             return;
         }
         let Some(file) = item.file.clone() else {
             self.status = Some(match item.video {
-                true => "This video can't be played here: o opens it on instagram.com".into(),
+                true => format!(
+                    "This video can't be played here: o opens it on {}",
+                    network.site()
+                ),
                 false => "This post can't be opened here".into(),
             });
             return;
         };
         let (post_id, audio) = (post.id, item.audio);
         if !item.video {
-            self.photo_view = feed_photo(post_id, item);
+            self.photo_view = feed_photo(network, post_id, item);
             return;
         }
         if self
@@ -4288,20 +4364,34 @@ impl App {
         }
     }
 
+    /// The posts were replaced a moment ago, maybe just as Enter went down:
+    /// the one under the cursor isn't what the user meant to open, so it
+    /// asks for Enter again. Fields rather than `self`, so the post can stay
+    /// borrowed.
+    fn feed_just_changed(changed: &mut Option<Instant>, status: &mut Option<String>) -> bool {
+        let just = changed
+            .take()
+            .is_some_and(|at| at.elapsed() < CONFIRM_GRACE);
+        if just {
+            *status = Some("The feed just changed: press Enter again to open it".into());
+        }
+        just
+    }
+
     /// `h` / `l` in the viewer over the feed: the photo before or after,
     /// through the carousels and the posts, loading more past the last.
     fn view_next_feed_photo(&mut self, post_id: i64, file_id: i32, newer: bool) {
         let Some(feed) = self.feed.as_mut() else {
             return;
         };
-        let before = feed.selected;
+        let (before, network) = (feed.selected, feed.network);
         match feed.next_photo(post_id, file_id, newer) {
             Some((post_id, item)) => {
                 if feed.selected != before {
                     self.stop_video();
                     self.close_comments();
                 }
-                if let Some(view) = feed_photo(post_id, &item) {
+                if let Some(view) = feed_photo(network, post_id, &item) {
                     self.photo_view = Some(view);
                 }
                 self.load_more_feed();
@@ -4316,7 +4406,8 @@ impl App {
         }
     }
 
-    /// `o`: the post on instagram.com, where it can be liked or answered.
+    /// `o`: the post on its network's website, where it can be liked or
+    /// answered.
     fn open_post_outside(&mut self) {
         match self.feed_link() {
             Some(link) => self.open_link_outside(link),
@@ -4332,11 +4423,15 @@ impl App {
         }
     }
 
-    /// `c`: the selected post's comments, in a pane on its right, which
-    /// takes the keys; `c` again closes it. The post stays in view, and its
-    /// video plays on.
+    /// `c`: the selected post's comments (Threads' replies), in a pane on
+    /// its right, which takes the keys; `c` again closes it. The post stays
+    /// in view, and its video plays on.
     fn toggle_comments(&mut self) {
-        let Some(post) = self.feed.as_ref().and_then(Feed::selected_post) else {
+        let Some(feed) = self.feed.as_ref() else {
+            return;
+        };
+        let network = feed.network;
+        let Some(post) = feed.selected_post() else {
             return;
         };
         if self.comments.as_ref().is_some_and(|c| c.post_id == post.id) {
@@ -4348,6 +4443,9 @@ impl App {
             false => format!("@{}", post.username),
         };
         let mut comments = Comments::new(post.id, &author);
+        if network == Network::Threads {
+            comments.what = "Replies";
+        }
         if let Some(load) = comments.start_load(None, false) {
             self.meta.load_comments(post.id, None, false, load);
         }
@@ -4598,15 +4696,15 @@ impl App {
     }
 }
 
-/// The viewer on a photo of the feed's post `post_id`.
-fn feed_photo(post_id: i64, item: &feed::Item) -> Option<PhotoView> {
+/// The viewer on a photo of `network`'s feed's post `post_id`.
+fn feed_photo(network: Network, post_id: i64, item: &feed::Item) -> Option<PhotoView> {
     let file = item.file.clone().filter(|_| !item.video)?;
     let (width, height) = item
         .still
         .as_ref()
         .map_or((1080, 1080), |s| (s.width, s.height));
     Some(PhotoView {
-        chat_id: FEED,
+        chat_id: chats::feed_id(network)?,
         message_id: post_id,
         photo: Preview {
             file_id: file.id,
@@ -4735,6 +4833,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::chats::FEED;
     use crate::meta::{ChatInfo, ChatKind, Message, Network};
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -5512,6 +5611,11 @@ mod tests {
             "waiting to hear about WhatsApp"
         );
         account(&mut app, Network::WhatsApp, AccountState::LoggedOut);
+        assert!(
+            matches!(&app.screen, Screen::Login(l) if matches!(l.step, LoginStep::Connecting)),
+            "waiting to hear about Threads"
+        );
+        account(&mut app, Network::Threads, AccountState::LoggedOut);
         assert!(
             matches!(&app.screen, Screen::Login(l) if matches!(l.step, LoginStep::Choose { .. }))
         );
@@ -6488,7 +6592,7 @@ mod tests {
     #[test]
     fn a_warning_from_the_chats_does_not_come_back_after_logging_in_again() {
         let mut app = test_app("confirm-relogin");
-        for network in [Network::Messenger, Network::Instagram] {
+        for network in [Network::Messenger, Network::Instagram, Network::Threads] {
             app.accounts.insert(
                 network,
                 Account {
@@ -7665,7 +7769,7 @@ mod tests {
             name: None,
             error: None,
         });
-        assert!(app.feed.is_none() && app.feed_kept.is_none());
+        assert!(app.feed.is_none() && app.feeds_kept.is_empty());
         assert_eq!(app.focus, Focus::Chats);
         app.chats.refresh();
         assert!(app.chats.get(FEED).is_none());
@@ -7697,5 +7801,227 @@ mod tests {
         assert_eq!(sent_with(&app, "load_feed").len(), 1, "not loaded again");
         press(&mut app, KeyCode::Char('i'), KeyModifiers::CONTROL);
         assert_eq!(app.open.as_ref().map(|o| o.chat_id), Some(chat));
+    }
+
+    /// The Threads account comes in, as the helper says it.
+    fn threads_in(app: &mut App) {
+        app.on_meta(MetaEvent::Account {
+            network: Network::Threads,
+            state: AccountState::Ready,
+            user_id: None,
+            name: Some("alice.example".into()),
+            error: None,
+        });
+    }
+
+    /// Opens Threads' feed from its row in the Threads tab.
+    fn open_threads(app: &mut App) {
+        threads_in(app);
+        app.focus = Focus::Chats;
+        app.chats.show(List::Network(Network::Threads));
+        app.chats.refresh();
+        app.selected = Some(chats::THREADS_FEED);
+        press(app, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    /// The page Threads' feed waits for comes.
+    fn threads_page(app: &mut App, posts: Vec<FeedPost>, more: bool) {
+        let load = app
+            .feed
+            .as_ref()
+            .unwrap()
+            .loading
+            .expect("a load on its way");
+        app.on_meta(MetaEvent::Feed {
+            network: Network::Threads,
+            load,
+            page: Ok((posts, more)),
+        });
+    }
+
+    /// A Threads post of text alone, with `fields` besides.
+    fn thread(id: i64, fields: serde_json::Value) -> FeedPost {
+        let mut all = serde_json::json!({
+            "media": [], "caption": "words, no photo", "reposts": 2, "shares": 5,
+            "url": "https://www.threads.com/@alice.example/post/ABC"
+        });
+        if let (Some(all), Some(fields)) = (all.as_object_mut(), fields.as_object()) {
+            for (key, value) in fields {
+                all.insert(key.clone(), value.clone());
+            }
+        }
+        post(id, all)
+    }
+
+    #[test]
+    fn threads_has_a_tab_with_its_feed_and_no_chats_to_load() {
+        let mut app = test_app("threads-row");
+        threads_in(&mut app);
+        assert!(
+            sent_with(&app, "load_chats")
+                .iter()
+                .all(|p| p["network"] != "threads"),
+            "Threads has no chats"
+        );
+        app.chats.refresh();
+        assert!(app.chats.tabs().iter().any(|t| t.name == "Threads"));
+        app.chats.show(List::Network(Network::Threads));
+        app.chats.refresh();
+        assert_eq!(app.chats.ids(), &[chats::THREADS_FEED]);
+        // With Instagram in too, each feed is in its own tab.
+        instagram_in(&mut app);
+        app.chats.show(List::Network(Network::Instagram));
+        app.chats.refresh();
+        assert_eq!(app.chats.ids().first(), Some(&FEED));
+        assert!(!app.chats.ids().contains(&chats::THREADS_FEED));
+        // Nothing that acts on a chat goes to the helper for it.
+        app.chats.show(List::Network(Network::Threads));
+        app.chats.refresh();
+        app.selected = Some(chats::THREADS_FEED);
+        app.focus = Focus::Chats;
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('H'), KeyModifiers::NONE);
+        assert!(sent_with(&app, "mute").is_empty());
+        assert!(app.settings.highlighted_chats.is_empty());
+    }
+
+    #[test]
+    fn threads_feed_opens_for_you_and_f_switches_to_the_accounts_followed() {
+        let mut app = test_app("threads-feed");
+        open_threads(&mut app);
+        let asked = sent_with(&app, "load_feed");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            (&asked[0]["network"], &asked[0]["feed"]),
+            (&serde_json::json!("threads"), &serde_json::json!("for_you"))
+        );
+        threads_page(
+            &mut app,
+            (1..=3).map(|i| thread(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Threads · For you")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("words, no photo")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("12 likes · 3 replies · 2 reposts · 5 shares")),
+            "{rows:#?}"
+        );
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        let asked = sent_with(&app, "load_feed");
+        let last = asked.last().unwrap();
+        assert_eq!(
+            (&last["feed"], &last["fresh"]),
+            (&serde_json::json!("following"), &serde_json::json!(true))
+        );
+        threads_page(
+            &mut app,
+            vec![thread(9, serde_json::json!({"caption": "followed"}))],
+            false,
+        );
+        let feed = app.feed.as_ref().unwrap();
+        assert!(feed.following);
+        assert_eq!(feed.posts.iter().map(|p| p.id).collect::<Vec<_>>(), vec![9]);
+        assert!(
+            screen(&mut app)
+                .iter()
+                .any(|r| r.contains("Threads · Following"))
+        );
+        // Back to For you.
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(
+            sent_with(&app, "load_feed").last().unwrap()["feed"],
+            "for_you"
+        );
+    }
+
+    #[test]
+    fn each_feed_is_kept_as_it_was_while_the_other_is_open() {
+        let mut app = test_app("two-feeds");
+        open_threads(&mut app);
+        threads_page(
+            &mut app,
+            (1..=3).map(|i| thread(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        open_the_feed(&mut app);
+        assert_eq!(app.feed.as_ref().unwrap().network, Network::Instagram);
+        feed_page(&mut app, vec![post(20, serde_json::json!({}))], false);
+        // Back to Threads: as it was, not loaded again.
+        let loads = sent_with(&app, "load_feed").len();
+        app.focus = Focus::Chats;
+        app.chats.show(List::Network(Network::Threads));
+        app.chats.refresh();
+        app.selected = Some(chats::THREADS_FEED);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let feed = app.feed.as_ref().unwrap();
+        assert_eq!(
+            (feed.network, feed.selected, feed.posts.len()),
+            (Network::Threads, 1, 3)
+        );
+        assert_eq!(sent_with(&app, "load_feed").len(), loads);
+        assert_eq!(app.here().map(|h| h.chat_id), Some(chats::THREADS_FEED));
+        // Logging out of Instagram forgets its feed only.
+        app.on_meta(MetaEvent::Account {
+            network: Network::Instagram,
+            state: AccountState::LoggedOut,
+            user_id: None,
+            name: None,
+            error: None,
+        });
+        assert!(app.feed.is_some() && !app.feeds_kept.contains_key(&Network::Instagram));
+    }
+
+    #[test]
+    fn c_shows_a_threads_posts_replies_and_enter_on_a_link_card_asks_before_a_look_alike() {
+        let mut app = test_app("threads-replies");
+        open_threads(&mut app);
+        threads_page(
+            &mut app,
+            vec![thread(
+                1,
+                serde_json::json!({"link_preview": {"url": "https://paypal.com@evil.example/login",
+                                                      "title": "Your account"}}),
+            )],
+            false,
+        );
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        let comments = app.comments.as_ref().expect("the replies pane");
+        assert_eq!(comments.what, "Replies");
+        assert_eq!(sent_with(&app, "load_comments")[0]["post_id"], 1);
+        let load = comments.loading.unwrap().0;
+        app.on_meta(MetaEvent::Comments {
+            post_id: 1,
+            load,
+            page: Ok((
+                vec![
+                    serde_json::from_value(serde_json::json!({"id": 5,
+                        "author": {"username": "sam"}, "text": "look", "attachment": "photo"}))
+                    .unwrap(),
+                ],
+                false,
+            )),
+        });
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Replies · @alice.example")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("[Photo]")), "{rows:#?}");
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        // A text post's Enter is its link, which asks first when its address
+        // has someone's name before its host.
+        app.feed_changed = None;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let confirm = app.confirm.as_ref().expect("asks before opening it");
+        assert_eq!(confirm.site.as_deref(), Some("evil.example"));
     }
 }
