@@ -752,7 +752,14 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         draw_picker(frame, chat_area, picker, &names, colors);
     }
     if let Some(view) = &mut app.photo_view {
-        viewer::draw(frame, body, view, &mut app.images, colors);
+        viewer::draw(
+            frame,
+            body,
+            view,
+            &mut app.images,
+            app.confirm.is_some(),
+            colors,
+        );
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(frame, chat_area, confirm, colors);

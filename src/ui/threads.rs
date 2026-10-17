@@ -785,7 +785,7 @@ fn draw_avatar(
     if covered && images.paints_over() {
         return;
     }
-    if let Some(image) = images.get(still, AVATAR_COLS, AVATAR_ROWS) {
+    if let Some(image) = images.get(still, AVATAR_COLS, AVATAR_ROWS, covered) {
         let position = SignedPosition::from((at.0 as i16, at.1 as i16));
         frame.render_widget(SlicedImage::new(image, position), area);
     }

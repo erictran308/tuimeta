@@ -232,6 +232,15 @@ struct Avatar {
     shown: bool,
 }
 
+/// An encoded photo.
+struct Encoded {
+    image: SlicedProtocol,
+    /// The frame it was last drawn in.
+    used: u64,
+    /// It has been drawn, not under a popup: see [`Avatar::shown`].
+    shown: bool,
+}
+
 /// How much a cell's measured width or height must change, as a share of
 /// what it was, to count as a new cell size rather than rounding: a window
 /// whose pixels include its padding measures a little more per cell the
@@ -281,8 +290,8 @@ pub struct Images {
     /// What its window measured its cells as then: see [`Images::measured`].
     measured: Option<FontSize>,
     tx: UnboundedSender<ImageEvent>,
-    /// Encoded photos, with the frame each was last drawn in.
-    ready: HashMap<Key, (SlicedProtocol, u64)>,
+    /// Encoded photos.
+    ready: HashMap<Key, Encoded>,
     /// Counts frames, for `ready`.
     frame: u64,
     /// Goes up when the files are forgotten, for a new session: an
@@ -391,7 +400,15 @@ impl Images {
     }
 
     /// The best image ready to draw: the photo, else its blurry thumbnail.
-    pub fn get(&mut self, photo: &Preview, cols: u16, rows: u16) -> Option<&SlicedProtocol> {
+    /// While `covered` (a popup may be over it), only one drawn before: see
+    /// [`Avatar::shown`].
+    pub fn get(
+        &mut self,
+        photo: &Preview,
+        cols: u16,
+        rows: u16,
+        covered: bool,
+    ) -> Option<&SlicedProtocol> {
         let key = |thumbnail| Key {
             file_id: photo.file_id,
             cols,
@@ -401,16 +418,19 @@ impl Images {
         };
         let key = [key(false), key(true)]
             .into_iter()
-            .find(|k| self.ready.contains_key(k))?;
-        let frame = self.frame;
-        let (image, used) = self.ready.get_mut(&key)?;
-        *used = frame;
-        Some(image)
+            .find(|k| self.ready.get(k).is_some_and(|e| e.shown || !covered))?;
+        self.drawn(key)
     }
 
     /// Like [`get`](Self::get), but only the photo itself, not its blurry
     /// thumbnail.
-    pub fn sharp(&mut self, photo: &Preview, cols: u16, rows: u16) -> Option<&SlicedProtocol> {
+    pub fn sharp(
+        &mut self,
+        photo: &Preview,
+        cols: u16,
+        rows: u16,
+        covered: bool,
+    ) -> Option<&SlicedProtocol> {
         let key = Key {
             file_id: photo.file_id,
             cols,
@@ -418,10 +438,19 @@ impl Images {
             thumbnail: false,
             avatar: false,
         };
+        if self.ready.get(&key).is_none_or(|e| covered && !e.shown) {
+            return None;
+        }
+        self.drawn(key)
+    }
+
+    /// The photo `key`, drawn in this frame.
+    fn drawn(&mut self, key: Key) -> Option<&SlicedProtocol> {
         let frame = self.frame;
-        let (image, used) = self.ready.get_mut(&key)?;
-        *used = frame;
-        Some(image)
+        let encoded = self.ready.get_mut(&key)?;
+        encoded.used = frame;
+        encoded.shown = true;
+        Some(&encoded.image)
     }
 
     /// The photo's file is downloaded.
@@ -616,7 +645,7 @@ impl Images {
                 .ready
                 .iter()
                 .filter(|(k, _)| large(k))
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, e)| e.used)
                 .map(|(&k, _)| k)
         {
             self.ready.remove(&oldest);
@@ -625,12 +654,17 @@ impl Images {
             && let Some(oldest) = self
                 .ready
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, e)| e.used)
                 .map(|(&k, _)| k)
         {
             self.ready.remove(&oldest);
         }
-        self.ready.insert(key, (image, self.frame));
+        let encoded = Encoded {
+            image,
+            used: self.frame,
+            shown: false,
+        };
+        self.ready.insert(key, encoded);
     }
 
     fn add_avatar(&mut self, key: Key, image: SlicedProtocol) {
@@ -861,15 +895,46 @@ mod tests {
             (start.width * 2, start.height * 2)
         );
         assert!(!images.draws_photos(), "the protocol stays");
-        assert!(images.get(&preview(1), 4, 2).is_none(), "made again");
+        assert!(images.get(&preview(1), 4, 2, false).is_none(), "made again");
         go.send(()).unwrap();
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&preview(7), 4, 2).is_none(), "dropped");
+        assert!(images.get(&preview(7), 4, 2, false).is_none(), "dropped");
         assert!(!images.is_broken(&preview(7)));
         assert!(!images.measured(measure(20, 40)), "only once");
         images.build(key(7), || Ok(DynamicImage::new_rgba8(8, 8)));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&preview(7), 4, 2).is_some(), "the new size");
+        assert!(
+            images.get(&preview(7), 4, 2, false).is_some(),
+            "the new size"
+        );
+    }
+
+    #[test]
+    fn a_photo_never_drawn_waits_while_a_popup_may_hide_it() {
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.insert_ready(key(1), DynamicImage::new_rgba8(8, 8));
+        // Kitty's terminal gets an image only with its first drawing: one
+        // a popup covers would never come.
+        assert!(images.get(&preview(1), 4, 2, true).is_none());
+        assert!(images.sharp(&preview(1), 4, 2, true).is_none());
+        assert!(images.get(&preview(1), 4, 2, false).is_some());
+        // Once drawn, it stays under one, as before.
+        assert!(images.get(&preview(1), 4, 2, true).is_some());
+        assert!(images.sharp(&preview(1), 4, 2, true).is_some());
+        // Its thumbnail drawn before stands in while it waits.
+        let thumbnail = Key {
+            thumbnail: true,
+            ..key(2)
+        };
+        images.insert_ready(thumbnail, DynamicImage::new_rgba8(8, 8));
+        assert!(images.get(&preview(2), 4, 2, false).is_some());
+        images.insert_ready(key(2), DynamicImage::new_rgba8(8, 8));
+        assert!(
+            images.get(&preview(2), 4, 2, true).is_some(),
+            "the thumbnail"
+        );
+        assert!(images.sharp(&preview(2), 4, 2, true).is_none());
     }
 
     #[tokio::test]
@@ -912,12 +977,18 @@ mod tests {
         images.insert_ready(key(0), DynamicImage::new_rgba8(8, 8));
         for id in 1..MAX_READY as i32 + 10 {
             images.frame += 1;
-            assert!(images.get(&preview(0), 4, 2).is_some(), "still drawn");
+            assert!(
+                images.get(&preview(0), 4, 2, false).is_some(),
+                "still drawn"
+            );
             images.insert_ready(key(id), DynamicImage::new_rgba8(8, 8));
         }
         assert_eq!(images.ready.len(), MAX_READY);
-        assert!(images.get(&preview(0), 4, 2).is_some());
-        assert!(images.get(&preview(1), 4, 2).is_none(), "the oldest went");
+        assert!(images.get(&preview(0), 4, 2, false).is_some());
+        assert!(
+            images.get(&preview(1), 4, 2, false).is_none(),
+            "the oldest went"
+        );
     }
 
     #[test]
@@ -955,7 +1026,7 @@ mod tests {
         // A detached client makes no requests, so a download would never end.
         images.fetch(&Meta::detached(tokio::sync::mpsc::unbounded_channel().0));
         images.on_built(rx.recv().await.unwrap());
-        assert!(images.get(&photo, 4, 2).is_some());
+        assert!(images.get(&photo, 4, 2, false).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

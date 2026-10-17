@@ -332,7 +332,7 @@ pub(super) fn draw_photos(
         if covered && images.paints_over() {
             continue;
         }
-        if let Some(image) = images.get(&slot.photo, slot.cols, slot.rows) {
+        if let Some(image) = images.get(&slot.photo, slot.cols, slot.rows, covered) {
             let position = SignedPosition::from((slot.x as i16, y as i16));
             frame.render_widget(SlicedImage::new(image, position), area);
             continue;

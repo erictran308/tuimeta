@@ -14,11 +14,13 @@ use crate::messages::Preview;
 use crate::theme::Colors;
 use crate::viewer::{PhotoView, SIZES};
 
+/// Draws the viewer over `area`; `covered` while a warning is over it.
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     view: &mut PhotoView,
     images: &mut Images,
+    covered: bool,
     colors: &Colors,
 ) {
     let inner = super::bordered(colors).inner(area);
@@ -43,7 +45,7 @@ pub(super) fn draw(
     }
     let sharp = std::iter::once(&view.photo)
         .chain(&stand_in)
-        .find(|p| images.sharp(p, cols, rows).is_some())
+        .find(|p| images.sharp(p, cols, rows, covered).is_some())
         .cloned();
     let ready = sharp
         .as_ref()
@@ -71,13 +73,13 @@ pub(super) fn draw(
     }
     let at = SignedPosition::from((shot.x as i16, shot.y as i16));
     if let Some(photo) = &sharp
-        && let Some(image) = images.sharp(photo, cols, rows)
+        && let Some(image) = images.sharp(photo, cols, rows, covered)
     {
         frame.render_widget(SlicedImage::new(image, at), inner);
         return;
     }
     if let Some(stand_in) = &stand_in
-        && let Some(image) = images.get(stand_in, cols, rows)
+        && let Some(image) = images.get(stand_in, cols, rows, covered)
     {
         frame.render_widget(SlicedImage::new(image, at), inner);
         return;
@@ -203,7 +205,7 @@ mod tests {
     fn draw_rows(view: &mut PhotoView, images: &mut Images) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal
-            .draw(|f| draw(f, f.area(), view, images, &Colors::default()))
+            .draw(|f| draw(f, f.area(), view, images, false, &Colors::default()))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..20)
