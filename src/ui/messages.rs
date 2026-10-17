@@ -358,7 +358,10 @@ pub(super) fn draw_photos(
 }
 
 /// Size of a photo in cells: as wide as allowed (but not past its own pixels),
-/// with rows from the aspect ratio, since cells are taller than wide.
+/// with rows from the aspect ratio, since cells are taller than wide. A
+/// sticker takes the whole sticker box, as WhatsApp's 512 px ones do: the
+/// size Messenger and Instagram give is what they draw it at (96 px on
+/// Messenger), not its file's, and would leave it a few cells wide.
 fn photo_cells(photo: &Preview, max_cols: usize, font: FontSize) -> (u16, u16) {
     let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
     let (pw, ph) = (f64::from(photo.width), f64::from(photo.height));
@@ -367,7 +370,12 @@ fn photo_cells(photo: &Preview, max_cols: usize, font: FontSize) -> (u16, u16) {
     } else {
         (MAX_PHOTO_COLS, MAX_PHOTO_ROWS)
     };
-    let mut cols = (max_cols.min(limit_cols) as f64).min(pw / fw);
+    let own = if photo.sticker {
+        f64::INFINITY
+    } else {
+        pw / fw
+    };
+    let mut cols = (max_cols.min(limit_cols) as f64).min(own);
     let mut rows = cols * fw * ph / pw / fh;
     if rows > limit_rows as f64 {
         rows = limit_rows as f64;
@@ -2398,6 +2406,25 @@ mod tests {
         let mut images = images();
         // 512x512 at 10x20 px cells: 20 cols by 10 rows.
         assert_eq!(photo_cells(&sticker, 56, images.font_size()), (20, 10));
+        // Messenger says 96 px, the size it draws them at: as big all the
+        // same, and a wide one keeps its shape.
+        let messenger = Preview {
+            width: 96,
+            height: 96,
+            ..sticker.clone()
+        };
+        assert_eq!(photo_cells(&messenger, 56, images.font_size()), (20, 10));
+        let wide = Preview {
+            width: 120,
+            height: 60,
+            ..sticker.clone()
+        };
+        assert_eq!(photo_cells(&wide, 56, images.font_size()), (20, 5));
+        assert_eq!(
+            photo_cells(&messenger, 12, images.font_size()),
+            (12, 6),
+            "a narrow pane"
+        );
         let buf = render_buffer(&mut open, false, &mut images);
         let own = Colors::default().own_bubble;
         assert!(
