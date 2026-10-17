@@ -1102,10 +1102,12 @@ pub fn helper_path() -> Result<PathBuf> {
         .context("cannot tell where tuimeta is")?
         .join(name);
     if !path.is_file() {
+        // `cargo install` copies only tuimeta, so say where it goes.
+        let path = config::shown(&path);
         bail!(
-            "{name} isn't next to tuimeta ({}). It speaks Messenger, Instagram and \
-             WhatsApp for it; build it with `go build -o ../target/debug/{name} .` in helper/",
-            config::shown(&path)
+            "{name} isn't next to tuimeta, at {path}. It speaks Messenger, Instagram and \
+             WhatsApp for tuimeta: build it there with `go build -o \"{path}\" .` in the \
+             repository's helper/ folder"
         );
     }
     Ok(path)

@@ -37,7 +37,7 @@ The same app as [tuigram](https://github.com/erictran308/tuigram), for Meta's me
 
 tuimeta is two programs: `tuimeta`, the app (Rust, MIT), and `tuimeta-helper`, the separate program that speaks Meta's protocols (Go, AGPL). The app starts the helper and talks to it over a pipe; the helper must be next to the app.
 
-tuimeta is distributed on GitHub only and built from source — it is **not** published to crates.io, so there is no `cargo install`. Clone the repo and build both programs:
+tuimeta is distributed on GitHub only and built from source — it is **not** published to crates.io, so there is no `cargo install tuimeta`. Clone the repo and build both programs:
 
 ```sh
 git clone https://github.com/erictran308/tuimeta && cd tuimeta
@@ -45,6 +45,15 @@ cargo build --release
 (cd helper && go build -o ../target/release/tuimeta-helper .)
 ./target/release/tuimeta
 ```
+
+To have `tuimeta` on your `PATH` instead, install it from the clone, and the helper next to it: `cargo install` builds only the Rust program.
+
+```sh
+cargo install --path . --locked
+(cd helper && go build -o ~/.cargo/bin/tuimeta-helper .)
+```
+
+Do both again after each `git pull`, so the two stay from the same version.
 
 You need Rust 1.88 or newer and Go 1.27.
 
