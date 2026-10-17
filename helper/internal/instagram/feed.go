@@ -644,11 +644,11 @@ func (b *Instagram) feedMediaOf(m *feedMedia, box backend.Box, st *feedStats) (p
 	w, h := int(m.Width), int(m.Height)
 	if still, ok := atLeast(m.Images.Candidates, photoWidth); ok {
 		drawn := drawnIn(m.Images.Candidates, box, still)
-		cover = b.feedFile(drawn.URL, "feed-still", proto.Photo, int(drawn.Width), int(drawn.Height))
+		cover = b.feedFile(drawn.URL, stillKey(drawn), proto.Photo, int(drawn.Width), int(drawn.Height))
 		full = cover
 		// A video's cover is only drawn: no larger one for the viewer.
 		if !video && drawn.URL != still.URL {
-			full = b.feedFile(still.URL, "feed-still", proto.Photo, int(still.Width), int(still.Height))
+			full = b.feedFile(still.URL, stillKey(still), proto.Photo, int(still.Width), int(still.Height))
 		}
 		stillURL = still.URL
 		if w <= 0 || h <= 0 {
@@ -701,6 +701,14 @@ func (b *Instagram) feedMediaOf(m *feedMedia, box backend.Box, st *feedStats) (p
 	}
 	md.Duration = int(math.Ceil(min(max(seconds, 0), math.MaxInt32)))
 	return md, true
+}
+
+// stillKey is the which of a picture's file at one size. Instagram serves
+// a picture's sizes at one path, with the size in its query (stp=), so
+// each size needs a key of its own, or the drawn one and the viewer's
+// would be one file.
+func stillKey(c feedCandidate) string {
+	return "feed-still:" + strconv.FormatInt(int64(c.Width), 10) + "x" + strconv.FormatInt(int64(c.Height), 10)
 }
 
 // feedFile registers a file of the feed, keyed by its address's path (not

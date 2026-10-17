@@ -618,6 +618,34 @@ func TestTheFeedDrawsAPictureNoBiggerThanItsBoxAndTheViewerTheLargerOne(t *testi
 	}
 }
 
+func TestEachSizeOfAPictureAtOnePathIsAFileOfItsOwn(t *testing.T) {
+	at := func(w, h int) string {
+		return fmt.Sprintf(`{"width":%d,"height":%d,"url":"%s/v/t51.2885-15/5521_n.jpg?stp=dst-jpg_e35_p%dx%d&_nc_ht=x&oh=sig%d"}`, w, h, cdn, w, w, w)
+	}
+	post := `{"pk":"3400000000000000013","code":"DAbcSame13","media_type":1,"user":` + mayaFeed + `,
+		"image_versions2":{"candidates":[` + at(1080, 1350) + `,` + at(640, 800) + `]}}`
+	h, _ := feedHarness(t, map[string][]byte{"": feedPageJSON(false, "", post)})
+	posts, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{Width: 600, Height: 600})
+	if err != nil || len(posts) != 1 {
+		t.Fatalf("got %+v, %v", posts, err)
+	}
+	pm := posts[0].Media[0]
+	if pm.Thumbnail.FileID == pm.FileID {
+		t.Fatalf("one file for both sizes: %+v", pm)
+	}
+	if u := fileURL(t, h, pm.Thumbnail.FileID); !strings.Contains(u, "p640x640") {
+		t.Errorf("drawn %s", u)
+	}
+	if u := fileURL(t, h, pm.FileID); !strings.Contains(u, "p1080x1080") {
+		t.Errorf("viewer's %s", u)
+	}
+	// Without a box, the one size is one file.
+	again, _, _ := h.b.LoadFeed(context.Background(), 10, true, backend.Box{})
+	if m := again[0].Media[0]; m.Thumbnail.FileID != m.FileID || m.FileID != pm.FileID {
+		t.Errorf("again %+v, first %+v", m, pm)
+	}
+}
+
 func TestTheVersionDrawnIsTheSmallestThatFillsItsBox(t *testing.T) {
 	c := func(w, h int) feedCandidate {
 		return feedCandidate{Width: flexInt(w), Height: flexInt(h), URL: fmt.Sprintf("%s/v/%dx%d.jpg", cdn, w, h)}
