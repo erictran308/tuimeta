@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/erictran308/tuimeta/helper/internal/backend"
 )
 
 // threadsPage is what one load of a page of threads.com gave.
@@ -56,7 +58,6 @@ var (
 	pageExp      = regexp.MustCompile(`"(\d+)":\{"r":(true|false|null|-?\d+(?:\.\d+)?|"[^"\\]{0,200}")`)
 	pageConfig   = regexp.MustCompile(`"(\d+)":\{"value":(true|false|null|-?\d+(?:\.\d+)?|"[^"\\]{0,200}")\}`)
 	pageBundle   = regexp.MustCompile(`https:(?:\\/\\/|//)static\.cdninstagram\.com(?:\\/|/)rsrc\.php(?:\\/|/)[A-Za-z0-9_\\/,.+-]{1,300}?\.js`)
-	threadsUser  = regexp.MustCompile(`^[A-Za-z0-9._]{1,30}$`)
 	threadsDigit = regexp.MustCompile(`^\d{1,25}$`)
 )
 
@@ -121,7 +122,7 @@ func parseThreadsPage(html string) (p threadsPage, ok bool) {
 			p.bundles = append(p.bundles, u)
 		}
 	}
-	if !threadsUser.MatchString(p.username) {
+	if !backend.Username(p.username) {
 		p.username = ""
 	}
 	if !threadsDigit.MatchString(p.viewerID) {

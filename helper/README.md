@@ -193,8 +193,10 @@ What goes to Instagram without tuimeta asking, and why it's kept:
   instagram.com makes for it, a GET from that page:
   `/api/v1/media/<media pk>/info/`, the pk worked out from the link's code
   (its letters are the pk's digits in base 64), and the answer kept only
-  if it's the post of that code. It shares the feed's lock and gap, and
-  tells Instagram nothing more than opening the post on its website.
+  if it's the post of that code. It shares the feed's lock and gap, waits
+  its turn behind the feed's loads, is called off before it's sent when
+  another post's link is opened, and tells Instagram nothing more than
+  opening the post on its website.
 
 instameow itself sends no presence, "active now", foreground or app state,
 and registers no push; it marks nothing read and sends no typing on its own
@@ -250,10 +252,13 @@ Everything sent to threads.com, at most one request at a time and at least
   (`/t/<code>` for a link without the username), as a navigation from
   another app, when you press Enter on a Threads post's link in a chat
   (`load_post`): the post is read from the answers to its own queries that
-  the page comes with, and its tokens are the session's from then on, as a
-  browser's would be. Only the code and username go into its address, and
-  only if they're made of what Threads' are. A post's page that answers as
-  to nobody logged in doesn't end the session; the home page decides that.
+  the page comes with. Its cookies are kept, but the session's queries go
+  on with the home page's tokens and gates, as a browser's do when it goes
+  from page to page within the website. Only the code and username go
+  into its address, and only if they're made of what Threads' are. A
+  post's page that answers as to nobody logged in doesn't end the session;
+  the home page decides that. Opening another post's link calls off one
+  not yet loaded.
 - GraphQL queries, `POST https://www.threads.com/api/graphql`, with the
   form and headers the page's own code sends (`x-ig-app-id`, `x-fb-lsd`,
   `x-csrftoken`, `x-asbd-id`, `x-fb-friendly-name`, the page as referer):
@@ -283,13 +288,14 @@ Everything sent to threads.com, at most one request at a time and at least
 - When Threads stops taking a query as sent (a variable it now needs, a
   document it no longer knows), its definition is read again from the
   website's JavaScript: the page is loaded again (the post's page, as a
-  navigation from home, for the replies' queries), then its scripts, in the
-  page's order, `GET https://static.cdninstagram.com/rsrc.php/…` without
-  cookies as a page's scripts are fetched, until the query and the flags
-  it reads are found: at most 60 MB, at most once in ten minutes, and the
-  query is tried once more. What was found, and which scripts held none of
-  it (by a hash of their address, at most 5000), is kept in
-  `threads/catalog.json`; the definitions as of 2026-10-17 are built in.
+  navigation from home, for the replies' queries, read only for its list
+  of scripts), then its scripts, in the page's order,
+  `GET https://static.cdninstagram.com/rsrc.php/…` without cookies as a
+  page's scripts are fetched, until the query and the flags it reads are
+  found: at most 60 MB, at most once in ten minutes, and the query is
+  tried once more. What was found, and which scripts held none of it (by a
+  hash of their address, at most 5000), is kept in `threads/catalog.json`;
+  the definitions as of 2026-10-17 are built in.
 
 The feed's and the replies' files (pictures, videos, avatars, link cards'
 pictures) download only on `download`, from Instagram's CDN as the

@@ -252,7 +252,7 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 	given := map[int64]bool{}
 	for range feedTries {
 		now := time.Now().UnixMilli()
-		data, err := t.ask(ctx, threadsFeedQuery, f.variables(now), threadsBase+"/")
+		data, err := t.ask(ctx, epoch, threadsFeedQuery, f.variables(now), threadsBase+"/")
 		if err != nil {
 			hlog.Warn("threads: feed failed", hlog.Kind(err))
 			return nil, false, err
@@ -443,7 +443,7 @@ func (t *Threads) feedPosts(f *threadsFeed, threads []feedThread, box backend.Bo
 			if r := m.Info.Share.Reposted; r != nil {
 				// A repost is the post reposted, and who reposted it.
 				context = "Reposted"
-				if u := strings.TrimSpace(m.User.Username); threadsUser.MatchString(u) {
+				if u := strings.TrimSpace(m.User.Username); backend.Username(u) {
 					context = u + " reposted"
 				}
 				m = r
@@ -452,23 +452,30 @@ func (t *Threads) feedPosts(f *threadsFeed, threads []feedThread, box backend.Bo
 			if !ok {
 				continue
 			}
-			key := string(m.Pk)
-			if key == "" {
-				key = string(m.ID)
-			}
-			id, seen := f.posts[key]
-			if !seen {
-				f.next++
-				id = f.next
-				f.posts[key] = id
-			}
-			f.refs[id] = postRef{pk: mediaPK(&m.feedMedia), url: p.URL}
-			p.ID, p.Context, p.Continues = id, context, !first
+			p.ID, p.Context, p.Continues = f.idFor(m, p.URL), context, !first
 			first = false
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// idFor is the id of post m, which opens at url: the one it was given
+// before (by its pk, else its id), or the next. Its replies are found by
+// it from now on. f.mu is held.
+func (f *threadsFeed) idFor(m *threadsMedia, url string) int64 {
+	key := string(m.Pk)
+	if key == "" {
+		key = string(m.ID)
+	}
+	id, seen := f.posts[key]
+	if !seen {
+		f.next++
+		id = f.next
+		f.posts[key] = id
+	}
+	f.refs[id] = postRef{pk: mediaPK(&m.feedMedia), url: url}
+	return id
 }
 
 // postOf is the protocol's post of a Threads post, registering its files;
@@ -555,7 +562,7 @@ func postOf(fs feedFiles, m *threadsMedia, box backend.Box, st *feedStats, quote
 // username and its code are what Threads' are made of.
 func threadsURL(username, code string) string {
 	username = strings.TrimSpace(username)
-	if !threadsUser.MatchString(username) || postURL(code, "") == "" {
+	if !backend.Username(username) || !backend.PostCode(code) {
 		return ""
 	}
 	return threadsBase + "/@" + username + "/post/" + code

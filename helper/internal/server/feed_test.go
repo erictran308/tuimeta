@@ -246,10 +246,13 @@ func TestAFeedLoadGivenUpWhileWaitingKeepsTheLine(t *testing.T) {
 }
 
 // commenter is a feeder whose posts have comments: each load answers one
-// comment saying what it was asked, waiting for loads when set.
+// comment saying what it was asked, waiting for cloads when set. Its
+// LoadPost says it's in on inPost and waits for ploads, when they're set.
 type commenter struct {
 	feeder
 	cloads chan struct{}
+	ploads chan struct{}
+	inPost chan struct{}
 
 	cmu    sync.Mutex
 	casked [][3]int64 // post, replies_of, more (0 or 1)
@@ -285,10 +288,20 @@ func (c *commenter) LoadComments(ctx context.Context, post, of int64, more bool)
 }
 
 // LoadPost gives post 41 for any code but "Gone", which it hasn't.
-func (c *commenter) LoadPost(_ context.Context, code, username string, _ backend.Box) (proto.Post, error) {
+func (c *commenter) LoadPost(ctx context.Context, code, username string, _ backend.Box) (proto.Post, error) {
 	c.cmu.Lock()
 	c.posted = append(c.posted, code+" "+username)
 	c.cmu.Unlock()
+	if c.inPost != nil {
+		c.inPost <- struct{}{}
+	}
+	if c.ploads != nil {
+		select {
+		case <-c.ploads:
+		case <-ctx.Done():
+			return proto.Post{}, ctx.Err()
+		}
+	}
 	if code == "Gone" {
 		return proto.Post{}, proto.Err(proto.NotFound, "No such post.")
 	}
@@ -338,6 +351,62 @@ func TestAPostOpensByItsLinkAndThenItsCommentsLoad(t *testing.T) {
 	defer cm.cmu.Unlock()
 	if strings.Join(cm.posted, ",") != "DAbc_-1 maya.lens,Gone " {
 		t.Errorf("asked %q", cm.posted)
+	}
+}
+
+func TestALinkOpenedCallsOffTheOneBeforeItAndWaitsItsTurnBehindTheFeed(t *testing.T) {
+	h, cm := withCommenter(t, func(c *commenter) {
+		c.loads = make(chan struct{})
+		c.ploads = make(chan struct{})
+		c.inPost = make(chan struct{}, 1)
+	})
+	post := func(code string) uint64 {
+		return h.c.Request("load_post", map[string]any{"network": "instagram", "code": code})
+	}
+	calledOff := func(id uint64) {
+		t.Helper()
+		if r := h.c.Response(id); r.Error == nil || r.Error.Code != proto.Cancelled {
+			t.Errorf("got %s", r.Raw)
+		}
+	}
+	posted := func() string {
+		cm.cmu.Lock()
+		defer cm.cmu.Unlock()
+		return strings.Join(cm.posted, ",")
+	}
+
+	// One being asked for is called off by the next: only one linked post
+	// shows at a time.
+	a := post("A")
+	<-cm.inPost
+	b := post("B")
+	calledOff(a)
+	<-cm.inPost
+	cm.ploads <- struct{}{}
+	if r := h.c.Response(b); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+
+	// One waiting behind a feed load is called off before the network is
+	// asked, and the next goes once the feed's is done.
+	feed := h.c.Request("load_feed", map[string]any{"network": "instagram", "limit": 3})
+	c := post("C")
+	d := post("D")
+	calledOff(c)
+	if got := posted(); got != "A ,B " {
+		t.Errorf("asked %q while the feed loaded", got)
+	}
+	cm.loads <- struct{}{}
+	if r := h.c.Response(feed); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+	<-cm.inPost
+	cm.ploads <- struct{}{}
+	if r := h.c.Response(d); r.Error != nil {
+		t.Fatalf("got %s", r.Raw)
+	}
+	if got := posted(); got != "A ,B ,D " {
+		t.Errorf("asked %q", got)
 	}
 }
 

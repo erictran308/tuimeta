@@ -61,8 +61,9 @@ type threadsSite struct {
 	mu sync.Mutex
 	// home answers the home page: a status, a body and headers.
 	home func(r *http.Request) *http.Response
-	// pages are other pages, by address.
-	pages map[string]string
+	// pages are other pages, by address, sent with pageHeader.
+	pages      map[string]string
+	pageHeader []string
 	// graphql answers a query, by its form.
 	graphql func(form url.Values) string
 	bundles map[string]string
@@ -99,9 +100,10 @@ func (s *threadsSite) RoundTrip(r *http.Request) (*http.Response, error) {
 	case r.URL.Host == "www.threads.com":
 		s.mu.Lock()
 		page, ok := s.pages[r.URL.String()]
+		header := s.pageHeader
 		s.mu.Unlock()
 		if ok {
-			return respond(200, page)(r), nil
+			return respond(200, page, header...)(r), nil
 		}
 		return respond(404, "")(r), nil
 	case r.URL.Host == "static.cdninstagram.com":

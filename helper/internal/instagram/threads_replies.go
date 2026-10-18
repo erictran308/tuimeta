@@ -70,7 +70,7 @@ func (t *Threads) LoadComments(ctx context.Context, postID, repliesOf int64, mor
 		name = threadsMoreQuery
 		vars = map[string]any{"after": list.cursor, "first": repliesPage, "postID": of, "sortOrder": "TOP"}
 	}
-	data, err := t.ask(ctx, name, vars, post.url)
+	data, err := t.ask(ctx, epoch, name, vars, post.url)
 	if err != nil {
 		hlog.Warn("threads: replies failed", hlog.Kind(err))
 		return nil, false, err

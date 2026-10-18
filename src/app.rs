@@ -267,6 +267,8 @@ impl Confirm {
 pub enum Confirmed {
     OpenFile(String),
     OpenLink(String),
+    /// Show this Instagram or Threads post here, as Enter on its link would.
+    OpenPost(feed::PostLink),
     /// Edit this message, starting from this text, losing its formatting.
     Edit {
         id: i64,
@@ -280,7 +282,7 @@ impl Confirmed {
     /// What `y` does, for the key hints.
     pub fn verb(&self) -> &'static str {
         match self {
-            Confirmed::OpenFile(_) | Confirmed::OpenLink(_) => "open",
+            Confirmed::OpenFile(_) | Confirmed::OpenLink(_) | Confirmed::OpenPost(_) => "open",
             Confirmed::Edit { .. } => "edit",
             Confirmed::Logout(_) => "log out",
         }
@@ -616,7 +618,9 @@ impl Command {
 
     pub fn about(self) -> &'static str {
         match self {
-            Command::Login => "Log in to Messenger, Instagram or WhatsApp, or log in again",
+            Command::Login => {
+                "Log in to Messenger, Instagram, Threads or WhatsApp, or log in again"
+            }
             Command::Logout => "Log out of the network of the chat under the cursor (asks first)",
         }
     }
@@ -2053,7 +2057,7 @@ impl App {
         if self.focus == Focus::Messages
             && self.comments_focus
             && self.comments.is_some()
-            && self.on_comments_key(key, ctrl)
+            && self.on_comments_key(key, ctrl, pending_g)
         {
             return;
         }
@@ -3275,7 +3279,8 @@ impl App {
 
     /// Files open in their default app once downloaded; links in the
     /// browser, but a link to an Instagram or Threads post here, in its
-    /// feed's place, while that account is in.
+    /// feed's place, while that account is in. Either asks first if the
+    /// link's words say something other than where it goes.
     fn open_target(&mut self, target: Target) {
         match target {
             Target::Photo { message_id, file } => self.view_photo(message_id, file),
@@ -3288,7 +3293,15 @@ impl App {
             Target::Link(link) => match feed::post_link(&link.url)
                 .filter(|post| self.ready_networks().contains(&post.network))
             {
-                Some(post) => self.open_linked_post(post),
+                Some(post) => match link.disguise {
+                    Some(shown) => self.ask_to_open(
+                        "Open this post?",
+                        format!("The text says: {shown}"),
+                        link.url,
+                        Confirmed::OpenPost(post),
+                    ),
+                    None => self.open_linked_post(post),
+                },
                 None => self.open_link_outside(link),
             },
             Target::Text(_) => {}
@@ -3405,17 +3418,24 @@ impl App {
                 None => return self.open_externally(&url),
             },
         };
+        self.ask_to_open(
+            "Open this link?",
+            why,
+            url.clone(),
+            Confirmed::OpenLink(url),
+        );
+    }
+
+    /// Asks before `action` opens `url`, saying `why` and showing the
+    /// address in full, with its site on a line of its own.
+    fn ask_to_open(&mut self, title: &str, why: String, url: String, action: Confirmed) {
         // Browsers show other scripts' letters as such, so a look-alike
         // host can pass for a familiar one.
         let site = link_host(&url).map(|host| match other_scripts(&host) {
             false => host,
             true => format!("{host} (has non-Latin letters)"),
         });
-        let mut confirm = Confirm::new(
-            "Open this link?",
-            vec![why, format!("Full address:  {url}")],
-            Confirmed::OpenLink(url),
-        );
+        let mut confirm = Confirm::new(title, vec![why, format!("Full address:  {url}")], action);
         confirm.site = site;
         self.confirm = Some(confirm);
     }
@@ -3502,6 +3522,13 @@ impl App {
                     match confirm.action {
                         Confirmed::OpenFile(target) | Confirmed::OpenLink(target) => {
                             self.open_externally(&target)
+                        }
+                        // Its account may have gone meanwhile: then it's any link.
+                        Confirmed::OpenPost(post) => {
+                            match self.ready_networks().contains(&post.network) {
+                                true => self.open_linked_post(post),
+                                false => self.open_externally(&post.url),
+                            }
                         }
                         Confirmed::Edit { id, text } => self.start_edit(id, text),
                         Confirmed::Logout(network) => self.log_out(network),
@@ -4116,10 +4143,9 @@ impl App {
         self.close_chat_popups();
         // The chat, or the feed, is kept as it was.
         self.leave_chat();
-        // The list's cursor goes to the feed's row, even if the filter hid it.
-        if !self.chats.ids().contains(&row) {
-            self.chats.set_filter("");
-        }
+        // The list's cursor goes to the feed's row: in its network's tab when
+        // the list of every chat hasn't it, and even if the filter hid it.
+        self.chats.reveal(row);
         self.selected = Some(row);
         self.focus = Focus::Messages;
         self.feed = Some(Feed::linked(link));
@@ -4573,7 +4599,7 @@ impl App {
     /// every pane has (quitting, help, commands, the picker, jumps, going to
     /// the chat list), for those to take; the rest act on the comments, and
     /// Space and `m` on the video playing beside them.
-    fn on_comments_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+    fn on_comments_key(&mut self, key: KeyEvent, ctrl: bool, pending_g: bool) -> bool {
         let to_list = match self.settings.chat_list_side {
             Side::Left => 'h',
             Side::Right => 'l',
@@ -4586,7 +4612,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => Some(-1),
             KeyCode::Char('d') if ctrl => Some(HALF_PAGE / 2),
             KeyCode::Char('u') if ctrl => Some(-HALF_PAGE / 2),
-            KeyCode::Char('g') => Some(isize::MIN),
+            KeyCode::Char('g') if pending_g => Some(isize::MIN),
             KeyCode::Char('G') => Some(isize::MAX),
             _ => None,
         };
@@ -4597,6 +4623,8 @@ impl App {
         }
         match key.code {
             _ if ctrl => return false,
+            // `gg`, as in every pane.
+            KeyCode::Char('g') => self.pending_g = true,
             // One page at a time, as the helper takes them.
             KeyCode::Enter if comments.loading.is_some() => {
                 self.status = Some("Still loading: press Enter again in a moment".into());
@@ -8335,5 +8363,104 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.feed.is_none() && sent_with(&app, "load_post").is_empty());
         assert_eq!(opened_link(&app).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn a_late_answer_for_the_last_link_isnt_taken_for_the_next() {
+        let mut app = test_app("linked-late");
+        let none = KeyModifiers::NONE;
+        instagram_in(&mut app);
+        settled_message(&mut app, "https://www.instagram.com/p/FIRST1/");
+        press(&mut app, KeyCode::Enter, none);
+        let first = app.feed.as_ref().unwrap().loading.unwrap();
+        // Back to the chat before it came, and on to another link.
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.open.is_some());
+        settled_message(&mut app, "https://www.instagram.com/p/NEXT2/");
+        app.open.as_mut().unwrap().selected = None;
+        press(&mut app, KeyCode::Enter, none);
+        app.on_meta(MetaEvent::Post {
+            network: Network::Instagram,
+            load: first,
+            post: Ok(Box::new(post(
+                1,
+                serde_json::json!({"caption": "the first"}),
+            ))),
+        });
+        let feed = app.feed.as_ref().unwrap();
+        assert_eq!(feed.linked.as_ref().map(|l| l.code.as_str()), Some("NEXT2"));
+        assert!(
+            feed.posts.is_empty() && feed.loading.is_some(),
+            "still waiting for its own"
+        );
+    }
+
+    #[test]
+    fn a_post_link_behind_other_words_asks_before_showing_the_post() {
+        let mut app = test_app("linked-disguised");
+        let none = KeyModifiers::NONE;
+        instagram_in(&mut app);
+        app.focus = Focus::Messages;
+        let id = app.open.as_ref().unwrap().newest_id().unwrap() + 1_000_000;
+        let url = "https://www.instagram.com/p/SCAM1/";
+        app.on_meta(MetaEvent::Message(Box::new(incoming_disguised(
+            &app, id, url,
+        ))));
+        settled(&mut app, id);
+        press(&mut app, KeyCode::Enter, none);
+        let confirm = app.confirm.as_mut().expect("asks first");
+        assert_eq!(confirm.title, "Open this post?");
+        assert_eq!(confirm.lines[0], "The text says: doc");
+        assert_eq!(confirm.site.as_deref(), Some("www.instagram.com"));
+        assert!(app.feed.is_none() && sent_with(&app, "load_post").is_empty());
+        app.confirm.as_mut().unwrap().shown = Instant::now().checked_sub(CONFIRM_GRACE).unwrap();
+        press(&mut app, KeyCode::Char('y'), none);
+        assert_eq!(
+            app.feed
+                .as_ref()
+                .and_then(|f| f.linked.as_ref())
+                .map(|l| l.code.as_str()),
+            Some("SCAM1")
+        );
+        assert_eq!(sent_with(&app, "load_post").len(), 1);
+    }
+
+    #[test]
+    fn a_post_link_puts_the_cursor_on_the_feeds_row_in_its_tab_and_keeps_the_filter() {
+        let mut app = test_app("linked-tab");
+        instagram_in(&mut app);
+        // Three networks: the list of every chat has no feed row.
+        app.chats.set_filter("fee");
+        app.chats.refresh();
+        assert!(!app.chats.ids().contains(&FEED));
+        settled_message(&mut app, "https://www.instagram.com/p/DAbc12/");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.chats.shown(), List::Network(Network::Instagram));
+        assert_eq!(app.chats.filter(), "fee");
+        assert!(app.chats.ids().contains(&FEED));
+        assert_eq!(app.selected, Some(FEED));
+    }
+
+    #[test]
+    fn in_the_comments_one_g_waits_for_another_as_in_every_pane() {
+        let mut app = test_app("comments-gg");
+        let none = KeyModifiers::NONE;
+        open_the_feed(&mut app);
+        feed_page(&mut app, vec![post(1, serde_json::json!({}))], false);
+        press(&mut app, KeyCode::Char('c'), none);
+        comments_page(
+            &mut app,
+            (10..=13)
+                .map(|i| comment(i, serde_json::json!({})))
+                .collect(),
+            false,
+        );
+        press(&mut app, KeyCode::Char('G'), none);
+        let last = app.comments.as_ref().unwrap().selected;
+        assert!(last > 0);
+        press(&mut app, KeyCode::Char('g'), none);
+        assert_eq!(app.comments.as_ref().unwrap().selected, last, "not yet");
+        press(&mut app, KeyCode::Char('g'), none);
+        assert_eq!(app.comments.as_ref().unwrap().selected, 0);
     }
 }

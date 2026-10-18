@@ -10,6 +10,7 @@ package instagram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -94,15 +95,15 @@ func (b *Instagram) LoadPost(ctx context.Context, code, _ string, box backend.Bo
 	}
 	body, err := conn.cli.MediaInfo(withQuietLog(ctx), pk, postURL(code, ""))
 	f.last = time.Now()
-	if gone(body) {
-		return proto.Post{}, errPostGone
-	}
 	if err == nil {
 		err = refused(body, errPost)
 	}
 	if err != nil {
-		hlog.Warn("instagram: post failed", hlog.Kind(err))
-		return proto.Post{}, feedError(err, body, errPost)
+		err = postError(err, body)
+		if err != errPostGone {
+			hlog.Warn("instagram: post failed", hlog.Kind(err))
+		}
+		return proto.Post{}, err
 	}
 	m, err := parseMediaInfo(body)
 	if err != nil {
@@ -122,16 +123,33 @@ func (b *Instagram) LoadPost(ctx context.Context, code, _ string, box backend.Bo
 	return p, nil
 }
 
+// postError is why a post didn't come: the session's trouble or the
+// service's first, and only then Instagram saying it has no such post.
+func postError(err error, body []byte) error {
+	err = feedError(err, body, errPost)
+	var pe *proto.Error
+	if errors.As(err, &pe) && pe.Code == proto.NetworkError && pe.Message == errPost && gone(body) {
+		return errPostGone
+	}
+	return err
+}
+
 // gone reports whether Instagram's answer says it has no such post, or
-// none this account may see.
+// none this account may see: not that it can't answer now ("Service
+// Unavailable").
 func gone(body []byte) bool {
 	var a feedAnswer
 	if json.Unmarshal(body, &a) != nil || a.Status != "fail" {
 		return false
 	}
 	msg := strings.ToLower(a.Message)
+	for _, now := range []string{"service", "server", "temporar", "try again", "later"} {
+		if strings.Contains(msg, now) {
+			return false
+		}
+	}
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "unavailable") ||
-		strings.Contains(msg, "private") || strings.Contains(msg, "does not exist")
+		strings.Contains(msg, "private") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "invalid media")
 }
 
 // parseMediaInfo reads the post an answer is about: {"items":[media]}; nil

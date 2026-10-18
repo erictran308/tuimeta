@@ -12,8 +12,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
-	"slices"
 	"strings"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
@@ -41,7 +39,7 @@ func (t *Threads) LoadPost(ctx context.Context, code, username string, box backe
 	if u := threadsURL(username, code); u != "" {
 		page = u
 	}
-	s, epoch, err := t.current(ctx)
+	_, epoch, err := t.current(ctx)
 	if err != nil {
 		return proto.Post{}, err
 	}
@@ -49,7 +47,7 @@ func (t *Threads) LoadPost(ctx context.Context, code, username string, box backe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sync(epoch)
-	html, err := t.postPage(ctx, s, epoch, page)
+	html, err := t.postPage(ctx, epoch, page)
 	if err != nil {
 		hlog.Warn("threads: post failed", hlog.Kind(err))
 		return proto.Post{}, err
@@ -64,27 +62,20 @@ func (t *Threads) LoadPost(ctx context.Context, code, username string, box backe
 	if !ok {
 		return proto.Post{}, errThreadsPostEmpty
 	}
-	key := string(m.Pk)
-	if key == "" {
-		key = string(m.ID)
-	}
-	id, seen := f.posts[key]
-	if !seen {
-		f.next++
-		id = f.next
-		f.posts[key] = id
-	}
-	f.refs[id] = postRef{pk: mediaPK(&m.feedMedia), url: p.URL}
-	p.ID = id
+	p.ID = f.idFor(&m, p.URL)
 	hlog.Info("threads: post loaded")
 	return p, nil
 }
 
-// postPage is a post's page, as it came: the session's next requests go
-// from it, as a browser's would. A page that reads as nobody's doesn't end
-// the session here, as the home page's would: the feed's next request
-// finds out from the home page. t.net is taken.
-func (t *Threads) postPage(ctx context.Context, s *threadsSession, epoch int, page string) (string, error) {
+// postPage is a post's page, as it came, for login epoch. The session's
+// requests don't go from it (open), and a page that reads as nobody's
+// doesn't end the session here, as the home page's would: the feed's next
+// request finds out from the home page. t.net is taken.
+func (t *Threads) postPage(ctx context.Context, epoch int, page string) (string, error) {
+	s, err := t.currentOf(ctx, epoch)
+	if err != nil {
+		return "", err
+	}
 	t.net.Lock()
 	defer t.net.Unlock()
 	defer func() {
@@ -108,13 +99,15 @@ func (t *Threads) postPage(ctx context.Context, s *threadsSession, epoch int, pa
 // has it: {"__bbox":{"result":{"data":…}}}, or a list of them.
 const bboxMark = `{"__bbox":`
 
-// maxJSONDepth bounds walkJSON: a page's answers nest a few dozen deep.
-const maxJSONDepth = 64
+// maxJSONNesting is how deep a page's answers are read, which nest a few
+// dozen deep: encoding/json's own bound.
+const maxJSONNesting = 10000
 
 // findThreadsPost is the post with code on a post's page: the media dict
 // of that code (with its author) in the answers the page came with, the
 // fullest where several have it (the post's own query's, not the replies'
-// one naming it).
+// one naming it), the first of those where they're as full. The page is
+// read once, however its answers are cut short or broken.
 func findThreadsPost(html, code string) (threadsMedia, bool) {
 	if code == "" {
 		return threadsMedia{}, false
@@ -126,15 +119,7 @@ func findThreadsPost(html, code string) (threadsMedia, bool) {
 			break
 		}
 		i += at
-		dec := json.NewDecoder(strings.NewReader(html[i:]))
-		dec.UseNumber() // so a number pk reads as it was written
-		var v any
-		if dec.Decode(&v) != nil {
-			at = i + len(bboxMark)
-			continue
-		}
-		at = i + int(dec.InputOffset())
-		walkJSON(v, 0, func(m map[string]any) {
+		read := scanJSON(html[i:], func(m map[string]any) {
 			if c, _ := m["code"].(string); c != code {
 				return
 			}
@@ -142,6 +127,7 @@ func findThreadsPost(html, code string) (threadsMedia, bool) {
 				best = m
 			}
 		})
+		at = i + max(read, len(bboxMark))
 	}
 	if best == nil {
 		return threadsMedia{}, false
@@ -157,21 +143,68 @@ func findThreadsPost(html, code string) (threadsMedia, bool) {
 	return m, true
 }
 
-// walkJSON shows visit every object in v, in the order of their keys, to
-// maxJSONDepth deep.
-func walkJSON(v any, depth int, visit func(map[string]any)) {
-	if depth > maxJSONDepth {
-		return
+// scanJSON reads the JSON value s starts with, a token at a time, and
+// shows visit each object in it once it's closed: inner ones first. A
+// value cut short or broken off still shows those that closed before it
+// broke, so the answers inside a broken one are found all the same. It
+// returns how far it read: to the value's end, or to the last token before
+// it broke, past which nothing it had open can close (or where it nested
+// past maxJSONNesting), so the next answer is looked for from there.
+func scanJSON(s string, visit func(map[string]any)) int {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber() // so a number pk reads as it was written
+	// open is an object (obj) or a list (arr) being read; key is the
+	// object's key whose value comes next, if hasKey.
+	type open struct {
+		obj    map[string]any
+		arr    []any
+		key    string
+		hasKey bool
 	}
-	switch v := v.(type) {
-	case map[string]any:
-		visit(v)
-		for _, k := range slices.Sorted(maps.Keys(v)) {
-			walkJSON(v[k], depth+1, visit)
+	var stack []*open
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return int(dec.InputOffset())
 		}
-	case []any:
-		for _, w := range v {
-			walkJSON(w, depth+1, visit)
+		var v any
+		switch tok {
+		case json.Delim('{'), json.Delim('['):
+			if len(stack) == maxJSONNesting {
+				return int(dec.InputOffset())
+			}
+			o := &open{arr: []any{}}
+			if tok == json.Delim('{') {
+				o.obj, o.arr = map[string]any{}, nil
+			}
+			stack = append(stack, o)
+			continue
+		case json.Delim('}'), json.Delim(']'):
+			o := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if o.obj == nil {
+				v = o.arr
+				break
+			}
+			visit(o.obj)
+			v = o.obj
+		default:
+			if len(stack) == 0 {
+				return int(dec.InputOffset())
+			}
+			if top := stack[len(stack)-1]; top.obj != nil && !top.hasKey {
+				top.key, top.hasKey = tok.(string)
+				continue
+			}
+			v = tok
+		}
+		if len(stack) == 0 {
+			return int(dec.InputOffset())
+		}
+		if top := stack[len(stack)-1]; top.obj != nil {
+			top.obj[top.key], top.hasKey = v, false
+		} else {
+			top.arr = append(top.arr, v)
 		}
 	}
 }

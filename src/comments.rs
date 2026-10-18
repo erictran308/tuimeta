@@ -116,7 +116,6 @@ pub struct Comments {
     /// The load on its way: its number, and the comment whose replies it
     /// is. Answers to any other are old news.
     pub loading: Option<(u64, Option<i64>)>,
-    loads: u64,
     /// The network has more top comments after the last one.
     pub has_more: bool,
     /// Comments whose replies are shown, and whether more of them come.
@@ -136,7 +135,6 @@ impl Comments {
             selected: 0,
             top: 0,
             loading: None,
-            loads: 0,
             has_more: true,
             open: HashMap::new(),
             error: None,
@@ -151,10 +149,10 @@ impl Comments {
         if self.loading.is_some() || (replies_of.is_none() && more && !self.has_more) {
             return None;
         }
-        self.loads += 1;
-        self.loading = Some((self.loads, replies_of));
+        let load = feed::next_load();
+        self.loading = Some((load, replies_of));
         self.error = None;
-        Some(self.loads)
+        Some(load)
     }
 
     /// More top comments are wanted: the cursor is near the last.
@@ -331,6 +329,18 @@ mod tests {
         assert_eq!(c.likes, Some(0));
         let long = Comment::from(&comment(2, serde_json::json!({"text": "x".repeat(3000)})));
         assert_eq!(long.text.chars().count(), MAX_TEXT + 1);
+    }
+
+    #[test]
+    fn a_pane_opened_again_doesnt_take_an_answer_meant_for_the_last_one() {
+        let mut old = Comments::new(5, "alice");
+        let late = old.start_load(Some(2), false).unwrap();
+        let mut new = Comments::new(5, "alice");
+        let load = new.start_load(None, false).unwrap();
+        assert_ne!(late, load);
+        // The old pane's replies of comment 2 would go in as top comments.
+        assert!(!new.on_page(late, Ok((page(21..=22), false))));
+        assert!(new.rows.is_empty());
     }
 
     #[test]

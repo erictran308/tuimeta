@@ -844,13 +844,8 @@ func nearest(cs []feedCandidate, want int) (feedCandidate, bool) {
 // postURL is where the post is on instagram.com: /reel/ for a reel, /p/
 // for the rest; "" if code isn't one of Instagram's shortcodes.
 func postURL(code, productType string) string {
-	if code == "" || len(code) > 64 {
+	if !backend.PostCode(code) {
 		return ""
-	}
-	for _, r := range code {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
-			return ""
-		}
 	}
 	kind := "p"
 	if productType == "clips" {

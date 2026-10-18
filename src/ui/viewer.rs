@@ -45,7 +45,7 @@ pub(super) fn draw(
     }
     let sharp = std::iter::once(&view.photo)
         .chain(&stand_in)
-        .find(|p| images.sharp(p, cols, rows, covered).is_some())
+        .find(|p| images.has_sharp(p, cols, rows, covered))
         .cloned();
     let ready = sharp
         .as_ref()

@@ -45,6 +45,17 @@ pub struct Key {
     pub avatar: bool,
 }
 
+/// The downloaded photo itself at `cols` × `rows` cells.
+fn sharp_key(photo: &Preview, cols: u16, rows: u16) -> Key {
+    Key {
+        file_id: photo.file_id,
+        cols,
+        rows,
+        thumbnail: false,
+        avatar: false,
+    }
+}
+
 /// Caps for decoding images from other people. Meta's networks send photos
 /// at most about 2048px a side (WhatsApp's HD ones 4096px) and stickers
 /// 512px, so a much bigger one is only a way to run memory out.
@@ -431,17 +442,19 @@ impl Images {
         rows: u16,
         covered: bool,
     ) -> Option<&SlicedProtocol> {
-        let key = Key {
-            file_id: photo.file_id,
-            cols,
-            rows,
-            thumbnail: false,
-            avatar: false,
-        };
-        if self.ready.get(&key).is_none_or(|e| covered && !e.shown) {
+        if !self.has_sharp(photo, cols, rows, covered) {
             return None;
         }
-        self.drawn(key)
+        self.drawn(sharp_key(photo, cols, rows))
+    }
+
+    /// [`sharp`](Self::sharp) would give the photo. Asking doesn't count it
+    /// drawn: with kitty's protocol a photo counted drawn but never sent
+    /// would come up blank under a popup.
+    pub fn has_sharp(&self, photo: &Preview, cols: u16, rows: u16, covered: bool) -> bool {
+        self.ready
+            .get(&sharp_key(photo, cols, rows))
+            .is_some_and(|e| e.shown || !covered)
     }
 
     /// The photo `key`, drawn in this frame.
@@ -935,6 +948,20 @@ mod tests {
             "the thumbnail"
         );
         assert!(images.sharp(&preview(2), 4, 2, true).is_none());
+    }
+
+    #[test]
+    fn asking_whether_a_photo_is_ready_doesnt_count_it_drawn() {
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        images.insert_ready(key(1), DynamicImage::new_rgba8(8, 8));
+        assert!(images.has_sharp(&preview(1), 4, 2, false));
+        // The viewer asks before it knows it has room to draw it: under a
+        // popup it must still wait for a drawing of its own.
+        assert!(!images.has_sharp(&preview(1), 4, 2, true));
+        assert!(images.sharp(&preview(1), 4, 2, true).is_none());
+        assert!(images.sharp(&preview(1), 4, 2, false).is_some());
+        assert!(images.has_sharp(&preview(1), 4, 2, true));
     }
 
     #[tokio::test]

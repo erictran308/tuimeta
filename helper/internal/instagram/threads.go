@@ -27,7 +27,12 @@ import (
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
-var errThreadsNoChats = proto.Err(proto.Unsupported, "Threads has no chats in tuimeta: only its feed.")
+var (
+	errThreadsNoChats = proto.Err(proto.Unsupported, "Threads has no chats in tuimeta: only its feed.")
+	// errThreadsLoginChanged ends what a login or logout since it started
+	// made stale.
+	errThreadsLoginChanged = proto.Err(proto.Cancelled, "A newer login or a logout came first.")
+)
 
 // threadsSaved is what's kept in <data-dir>/threads/ between runs.
 type threadsSaved struct {
@@ -194,9 +199,10 @@ func (t *Threads) establish(s *threadsSession, epoch int) bool {
 		t.mu.Unlock()
 		return false
 	}
-	if t.self != "" && t.self != self {
-		t.feed.reset() // another account: nothing of the old one carries over
-	}
+	// Another account's feed doesn't carry over: the feed starts over at its
+	// next load, which is this login's (threadsFeed.sync). It isn't cleared
+	// here, under t.mu: a load holds the feed's lock while it asks for the
+	// session, which takes t.mu, so waiting for it here would never end.
 	t.sess, t.ready, t.self, t.name = s, true, self, name
 	t.account(proto.Ready, "")
 	t.mu.Unlock()
@@ -295,7 +301,7 @@ func (t *Threads) LoginCookies(ctx context.Context, set cookies.Set, as browser.
 	t.mu.Unlock()
 	switch {
 	case err == nil:
-		return proto.Err(proto.Cancelled, "A newer login or a logout came first.")
+		return errThreadsLoginChanged
 	case errors.Is(err, context.Canceled):
 		return err
 	case errors.Is(err, errLoggedOutPage):
@@ -365,13 +371,26 @@ func (t *Threads) current(ctx context.Context) (*threadsSession, int, error) {
 	}
 }
 
+// currentOf is current, the session of login epoch: none once another came.
+func (t *Threads) currentOf(ctx context.Context, epoch int) (*threadsSession, error) {
+	s, now, err := t.current(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if now != epoch {
+		return nil, errThreadsLoginChanged
+	}
+	return s, nil
+}
+
 // ask sends query name with given variables, from the page from: with the
 // page loaded again first when it's old, again and once more when Threads
 // says its tokens expired, and with the query's definition read again from
 // the website, once more, when Threads says it changed. Threads ending the
-// session ends the account's readiness and says why.
-func (t *Threads) ask(ctx context.Context, name string, given map[string]any, from string) ([]byte, error) {
-	s, epoch, err := t.current(ctx)
+// session ends the account's readiness and says why. epoch is the login
+// the request is for: once another came, it isn't sent.
+func (t *Threads) ask(ctx context.Context, epoch int, name string, given map[string]any, from string) ([]byte, error) {
+	s, err := t.currentOf(ctx, epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -448,12 +467,18 @@ func (t *Threads) rediscover(ctx context.Context, s *threadsSession, name, from 
 		return errStaleQuery
 	}
 	t.found = time.Now()
-	// The home page as one typed in; a post's as one opened from it.
-	opener := threadsBase + "/"
-	if from == opener {
-		opener = ""
+	// The home page as one typed in, which the session's requests then go
+	// from; a post's as one opened from it, read only for its list.
+	var page *threadsPage
+	var err error
+	if home := threadsBase + "/"; from == home {
+		page, err = t.load(ctx, s, from, "")
+	} else {
+		page, _, err = t.open(ctx, s, from, home)
+		if errors.Is(err, errPageGone) {
+			err = errThreadsPage
+		}
 	}
-	page, err := t.load(ctx, s, from, opener)
 	if err != nil {
 		return err
 	}

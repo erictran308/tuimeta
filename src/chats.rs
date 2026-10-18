@@ -392,6 +392,30 @@ impl Chats {
         }
     }
 
+    /// Shows a list chat or feed row `id` is in, the one shown if it is,
+    /// and without the `/` filter if that hides it.
+    pub fn reveal(&mut self, id: i64) {
+        let Some(chat) = self.by_id.get(&id) else {
+            return;
+        };
+        // As `refresh` lists them.
+        let feed_in_main = self.networks().len() < 2;
+        let listed =
+            |list| chat.in_list(list) && (!is_feed(id) || list != List::Main || feed_in_main);
+        if !listed(self.shown)
+            && let Some(list) = [List::Main, List::Network(chat.network), List::Archive]
+                .into_iter()
+                .find(|&list| listed(list))
+        {
+            self.show(list);
+        }
+        self.refresh();
+        if !self.sorted.contains(&id) {
+            self.set_filter("");
+            self.refresh();
+        }
+    }
+
     /// The tabs over the list: all chats, then each network with chats once
     /// there are two, then the archive once it has chats. With only one of
     /// them there are none.

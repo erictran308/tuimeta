@@ -10,6 +10,7 @@
 //! link card's only if it's a web address, shown by its host.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::messages::{self, MediaFile, Preview};
 use crate::meta::{self, FeedPost, MediaKind, Network};
@@ -34,6 +35,17 @@ const MAX_CONTEXT: usize = 120;
 const MAX_TITLE: usize = 300;
 /// The longest code of a post in a link the helper takes.
 const MAX_CODE: usize = 64;
+
+/// The last number a load of a feed, a post or comments was given. One count
+/// for the run, not one per feed or pane: a feed made again (another link,
+/// a new login) would count from 1 again and take a late answer to the old
+/// one's load for its own.
+static LOADS: AtomicU64 = AtomicU64::new(0);
+
+/// A number no load has had yet.
+pub fn next_load() -> u64 {
+    LOADS.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// A post of the feed, made safe to show.
 #[derive(Clone)]
@@ -346,8 +358,6 @@ pub struct Feed {
     pub loading: Option<u64>,
     /// That load starts again from the top.
     fresh: bool,
-    /// Counts loads, to number them.
-    loads: u64,
     /// The network has more after the last post.
     pub has_more: bool,
     /// Threads: the accounts followed, rather than For you.
@@ -370,7 +380,6 @@ impl Feed {
             shown: HashMap::new(),
             loading: None,
             fresh: false,
-            loads: 0,
             has_more: true,
             following: false,
             error: None,
@@ -408,11 +417,11 @@ impl Feed {
         if fresh && self.loading.is_some() && self.fresh {
             return None;
         }
-        self.loads += 1;
-        self.loading = Some(self.loads);
+        let load = next_load();
+        self.loading = Some(load);
         self.fresh = fresh;
         self.error = None;
-        Some(self.loads)
+        Some(load)
     }
 
     /// The load on its way is `load`, and starts again from the top.
@@ -899,5 +908,16 @@ pub(crate) mod tests {
         let load = feed.start_load(true).unwrap();
         assert!(feed.on_post(load, Err("gone".into())));
         assert_eq!((feed.posts.len(), feed.error.as_deref()), (1, Some("gone")));
+    }
+
+    #[test]
+    fn a_feed_made_again_doesnt_take_an_answer_meant_for_the_last_one() {
+        let mut old = Feed::linked(post_link("https://www.instagram.com/p/FIRST1/").unwrap());
+        let late = old.start_load(true).unwrap();
+        let mut new = Feed::linked(post_link("https://www.instagram.com/p/NEXT2/").unwrap());
+        let load = new.start_load(true).unwrap();
+        assert_ne!(late, load);
+        assert!(!new.on_post(late, Ok(post(1, serde_json::json!({})))));
+        assert!(new.posts.is_empty() && new.loading == Some(load));
     }
 }

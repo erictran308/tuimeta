@@ -221,21 +221,31 @@ func (t *Threads) wait(ctx context.Context) error {
 
 // load loads a page of threads.com as a navigation does (from is the page
 // it was opened from; none for one typed in), following threads.com's own
-// redirects, and reads it: a fresh page for the session's requests. t.net
-// is held.
+// redirects, and reads it: a fresh page for the session's requests, its
+// tokens and gates, as the home page is. t.net is held.
 func (t *Threads) load(ctx context.Context, s *threadsSession, page, from string) (*threadsPage, error) {
 	p, _, err := t.open(ctx, s, page, from)
 	if errors.Is(err, errPageGone) {
-		err = errThreadsPage
+		return nil, errThreadsPage
 	}
-	return p, err
+	if err != nil {
+		return nil, err
+	}
+	s.page, s.pageAt = p, time.Now()
+	s.requests = 0
+	s.sid = methods.GenerateWebsessionID(true)
+	return p, nil
 }
 
 // errPageGone is threads.com saying it has no such page: a post deleted,
 // or a code of none.
 var errPageGone = errors.New("threads: no such page")
 
-// open is load's, with the page as it came. t.net is held.
+// open is load's, with the page as it came, but not made the session's:
+// its requests go on from the page they had (the home page), whose gates
+// the queries' flags are worked out from, as a browser's do when it goes
+// from the home page to another of the website's. Its cookies are taken.
+// t.net is held.
 func (t *Threads) open(ctx context.Context, s *threadsSession, page, from string) (*threadsPage, string, error) {
 	for range maxRedirects + 1 {
 		if err := t.wait(ctx); err != nil {
@@ -289,9 +299,6 @@ func (t *Threads) open(ctx context.Context, s *threadsSession, page, from string
 		if !ok {
 			return nil, "", errLoggedOutPage
 		}
-		s.page, s.pageAt = &p, time.Now()
-		s.requests = 0
-		s.sid = methods.GenerateWebsessionID(true)
 		return &p, html, nil
 	}
 	return nil, "", errThreadsPage

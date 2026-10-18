@@ -156,6 +156,52 @@ func (h *threadsHarness) feed(fresh bool, kind backend.FeedKind) ([]proto.Post, 
 	return posts, more
 }
 
+func TestALoginOfAnotherThreadsAccountNeverWaitsOnTheFeed(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	ctx := context.Background()
+	h.answers(tFeed("", false, tThread("", tPost("101", "maya.lens", 19, "a post"))))
+	posts, _ := h.feed(false, "")
+	h.b.mu.Lock()
+	first := h.b.epoch
+	h.b.mu.Unlock()
+
+	// A load holds the feed's lock all through, and asks for the session
+	// (t.mu) on the way, so a login, which holds t.mu to say it's ready,
+	// mustn't wait for the feed's lock: here a load is under way.
+	h.b.feed.mu.Lock()
+	h.site.home = respond(200, strings.ReplaceAll(threadsHTML(true, "dtsg-3"), threadsViewer, "9000002"))
+	done := make(chan error, 1)
+	go func() { done <- h.loginWith(threadsCookieText) }()
+	select {
+	case err := <-done:
+		h.b.feed.mu.Unlock()
+		if err != nil {
+			t.Fatalf("login: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		h.b.feed.mu.Unlock()
+		t.Fatal("the login waited for the feed's lock")
+	}
+
+	// What the load would ask next isn't asked for the new account.
+	asked := len(h.site.asked())
+	if _, err := h.b.ask(ctx, first, threadsFeedQuery, nil, threadsBase+"/"); err != errThreadsLoginChanged {
+		t.Errorf("a stale load asked: %v", err)
+	}
+	if len(h.site.asked()) != asked {
+		t.Errorf("requests made: %v", h.site.asked()[asked:])
+	}
+	// Nothing of the other account's feed carries over.
+	if _, _, err := h.b.LoadComments(ctx, posts[0].ID, 0, false); err != errNoPost {
+		t.Errorf("the other account's post: %v", err)
+	}
+	h.answers(tFeed("", false, tThread("", tPost("101", "maya.lens", 19, "a post"))))
+	if again, _ := h.feed(false, ""); len(again) != 1 || again[0].ID == posts[0].ID {
+		t.Errorf("feed %+v, before %+v", again, posts)
+	}
+}
+
 func TestThreadsFeedAsksAsTheWebsiteDoesAndSaysNothingWasSeen(t *testing.T) {
 	h := newThreadsHarness(t)
 	h.login()
@@ -364,8 +410,11 @@ func TestThreadsSendsOnlyQueriesNeverAMutation(t *testing.T) {
 	h.b.cat.Queries["BarcelonaSneakyQuery"] = threadsQuery{Name: "BarcelonaSneakyQuery", Doc: "2", Kind: "mutation"}
 	h.b.cat.Queries["BarcelonaLikeMutationQuery"] = threadsQuery{Name: "BarcelonaLikeMutationQuery", Doc: "3", Kind: "query"}
 	h.b.net.Unlock()
+	h.b.mu.Lock()
+	epoch := h.b.epoch
+	h.b.mu.Unlock()
 	for _, name := range []string{"useBarcelonaLikeMutationLikeMutation", "BarcelonaSneakyQuery", "BarcelonaLikeMutationQuery", "BarcelonaUnknownQuery"} {
-		if _, err := h.b.ask(context.Background(), name, nil, threadsBase+"/"); err == nil {
+		if _, err := h.b.ask(context.Background(), epoch, name, nil, threadsBase+"/"); err == nil {
 			t.Errorf("%s was sent", name)
 		}
 	}

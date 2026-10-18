@@ -133,6 +133,11 @@ func TestALinkedPostThatCantBeShownSaysWhy(t *testing.T) {
 	}{
 		{"gone", fail("Media not found or unavailable"), bad, errPostGone},
 		{"gone with an ok status", fail("Media not found or unavailable"), nil, errPostGone},
+		{"a private account's", fail("This account is private"), bad, errPostGone},
+		{"a service that's down for now", fail("Service Unavailable"), fmt.Errorf("%w 503", httpclient.ErrUnexpectedError),
+			proto.Err(proto.NetworkError, errPost)},
+		{"rate limited, whatever it says", []byte(`{"message":"media not found","error_type":"rate_limit_error","status":"fail"}`), bad, errRateLimited},
+		{"logged out, whatever it says", []byte(`{"message":"private","error_type":"login_required","status":"fail"}`), nil, errSessionEnded},
 		{"another post", mediaInfoJSON(photoPost(pk, "Bother", mayaFeed, `null`, "")), nil, errPostGone},
 		{"no post", mediaInfoJSON(), nil, errPostGone},
 		{"nothing to show", mediaInfoJSON(fmt.Sprintf(`{"pk":"%s","id":"%s_1","code":"%s","media_type":1,"user":%s}`, pk, pk, code, mayaFeed)), nil, errPostEmpty},

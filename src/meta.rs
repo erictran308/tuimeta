@@ -868,13 +868,15 @@ impl Meta {
             let messages = match answer {
                 // One message that doesn't read (a number out of range,
                 // say) costs that message, not the page around it.
-                Ok(mut result) => serde_json::from_value::<Vec<Value>>(result["messages"].take())
-                    .ok()
-                    .map(|list| {
-                        list.into_iter()
-                            .filter_map(|m| serde_json::from_value(m).ok())
-                            .collect()
-                    }),
+                Ok(mut result) => {
+                    serde_json::from_value::<Vec<Value>>(field(&mut result, "messages"))
+                        .ok()
+                        .map(|list| {
+                            list.into_iter()
+                                .filter_map(|m| serde_json::from_value(m).ok())
+                                .collect()
+                        })
+                }
                 Err(e) => {
                     let _ = tx.send(MetaEvent::Error(e));
                     None
@@ -896,7 +898,9 @@ impl Meta {
             move |answer| {
                 let replied = answer
                     .ok()
-                    .and_then(|mut result| serde_json::from_value(result["message"].take()).ok())
+                    .and_then(|mut result| {
+                        serde_json::from_value(field(&mut result, "message")).ok()
+                    })
                     .map(Box::new);
                 Some(MetaEvent::Replied {
                     chat_id,
@@ -1015,7 +1019,9 @@ impl Meta {
             move |answer| {
                 let found = answer
                     .ok()
-                    .and_then(|mut result| serde_json::from_value(result["results"].take()).ok())
+                    .and_then(|mut result| {
+                        serde_json::from_value(field(&mut result, "results")).ok()
+                    })
                     .unwrap_or_default();
                 Some(MetaEvent::ChatsFound {
                     network,
@@ -1078,7 +1084,7 @@ impl Meta {
         self.then("load_feed", params, move |answer| {
             let page = answer.map(|mut result| {
                 // A post that doesn't read costs that post.
-                let posts = serde_json::from_value::<Vec<Value>>(result["posts"].take())
+                let posts = serde_json::from_value::<Vec<Value>>(field(&mut result, "posts"))
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|p| serde_json::from_value(p).ok())
@@ -1104,7 +1110,7 @@ impl Meta {
         self.then("load_comments", params, move |answer| {
             let page = answer.map(|mut result| {
                 // A comment that doesn't read costs that comment.
-                let comments = serde_json::from_value::<Vec<Value>>(result["comments"].take())
+                let comments = serde_json::from_value::<Vec<Value>>(field(&mut result, "comments"))
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|c| serde_json::from_value(c).ok())
@@ -1140,7 +1146,7 @@ impl Meta {
         }
         self.then("load_post", params, move |answer| {
             let post = answer.and_then(|mut result| {
-                serde_json::from_value::<FeedPost>(result["post"].take())
+                serde_json::from_value::<FeedPost>(field(&mut result, "post"))
                     .map(Box::new)
                     .map_err(|_| "The helper's post didn't read".to_string())
             });
@@ -1372,6 +1378,13 @@ fn answer_id(line: &[u8]) -> Option<u64> {
         .trim_ascii_start();
     let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
     std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
+}
+
+/// Field `key` of an answer, taken out of it: null if it has none or isn't
+/// an object at all, where `answer[key]` would panic and end tuimeta over a
+/// helper's mistake.
+fn field(answer: &mut Value, key: &str) -> Value {
+    answer.get_mut(key).map(Value::take).unwrap_or_default()
 }
 
 /// Handles one line from the helper. `Err` means it broke the protocol.
@@ -2238,5 +2251,15 @@ mod tests {
             })
         ));
         assert!(rx.try_recv().is_err(), "a chat photo's failure isn't shown");
+    }
+
+    #[test]
+    fn an_answer_that_isnt_an_object_reads_as_nothing_rather_than_ending_tuimeta() {
+        assert_eq!(field(&mut json!([1, 2]), "post"), Value::Null);
+        assert_eq!(field(&mut json!(7), "posts"), Value::Null);
+        assert_eq!(field(&mut Value::Null, "messages"), Value::Null);
+        let mut answer = json!({"post": {"id": 3}});
+        assert_eq!(field(&mut answer, "post"), json!({"id": 3}));
+        assert_eq!(answer, json!({"post": null}), "taken, not copied");
     }
 }
