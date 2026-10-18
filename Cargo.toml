@@ -1,6 +1,6 @@
 [package]
 name = "tuimeta"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Messenger and Instagram in your terminal: a vim-style client, with a separate helper for Meta's protocols"
 license = "MIT"
