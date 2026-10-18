@@ -101,7 +101,7 @@ func (b *Instagram) LoadPost(ctx context.Context, code, _ string, box backend.Bo
 	if err != nil {
 		err = postError(err, body)
 		if err != errPostGone {
-			hlog.Warn("instagram: post failed", hlog.Kind(err))
+			warnFailed(ctx, "instagram: post failed", err)
 		}
 		return proto.Post{}, err
 	}

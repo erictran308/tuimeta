@@ -49,7 +49,7 @@ func (t *Threads) LoadPost(ctx context.Context, code, username string, box backe
 	f.sync(epoch)
 	html, err := t.postPage(ctx, epoch, page)
 	if err != nil {
-		hlog.Warn("threads: post failed", hlog.Kind(err))
+		warnFailed(ctx, "threads: post failed", err)
 		return proto.Post{}, err
 	}
 	m, ok := findThreadsPost(html, code)

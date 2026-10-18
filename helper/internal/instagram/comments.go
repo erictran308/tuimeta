@@ -114,7 +114,7 @@ func (b *Instagram) LoadComments(ctx context.Context, postID, repliesOf int64, m
 		err = refused(body, errComments)
 	}
 	if err != nil {
-		hlog.Warn("instagram: comments failed", hlog.Kind(err))
+		warnFailed(ctx, "instagram: comments failed", err)
 		return nil, false, feedError(err, body, errComments)
 	}
 	page, err := parseComments(body, repliesOf != 0)

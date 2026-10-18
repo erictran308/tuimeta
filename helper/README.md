@@ -194,9 +194,12 @@ What goes to Instagram without tuimeta asking, and why it's kept:
   `/api/v1/media/<media pk>/info/`, the pk worked out from the link's code
   (its letters are the pk's digits in base 64), and the answer kept only
   if it's the post of that code. It shares the feed's lock and gap, waits
-  its turn behind the feed's loads, is called off before it's sent when
-  another post's link is opened, and tells Instagram nothing more than
-  opening the post on its website.
+  its turn behind the feed's loads, and tells Instagram nothing more than
+  opening the post on its website. When another post's link is opened, or
+  tuimeta leaves the post before it came (`cancel`), it's called off: still
+  waiting its turn, it's never sent; already sent, it reached Instagram all
+  the same, and only its answer goes unread. So are a feed page `r`
+  replaced and a page of comments whose pane was closed.
 
 instameow itself sends no presence, "active now", foreground or app state,
 and registers no push; it marks nothing read and sends no typing on its own
@@ -257,8 +260,9 @@ Everything sent to threads.com, at most one request at a time and at least
   from page to page within the website. Only the code and username go
   into its address, and only if they're made of what Threads' are. A
   post's page that answers as to nobody logged in doesn't end the session;
-  the home page decides that. Opening another post's link calls off one
-  not yet loaded.
+  the home page decides that. Opening another post's link, or leaving the
+  post before it came, calls off one still waiting its turn, which is then
+  never asked for; one already asked for reached Threads all the same.
 - GraphQL queries, `POST https://www.threads.com/api/graphql`, with the
   form and headers the page's own code sends (`x-ig-app-id`, `x-fb-lsd`,
   `x-csrftoken`, `x-asbd-id`, `x-fb-friendly-name`, the page as referer):

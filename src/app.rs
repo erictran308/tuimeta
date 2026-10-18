@@ -2848,6 +2848,10 @@ impl App {
             self.images.clear();
             if feed.linked.is_none() {
                 self.feeds_kept.insert(feed.network, feed);
+            } else if let Some(request) = feed.request {
+                // Nobody waits for the post any more: the helper needn't
+                // ask the network for it.
+                self.meta.cancel(request);
             }
         }
     }
@@ -4120,8 +4124,14 @@ impl App {
             None => {
                 let mut feed = Feed::new(network);
                 if let Some(load) = feed.start_load(false) {
-                    self.meta
-                        .load_feed(network, feed::PAGE, false, picture, feed.following, load);
+                    feed.request = Some(self.meta.load_feed(
+                        network,
+                        feed::PAGE,
+                        false,
+                        picture,
+                        feed.following,
+                        load,
+                    ));
                 }
                 feed
             }
@@ -4169,8 +4179,12 @@ impl App {
         if let Some(load) = feed.start_load(true)
             && let Some(link) = &feed.linked
         {
-            self.meta
-                .load_post(network, &link.code, link.username.as_deref(), picture, load);
+            let request =
+                self.meta
+                    .load_post(network, &link.code, link.username.as_deref(), picture, load);
+            if let Some(old) = feed.sent(request) {
+                self.meta.cancel(old);
+            }
         }
     }
 
@@ -4308,7 +4322,7 @@ impl App {
         if feed.wants_more()
             && let Some(load) = feed.start_load(false)
         {
-            self.meta.load_feed(
+            let request = self.meta.load_feed(
                 feed.network,
                 feed::PAGE,
                 false,
@@ -4316,6 +4330,9 @@ impl App {
                 feed.following,
                 load,
             );
+            if let Some(old) = feed.sent(request) {
+                self.meta.cancel(old);
+            }
         }
     }
 
@@ -4332,7 +4349,7 @@ impl App {
             return;
         };
         if let Some(load) = feed.start_load(true) {
-            self.meta.load_feed(
+            let request = self.meta.load_feed(
                 feed.network,
                 feed::PAGE,
                 true,
@@ -4340,6 +4357,10 @@ impl App {
                 feed.following,
                 load,
             );
+            // A next page on its way would go after the posts these replace.
+            if let Some(old) = feed.sent(request) {
+                self.meta.cancel(old);
+            }
         }
     }
 
@@ -4355,7 +4376,7 @@ impl App {
         // Whatever was on its way was the other feed's.
         feed.loading = None;
         if let Some(load) = feed.start_load(true) {
-            self.meta.load_feed(
+            let request = self.meta.load_feed(
                 Network::Threads,
                 feed::PAGE,
                 true,
@@ -4363,6 +4384,9 @@ impl App {
                 feed.following,
                 load,
             );
+            if let Some(old) = feed.sent(request) {
+                self.meta.cancel(old);
+            }
         }
         self.stop_video();
         self.close_comments();
@@ -4584,14 +4608,18 @@ impl App {
             comments.what = "Replies";
         }
         if let Some(load) = comments.start_load(None, false) {
-            self.meta.load_comments(post.id, None, false, load);
+            comments.request = Some(self.meta.load_comments(post.id, None, false, load));
         }
         self.comments = Some(comments);
         self.comments_focus = true;
     }
 
     fn close_comments(&mut self) {
-        self.comments = None;
+        // Nobody waits for the page on its way any more: the helper needn't
+        // ask the network for it.
+        if let Some(request) = self.comments.take().and_then(|c| c.request) {
+            self.meta.cancel(request);
+        }
         self.comments_focus = false;
     }
 
@@ -4633,8 +4661,11 @@ impl App {
                 if let Replies::Load { of, more } = comments.enter()
                     && let Some(load) = comments.start_load(Some(of), more)
                 {
-                    self.meta
-                        .load_comments(comments.post_id, Some(of), more, load);
+                    comments.request =
+                        Some(
+                            self.meta
+                                .load_comments(comments.post_id, Some(of), more, load),
+                        );
                 }
             }
             KeyCode::Char('y') => {
@@ -4665,7 +4696,7 @@ impl App {
         if comments.wants_more()
             && let Some(load) = comments.start_load(None, true)
         {
-            self.meta.load_comments(comments.post_id, None, true, load);
+            comments.request = Some(self.meta.load_comments(comments.post_id, None, true, load));
         }
     }
 
@@ -8363,6 +8394,71 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.feed.is_none() && sent_with(&app, "load_post").is_empty());
         assert_eq!(opened_link(&app).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn a_linked_post_left_before_it_came_is_called_off_and_one_that_came_isnt() {
+        let mut app = test_app("linked-left");
+        let none = KeyModifiers::NONE;
+        let called_off = |app: &App| sent_with(app, "cancel");
+        let request = |app: &App| app.feed.as_ref().unwrap().request.unwrap();
+        instagram_in(&mut app);
+        settled_message(&mut app, "https://www.instagram.com/p/LEFT1/");
+        // Esc on to the feed while it loads.
+        press(&mut app, KeyCode::Enter, none);
+        let first = request(&app);
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(called_off(&app), [serde_json::json!({"id": first})]);
+        // The feed itself is kept, its page still on its way.
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.open.is_some());
+        assert_eq!(called_off(&app).len(), 1);
+        // Ctrl-o back to the chat while it loads. (Each time back, the chat
+        // waits for its history, which nothing here answers: the link comes
+        // again.)
+        settled_message(&mut app, "https://www.instagram.com/p/LEFT2/");
+        press(&mut app, KeyCode::Enter, none);
+        let second = request(&app);
+        assert_ne!(first, second);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(called_off(&app)[1], serde_json::json!({"id": second}));
+        // Once it came, leaving it calls nothing off.
+        settled_message(&mut app, "https://www.instagram.com/p/CAME3/");
+        press(&mut app, KeyCode::Enter, none);
+        let load = app.feed.as_ref().unwrap().loading.unwrap();
+        app.on_meta(MetaEvent::Post {
+            network: Network::Instagram,
+            load,
+            post: Ok(Box::new(post(5, serde_json::json!({})))),
+        });
+        assert_eq!(app.feed.as_ref().unwrap().request, None);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.open.is_some());
+        assert_eq!(called_off(&app).len(), 2);
+    }
+
+    #[test]
+    fn comments_closed_before_their_page_came_and_a_page_r_replaced_are_called_off() {
+        let mut app = test_app("comments-left");
+        let none = KeyModifiers::NONE;
+        let called_off = |app: &App| sent_with(app, "cancel");
+        open_the_feed(&mut app);
+        // `r` while the first page loads: that page isn't wanted any more.
+        let first = app.feed.as_ref().unwrap().request.unwrap();
+        press(&mut app, KeyCode::Char('r'), none);
+        assert_eq!(called_off(&app), [serde_json::json!({"id": first})]);
+        feed_page(&mut app, vec![post(1, serde_json::json!({}))], false);
+        // The comments, closed while their first page loads.
+        press(&mut app, KeyCode::Char('c'), none);
+        let page = app.comments.as_ref().unwrap().request.unwrap();
+        press(&mut app, KeyCode::Esc, none);
+        assert!(app.comments.is_none());
+        assert_eq!(called_off(&app)[1], serde_json::json!({"id": page}));
+        // Once it came, closing them calls nothing off.
+        press(&mut app, KeyCode::Char('c'), none);
+        comments_page(&mut app, vec![comment(10, serde_json::json!({}))], false);
+        press(&mut app, KeyCode::Esc, none);
+        assert_eq!(called_off(&app).len(), 2);
     }
 
     #[test]

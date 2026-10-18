@@ -254,7 +254,7 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 		now := time.Now().UnixMilli()
 		data, err := t.ask(ctx, epoch, threadsFeedQuery, f.variables(now), threadsBase+"/")
 		if err != nil {
-			hlog.Warn("threads: feed failed", hlog.Kind(err))
+			warnFailed(ctx, "threads: feed failed", err)
 			return nil, false, err
 		}
 		page, err := parseThreadsFeed(data)

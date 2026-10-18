@@ -356,6 +356,8 @@ pub struct Feed {
     shown: HashMap<i64, usize>,
     /// The load on its way, by number: answers to another are old news.
     pub loading: Option<u64>,
+    /// The helper's id for that load, to call it off with.
+    pub request: Option<u64>,
     /// That load starts again from the top.
     fresh: bool,
     /// The network has more after the last post.
@@ -379,6 +381,7 @@ impl Feed {
             top: 0,
             shown: HashMap::new(),
             loading: None,
+            request: None,
             fresh: false,
             has_more: true,
             following: false,
@@ -424,6 +427,13 @@ impl Feed {
         Some(load)
     }
 
+    /// The load just started went to the helper as `request`. Returns the
+    /// one it took the place of, if one was on its way: nobody waits for it
+    /// now.
+    pub fn sent(&mut self, request: u64) -> Option<u64> {
+        self.request.replace(request)
+    }
+
     /// The load on its way is `load`, and starts again from the top.
     pub fn is_fresh(&self, load: u64) -> bool {
         self.loading == Some(load) && self.fresh
@@ -445,6 +455,7 @@ impl Feed {
             return false;
         }
         self.loading = None;
+        self.request = None;
         let (posts, more) = match page {
             Ok(page) => page,
             Err(why) => {

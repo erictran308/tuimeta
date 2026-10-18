@@ -72,7 +72,7 @@ func (t *Threads) LoadComments(ctx context.Context, postID, repliesOf int64, mor
 	}
 	data, err := t.ask(ctx, epoch, name, vars, post.url)
 	if err != nil {
-		hlog.Warn("threads: replies failed", hlog.Kind(err))
+		warnFailed(ctx, "threads: replies failed", err)
 		return nil, false, err
 	}
 	replies, cursor, next, err := parseReplies(data)

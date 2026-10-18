@@ -296,9 +296,15 @@ func (c *commenter) LoadPost(ctx context.Context, code, username string, _ backe
 		c.inPost <- struct{}{}
 	}
 	if c.ploads != nil {
+		// "Slow" goes on to its answer even once called off, as one the
+		// network already answered does.
+		done := ctx.Done()
+		if code == "Slow" {
+			done = nil
+		}
 		select {
 		case <-c.ploads:
-		case <-ctx.Done():
+		case <-done:
 			return proto.Post{}, ctx.Err()
 		}
 	}
@@ -407,6 +413,80 @@ func TestALinkOpenedCallsOffTheOneBeforeItAndWaitsItsTurnBehindTheFeed(t *testin
 	}
 	if got := posted(); got != "A ,B ,D " {
 		t.Errorf("asked %q", got)
+	}
+}
+
+func TestACancelCallsOffTheLoadItNamesAndNoOther(t *testing.T) {
+	h, cm := withCommenter(t, func(c *commenter) {
+		c.loads = make(chan struct{})
+		c.cloads = make(chan struct{})
+		c.ploads = make(chan struct{})
+		c.inPost = make(chan struct{}, 1)
+	})
+	post := func(code string) uint64 {
+		return h.c.Request("load_post", map[string]any{"network": "instagram", "code": code})
+	}
+	cancel := func(id uint64) {
+		t.Helper()
+		if r := h.c.Call("cancel", map[string]any{"id": id}); r.Error != nil {
+			t.Errorf("cancel: %s", r.Raw)
+		}
+	}
+	answered := func(id uint64) {
+		t.Helper()
+		if r := h.c.Response(id); r.Error != nil {
+			t.Fatalf("got %s", r.Raw)
+		}
+	}
+	calledOff := func(id uint64) {
+		t.Helper()
+		if r := h.c.Response(id); r.Error == nil || r.Error.Code != proto.Cancelled || r.Error.Message != errCalledOff.Message {
+			t.Errorf("got %s", r.Raw)
+		}
+	}
+	posted := func() string {
+		cm.cmu.Lock()
+		defer cm.cmu.Unlock()
+		return strings.Join(cm.posted, ",")
+	}
+
+	// A post's comments being asked for, and another post: calling off the
+	// comments leaves the post alone.
+	first := post("First")
+	<-cm.inPost
+	cm.ploads <- struct{}{}
+	answered(first)
+	comments := h.c.Request("load_comments", map[string]any{"post_id": 41})
+	a := post("A")
+	<-cm.inPost
+	cancel(comments)
+	calledOff(comments)
+	cm.ploads <- struct{}{}
+	answered(a)
+
+	// One whose network already answered is still answered as called off.
+	late := post("Slow")
+	<-cm.inPost
+	cancel(late)
+	cm.ploads <- struct{}{}
+	calledOff(late)
+
+	// One waiting behind a feed load is never asked for.
+	feed := h.c.Request("load_feed", map[string]any{"network": "instagram", "limit": 3})
+	waiting := post("Waiting")
+	cancel(waiting)
+	calledOff(waiting)
+	cm.loads <- struct{}{}
+	answered(feed)
+	if got := posted(); got != "First ,A ,Slow " {
+		t.Errorf("asked %q", got)
+	}
+
+	// A call that's through, or no call at all, is fine; no id isn't.
+	cancel(a)
+	cancel(1 << 40)
+	if r := h.c.Call("cancel", map[string]any{}); r.Error == nil || r.Error.Code != proto.BadRequest {
+		t.Errorf("no id: %s", r.Raw)
 	}
 }
 

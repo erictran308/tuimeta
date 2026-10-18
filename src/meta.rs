@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 7;
+const PROTOCOL_VERSION: u32 = 8;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper, twice what it writes at most. A
@@ -711,38 +711,44 @@ impl Meta {
     }
 
     /// Sends a request; the answer comes when the helper gives it. `Err` is
-    /// what to tell the user.
-    fn call(&self, method: &str, params: Value) -> impl Future<Output = Answer> + Send + 'static {
+    /// what to tell the user. With it, the request's id, which
+    /// [`cancel`](Self::cancel) names it by.
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> (u64, impl Future<Output = Answer> + Send + 'static) {
         #[cfg(test)]
         self.inner
             .sent
             .lock()
             .unwrap()
             .push((method.to_string(), params.clone()));
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer_tx, answer_rx) = oneshot::channel();
         let sent = match &self.inner.out {
             Some(out) => {
-                let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
                 self.inner.pending.lock().unwrap().insert(id, answer_tx);
                 let line = json!({"id": id, "method": method, "params": params}).to_string();
                 out.send(Some(line)).is_ok()
             }
             None => false,
         };
-        async move {
+        let answer = async move {
             if !sent {
                 return Err("tuimeta-helper isn't running".into());
             }
             answer_rx
                 .await
                 .unwrap_or_else(|_| Err("tuimeta-helper stopped".into()))
-        }
+        };
+        (id, answer)
     }
 
     /// Sends a request whose answer only matters if it's an error, which is
     /// shown.
     fn spawn(&self, method: &str, params: Value) {
-        let answer = self.call(method, params);
+        let (_, answer) = self.call(method, params);
         // Without a helper nothing will answer: nothing to wait for.
         if self.is_detached() {
             return;
@@ -755,16 +761,16 @@ impl Meta {
         });
     }
 
-    /// Sends a request whose answer turns into an event.
+    /// Sends a request whose answer turns into an event. Returns its id.
     fn then(
         &self,
         method: &str,
         params: Value,
         event: impl FnOnce(Answer) -> Option<MetaEvent> + Send + 'static,
-    ) {
-        let answer = self.call(method, params);
+    ) -> u64 {
+        let (id, answer) = self.call(method, params);
         if self.is_detached() {
-            return;
+            return id;
         }
         let tx = self.inner.tx.clone();
         tokio::spawn(async move {
@@ -772,6 +778,7 @@ impl Meta {
                 let _ = tx.send(event);
             }
         });
+        id
     }
 
     /// Logs in with the cookies the user pasted, as the browser they came
@@ -1064,6 +1071,7 @@ impl Meta {
     /// `picture` is the largest box, in pixels, a post's picture is drawn
     /// in: the helper then sends none bigger than that needs. On Threads,
     /// `following` asks for the accounts followed rather than For you.
+    /// Returns the request's id, for [`cancel`](Self::cancel).
     pub fn load_feed(
         &self,
         network: Network,
@@ -1072,7 +1080,7 @@ impl Meta {
         picture: Option<(u32, u32)>,
         following: bool,
         load: u64,
-    ) {
+    ) -> u64 {
         let mut params = json!({"network": network, "limit": limit, "fresh": fresh});
         if let Some((width, height)) = picture {
             params["width"] = width.into();
@@ -1096,13 +1104,19 @@ impl Meta {
                 load,
                 page,
             })
-        });
+        })
     }
 
     /// Asks for a page of a feed post's comments, or of a comment's replies
     /// (`replies_of`): the first, or with `more` the next. Answered by
-    /// [`MetaEvent::Comments`] numbered `load`.
-    pub fn load_comments(&self, post_id: i64, replies_of: Option<i64>, more: bool, load: u64) {
+    /// [`MetaEvent::Comments`] numbered `load`; returns the request's id.
+    pub fn load_comments(
+        &self,
+        post_id: i64,
+        replies_of: Option<i64>,
+        more: bool,
+        load: u64,
+    ) -> u64 {
         let mut params = json!({"post_id": post_id, "more": more});
         if let Some(id) = replies_of {
             params["replies_of"] = id.into();
@@ -1122,12 +1136,13 @@ impl Meta {
                 load,
                 page,
             })
-        });
+        })
     }
 
     /// Asks for the post a link names by its `code` (and, on Threads, its
     /// author's `username`, when the link has one), answered by
     /// [`MetaEvent::Post`] numbered `load`. `picture` is `load_feed`'s.
+    /// Returns the request's id.
     pub fn load_post(
         &self,
         network: Network,
@@ -1135,7 +1150,7 @@ impl Meta {
         username: Option<&str>,
         picture: Option<(u32, u32)>,
         load: u64,
-    ) {
+    ) -> u64 {
         let mut params = json!({"network": network, "code": code});
         if let Some(username) = username {
             params["username"] = username.into();
@@ -1155,7 +1170,17 @@ impl Meta {
                 load,
                 post,
             })
-        });
+        })
+    }
+
+    /// Calls off a [`load_feed`](Self::load_feed),
+    /// [`load_comments`](Self::load_comments) or
+    /// [`load_post`](Self::load_post) by the id it returned, once nobody
+    /// waits for its answer: one still waiting in its network's line is never
+    /// asked of the network. That load then answers `cancelled`, which its
+    /// load number already makes old news; one that's through is left be.
+    pub fn cancel(&self, request: u64) {
+        self.spawn("cancel", json!({"id": request}));
     }
 
     /// Closes the helper's stdin, after which it disconnects quietly and
@@ -1879,6 +1904,27 @@ mod tests {
         })
         .await;
         assert!(none.is_err());
+        // One called off at once answers as called off, or with the post if
+        // the fake was quicker; the cancel itself is no error, and the next
+        // goes ahead.
+        let request = meta.load_post(Network::Threads, code, None, None, 13);
+        meta.cancel(request);
+        let called_off = next(&mut rx, |e| match e {
+            MetaEvent::Post { load: 13, post, .. } => Some(post),
+            _ => None,
+        })
+        .await;
+        if let Err(why) = called_off {
+            assert_eq!(why, "tuimeta stopped waiting for it.");
+        }
+        meta.load_post(Network::Threads, code, None, None, 14);
+        let again = next(&mut rx, |e| match e {
+            MetaEvent::Error(e) => panic!("{e}"),
+            MetaEvent::Post { load: 14, post, .. } => Some(post),
+            _ => None,
+        })
+        .await;
+        assert!(again.is_ok());
 
         // WhatsApp links a device instead: a code to type on the phone,
         // given up, then a QR code, which the fake takes as scanned.
@@ -1992,14 +2038,14 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":7,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":8}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":8,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":9}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
         // Version 3 read `send_files` by path alone, so a file swapped after
         // the composer checked it would go out; version 4 has no feed,
-        // version 5 no Threads, and version 6 doesn't open posts by their
-        // links.
-        for older in [3, 4, 5, 6] {
+        // version 5 no Threads, version 6 doesn't open posts by their links,
+        // and version 7 can't call off a load nobody waits for.
+        for older in [3, 4, 5, 6, 7] {
             let line = format!(r#"{{"event":"hello","version":{older}}}"#);
             let older = check_hello(line.as_bytes()).unwrap_err();
             assert!(older.to_string().contains("same release"), "{older}");

@@ -44,6 +44,7 @@ func init() {
 		"load_feed":     (*Server).loadFeed,
 		"load_comments": (*Server).loadComments,
 		"load_post":     (*Server).loadPost,
+		"cancel":        (*Server).cancelCall,
 	}
 }
 

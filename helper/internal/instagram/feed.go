@@ -144,7 +144,7 @@ func (b *Instagram) LoadFeed(ctx context.Context, _ int, fresh bool, box backend
 			err = refused(body, errFeed)
 		}
 		if err != nil {
-			hlog.Warn("instagram: feed failed", hlog.Kind(err))
+			warnFailed(ctx, "instagram: feed failed", err)
 			return nil, false, feedError(err, body, errFeed)
 		}
 		page, err := parseFeed(body)
@@ -254,6 +254,15 @@ func refusal(a feedAnswer) *proto.Error {
 		return errRateLimited
 	}
 	return nil
+}
+
+// warnFailed logs a load of a feed, a post or comments that failed, unless
+// it was called off (tuimeta stopped waiting, or the helper is quitting):
+// that's no failure, and the log is for those.
+func warnFailed(ctx context.Context, what string, err error) {
+	if ctx.Err() == nil {
+		hlog.Warn(what, hlog.Kind(err))
+	}
 }
 
 // feedError is what a failed feed or comments request tells the user: the

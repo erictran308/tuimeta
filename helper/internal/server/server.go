@@ -61,7 +61,10 @@ type Server struct {
 	// posting is each network's newest load_post call, which the next one
 	// calls off.
 	postingMu sync.Mutex
-	posting   map[proto.Network]*postCall
+	posting   map[proto.Network]*running
+	// calls are the calls cancel can call off, by id, while they run.
+	callsMu sync.Mutex
+	calls   map[uint64]*running
 	// posts are the networks that gave each post load_feed answered with.
 	postsMu sync.Mutex
 	posts   map[int64]proto.Network
@@ -86,7 +89,8 @@ func New(cfg Config, store *ids.Store, stdout io.Writer) *Server {
 		loading:    map[proto.Network]*sync.Mutex{},
 		feeding:    map[proto.Network]*turns{},
 		commenting: map[proto.Network]*turns{},
-		posting:    map[proto.Network]*postCall{},
+		posting:    map[proto.Network]*running{},
+		calls:      map[uint64]*running{},
 		posts:      map[int64]proto.Network{},
 		typingIn:   map[int64]*typingOrder{},
 	}
@@ -271,8 +275,90 @@ func (s *Server) handle(line []byte) {
 		c.ctx, c.end = s.newestPost(ctx, req.Params)
 	case "load_comments":
 		c.turn = s.commentTurn(req.Params)
+	case "cancel":
+		// As it's read: the call it names was read before it, and one read
+		// after it can't be the one it means.
+		s.callOff(req.Params)
+	}
+	if cancellable[req.Method] {
+		s.track(*req.ID, c)
 	}
 	go s.serve(req.ID, h, c)
+}
+
+// cancellable are the requests cancel can call off: the loads, which only
+// read, so one stopped halfway leaves nothing half done.
+var cancellable = map[string]bool{"load_feed": true, "load_post": true, "load_comments": true}
+
+// running is a call that can be called off.
+type running struct {
+	cancel context.CancelCauseFunc
+}
+
+// errCalledOff is what a call that cancel called off is answered.
+var errCalledOff = proto.Err(proto.Cancelled, "tuimeta stopped waiting for it.")
+
+// track lets cancel call c off by its id until it's through.
+func (s *Server) track(id uint64, c *call) {
+	ctx, cancel := context.WithCancelCause(c.ctx)
+	c.ctx = ctx
+	mine := &running{cancel: cancel}
+	s.callsMu.Lock()
+	s.calls[id] = mine
+	s.callsMu.Unlock()
+	end := c.end
+	c.end = func() {
+		s.callsMu.Lock()
+		if s.calls[id] == mine {
+			delete(s.calls, id)
+		}
+		s.callsMu.Unlock()
+		cancel(nil)
+		if end != nil {
+			end()
+		}
+	}
+}
+
+// callOff calls off the call a cancel names, as the cancel is read. One
+// that's through, or that can't be called off, is left alone.
+func (s *Server) callOff(params json.RawMessage) {
+	p, err := decode[struct {
+		ID *uint64 `json:"id"`
+	}](params)
+	if err != nil || p.ID == nil {
+		return
+	}
+	s.callsMu.Lock()
+	if r := s.calls[*p.ID]; r != nil {
+		r.cancel(errCalledOff)
+	}
+	s.callsMu.Unlock()
+}
+
+// cancelCall is cancel, whose work callOff did as it was read: here only
+// that it named a call.
+func (s *Server) cancelCall(c *call) (any, error) {
+	p, err := decode[struct {
+		ID *uint64 `json:"id"`
+	}](c.params)
+	if err != nil {
+		return nil, err
+	}
+	if p.ID == nil {
+		return nil, proto.Err(proto.BadRequest, "id is missing: say which request to call off.")
+	}
+	return nil, nil
+}
+
+// calledOff is why the call was called off, by cancel or a newer call of
+// its kind, if it was.
+func calledOff(ctx context.Context) *proto.Error {
+	var pe *proto.Error
+	if errors.As(context.Cause(ctx), &pe) && pe.Code == proto.Cancelled {
+		return pe
+	}
+	return nil
 }
 
 func (s *Server) serve(id *uint64, h handler, c *call) {
@@ -289,6 +375,11 @@ func (s *Server) serve(id *uint64, h handler, c *call) {
 		defer c.end()
 	}
 	result, err := h(s, c)
+	// One called off is answered so, whatever came of it: nobody waits for
+	// what it found any more.
+	if pe := calledOff(c.ctx); pe != nil {
+		result, err = nil, pe
+	}
 	if err != nil {
 		s.reply(id, nil, s.wireError(c.method, err))
 	} else {

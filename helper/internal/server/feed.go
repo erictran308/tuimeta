@@ -5,7 +5,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sync"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
@@ -70,18 +69,24 @@ func (t *turns) take() (before <-chan struct{}, done func()) {
 // taken as it's read; nil for one that doesn't name a network, which is
 // refused without waiting.
 func (s *Server) feedTurn(params json.RawMessage) *turn {
+	n, ok := paramNetwork(params)
+	if !ok {
+		return nil
+	}
+	before, done := s.feeding[n].take()
+	return &turn{before: before, done: done}
+}
+
+// paramNetwork is the network a request's params name, if they name one.
+func paramNetwork(params json.RawMessage) (proto.Network, bool) {
 	p, err := decode[struct {
 		Network string `json:"network"`
 	}](params)
 	if err != nil {
-		return nil
+		return "", false
 	}
-	t, ok := s.feeding[proto.Network(p.Network)]
-	if !ok {
-		return nil
-	}
-	before, done := t.take()
-	return &turn{before: before, done: done}
+	n := proto.Network(p.Network)
+	return n, n.Valid()
 }
 
 // turn is a call's place in a line.
@@ -152,11 +157,6 @@ func (s *Server) loadFeed(c *call) (any, error) {
 	return map[string]any{"posts": raw, "has_more": more}, nil
 }
 
-// postCall is a load_post call that a newer one of its network calls off.
-type postCall struct {
-	cancel context.CancelCauseFunc
-}
-
 // errPostSuperseded is what a load_post called off is answered: tuimeta
 // shows one linked post at a time, so once another is asked for, the one
 // before isn't wanted, nor need the network be asked for it.
@@ -166,18 +166,12 @@ var errPostSuperseded = proto.Err(proto.Cancelled, "Another post's link was open
 // newest of its network's, and the one before is called off. end is to run
 // when the call is through.
 func (s *Server) newestPost(ctx context.Context, params json.RawMessage) (_ context.Context, end func()) {
-	p, err := decode[struct {
-		Network string `json:"network"`
-	}](params)
-	if err != nil {
-		return ctx, nil
-	}
-	n := proto.Network(p.Network)
-	if _, ok := s.feeding[n]; !ok {
+	n, ok := paramNetwork(params)
+	if !ok {
 		return ctx, nil
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
-	mine := &postCall{cancel: cancel}
+	mine := &running{cancel: cancel}
 	s.postingMu.Lock()
 	if before := s.posting[n]; before != nil {
 		before.cancel(errPostSuperseded)
@@ -199,8 +193,10 @@ func (s *Server) newestPost(ctx context.Context, params json.RawMessage) (_ cont
 // that the code and username can be ones.
 func (s *Server) loadPost(c *call) (any, error) {
 	if c.turn != nil {
+		// Called off while waiting, the network is never asked (serve says
+		// why).
 		if err := c.turn.wait(c.ctx); err != nil {
-			return nil, superseded(c.ctx, err)
+			return nil, err
 		}
 		defer c.turn.done()
 	}
@@ -232,23 +228,14 @@ func (s *Server) loadPost(c *call) (any, error) {
 		return nil, err
 	}
 	if err := c.ctx.Err(); err != nil {
-		return nil, superseded(c.ctx, err)
+		return nil, err
 	}
 	post, err := pl.LoadPost(c.ctx, p.Code, p.Username, feedBox(p.Width, p.Height))
 	if err != nil {
-		return nil, superseded(c.ctx, err)
+		return nil, err
 	}
 	s.notePosts(n, []proto.Post{post})
 	return map[string]any{"post": post}, nil
-}
-
-// superseded is err, or errPostSuperseded if the call was called off for a
-// newer one: whatever the network said once it was isn't the point.
-func superseded(ctx context.Context, err error) error {
-	if errors.Is(context.Cause(ctx), errPostSuperseded) {
-		return errPostSuperseded
-	}
-	return err
 }
 
 // notePosts keeps which network gave the posts, so load_comments, which

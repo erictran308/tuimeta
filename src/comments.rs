@@ -116,6 +116,8 @@ pub struct Comments {
     /// The load on its way: its number, and the comment whose replies it
     /// is. Answers to any other are old news.
     pub loading: Option<(u64, Option<i64>)>,
+    /// The helper's id for that load, to call it off with.
+    pub request: Option<u64>,
     /// The network has more top comments after the last one.
     pub has_more: bool,
     /// Comments whose replies are shown, and whether more of them come.
@@ -135,6 +137,7 @@ impl Comments {
             selected: 0,
             top: 0,
             loading: None,
+            request: None,
             has_more: true,
             open: HashMap::new(),
             error: None,
@@ -172,6 +175,7 @@ impl Comments {
             return false;
         };
         self.loading = None;
+        self.request = None;
         let (comments, more) = match page {
             Ok(page) => page,
             Err(why) => {
