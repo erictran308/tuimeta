@@ -49,6 +49,9 @@ const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// every scanner reads an inverted code.
 const QR_DARK: Color = rgb(0x181825);
 const QR_LIGHT: Color = rgb(0xeff1f5);
+/// The blue of Meta's logo, whatever the theme: the logo is told apart by
+/// it.
+const META_BLUE: Color = rgb(0x0668e1);
 
 /// A theme file as written.
 #[derive(Clone, Deserialize)]
@@ -314,6 +317,7 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         selection: role("selection", p("surface"))?,
         popup_bg: role("popup_bg", p("bg_alt"))?,
         primary: role("primary", p("blue"))?,
+        logo: role("logo", META_BLUE)?,
         highlighted: role("highlighted", p("orange"))?,
         insert: role("insert", p("green"))?,
         error: role("error", p("red"))?,
@@ -369,6 +373,8 @@ pub struct Colors {
     pub popup_bg: Color,
     /// Unread badges, the NORMAL label, the Saved Messages title.
     pub primary: Color,
+    /// tuimeta's logo in the chat list's border: Meta's blue.
+    pub logo: Color,
     /// Titles of chats you highlighted with `H`.
     pub highlighted: Color,
     /// The INSERT label.

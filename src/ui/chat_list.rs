@@ -28,6 +28,31 @@ const PHOTO_ROWS: u16 = 2;
 /// Narrower than this inside its border, the list leaves photos out to keep
 /// room for titles.
 const MIN_WIDTH_FOR_PHOTOS: u16 = 24;
+
+/// tuimeta's mark, so it's told from its sister apps at a glance: Meta's
+/// infinity in its blue, then the name.
+const MARK: &str = "∞";
+const NAME: &str = " tuimeta ";
+
+/// The chat list's title after the logo: the mark and the name where the
+/// border has room for them and the whole title, the mark alone where the
+/// name would cut the title, and no logo on a list too narrow for even
+/// that, since the title says what's listed.
+fn with_logo(title: String, width: u16, colors: &Colors) -> Line<'static> {
+    let room = usize::from(width.saturating_sub(2));
+    let logo = Span::from(MARK).fg(colors.logo).bold();
+    let mut spans = vec![Span::from(" ")];
+    if 1 + MARK.width() + NAME.width() + 2 + title.width() <= room {
+        spans.push(logo);
+        spans.push(Span::from(NAME).fg(colors.fg).bold());
+        spans.push(Span::from("· "));
+    } else if 1 + MARK.width() + 1 + title.width() <= room {
+        spans.push(logo);
+        spans.push(Span::from(" "));
+    }
+    spans.push(Span::from(title));
+    Line::from(spans)
+}
 /// After a muted chat's name.
 const MUTED: &str = " 🔕";
 /// A tab shows at most this many columns of its name.
@@ -55,10 +80,10 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         chats,
     };
     let mut title = if filter.is_empty() {
-        format!(" Chats ({}) ", chats.ids().len())
+        format!("Chats ({}) ", chats.ids().len())
     } else {
         format!(
-            " Chats ({} of {}) /{filter} ",
+            "Chats ({} of {}) /{filter} ",
             chats.ids().len(),
             chats.total()
         )
@@ -67,7 +92,7 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         title.push_str("loading… ");
     }
     let block = super::bordered(colors)
-        .title(title)
+        .title(with_logo(title, area.width, colors))
         .border_style(border(list.focused, colors));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -352,6 +377,35 @@ mod tests {
             focused: true,
             covered: false,
         }
+    }
+
+    #[test]
+    fn the_logo_says_which_app_this_is_and_gives_way_to_the_title() {
+        let mut chats = Chats::default();
+        chats.add_local(1, "Friends", None);
+        chats.refresh();
+        let colors = Colors::default();
+        let top = |width: u16| {
+            let buf = render(
+                &list(&chats, None),
+                &mut images(ProtocolType::Halfblocks),
+                width,
+                10,
+            );
+            let row: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+            let mark = row.find('∞').map(|i| buf[(row[..i].width() as u16, 0)].fg);
+            (row, mark)
+        };
+        let (row, mark) = top(40);
+        assert!(row.contains("╭ ∞ tuimeta · Chats (1)"), "{row}");
+        assert_eq!(mark, Some(colors.logo), "in Meta's blue");
+        assert_eq!(colors.logo, ratatui::style::Color::Rgb(0x06, 0x68, 0xe1));
+
+        let (row, _) = top(18);
+        assert!(row.contains("╭ ∞ Chats (1)"), "the mark alone: {row}");
+        let (row, mark) = top(14);
+        assert!(row.contains("Chats (1)"), "the title stays whole: {row}");
+        assert_eq!(mark, None);
     }
 
     #[test]

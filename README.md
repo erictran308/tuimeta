@@ -208,7 +208,7 @@ Panes and popups have round corners. In terminals whose font can't draw them (th
 
 If your terminal uses a [Nerd Font](https://www.nerdfonts.com), turn on **Round pills** there too (`nerd_font = true`): unread counts, reactions, the tab you're on and the mode in the status bar get round ends. Other fonts show a box for them, so it's off at first.
 
-A few short animations catch your eye: when you come back to tuimeta's window, four lights draw the border of the pane your keys go to (the chats, a chat, the composer, a feed or its comments), each a quarter of it, until they meet (this needs a terminal that reports focus; in tmux, `set -g focus-events on`). Popups fade in, the toast slides in and out, and a message from someone else glows for a moment as it comes. Turn them all off with **Animations** there (`animations = false`). A theme can color the lights with `light` in its `[colors]`.
+A few short animations catch your eye: when you come back to tuimeta's window, four lights draw the border of the pane your keys go to (the chats, a chat, the composer, a feed or its comments), each a quarter of it, until they meet (this needs a terminal that reports focus; in tmux, `set -g focus-events on`). Popups fade in, the toast slides in and out, and a message from someone else glows for a moment as it comes. Turn them all off with **Animations** there (`animations = false`). A theme can color the lights with `light` in its `[colors]`. The chat list's border starts with tuimeta's logo, `∞` in Meta's blue, so it's told apart from tuigram and tuitube at a glance (`logo` in `[colors]` changes its color).
 
 ## Development
 
