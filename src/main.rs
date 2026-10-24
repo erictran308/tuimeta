@@ -11,6 +11,7 @@ mod feed;
 mod images;
 mod messages;
 mod meta;
+mod motion;
 mod notify;
 mod ogg;
 mod opus;

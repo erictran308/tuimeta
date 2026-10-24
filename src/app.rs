@@ -25,6 +25,7 @@ use crate::messages::{
     Editable, Editing, Link, MediaFile, OpenChat, Preview, Replied, SendState, link_host,
 };
 use crate::meta::{AccountState, CommentInfo, FeedPost, Meta, MetaEvent, Network, Page};
+use crate::motion::{self, Motion};
 use crate::notify::{self, Note, Notifications, Notifier};
 use crate::pepper::{self, Pepper, Placed};
 use crate::picker::{ChatPicker, Choice};
@@ -366,6 +367,8 @@ pub struct Toast {
     pub title: String,
     /// What it was about, e.g. what got copied.
     pub detail: String,
+    /// When it came up, to slide in from the right.
+    pub shown: Instant,
     pub until: Instant,
 }
 
@@ -417,8 +420,10 @@ impl SettingsMenu {
     pub const CORNERS: usize = Self::BLOCK_GAPS + 1;
     /// The "round pills, with a Nerd Font" row.
     pub const PILLS: usize = Self::CORNERS + 1;
+    /// The "animations" row.
+    pub const ANIMATIONS: usize = Self::PILLS + 1;
     /// The "Normal mode after sending" row.
-    pub const AFTER_SEND: usize = Self::PILLS + 1;
+    pub const AFTER_SEND: usize = Self::ANIMATIONS + 1;
     /// The "wrap long lines in the composer" row.
     pub const WRAP_COMPOSER: usize = Self::AFTER_SEND + 1;
     /// The "sound while focused too" row, first under the sound's heading.
@@ -785,6 +790,8 @@ pub struct App {
     /// drawn on a cleared screen: sixel and iTerm2 pictures drawn the old
     /// size would stay on it.
     cells_resized: bool,
+    /// When what's animated started (`Settings.animations`).
+    pub motion: Motion,
     /// The browser a login says tuimeta is (`TM_BROWSER`: Chrome and its full
     /// version), so the session looks like the browser its cookies came
     /// from. `None` leaves it to the helper.
@@ -901,6 +908,7 @@ impl App {
             unread_chats: 0,
             drawn_layers: None,
             cells_resized: false,
+            motion: Motion::default(),
             browser: None,
             login_attempt: 0,
             feed: None,
@@ -1020,9 +1028,18 @@ impl App {
 
             let deadline = self.quit_deadline;
             // Wakes up to take the toast down, to send notifications that
-            // had to wait, and to search once typing in the `s` picker
-            // pauses.
+            // had to wait, to search once typing in the `s` picker pauses,
+            // and to move what's animated on.
+            let open = self.open.as_ref().map(|o| o.chat_id);
+            let moving = self.motion.next_frame(Instant::now(), open);
+            let sliding = self
+                .toast
+                .as_ref()
+                .filter(|_| self.slides_toast())
+                .and_then(|t| motion::toast_frame(t.shown, t.until, Instant::now()));
             let wake = [
+                moving,
+                sliding,
                 self.toast.as_ref().map(|t| t.until),
                 self.notifier.next_at(),
                 self.picker.as_ref().and_then(ChatPicker::search_at),
@@ -1134,6 +1151,14 @@ impl App {
                 self.focus_reported = true;
                 // Back at tuimeta: what was waiting is on screen.
                 self.notifier.clear();
+                // And where the keys are, shown by lights round the pane,
+                // unless a popup has them.
+                if self.settings.animations
+                    && matches!(self.screen, Screen::Main)
+                    && !self.popup_over_chat()
+                {
+                    self.motion.focused = Some(Instant::now());
+                }
             }
             Event::FocusLost => {
                 self.terminal_focused = false;
@@ -1646,8 +1671,23 @@ impl App {
         if !message.outgoing {
             self.chats.stop_typing(message.chat_id, sender);
         }
+        // Nobody sees a message come in while they're away or a popup is
+        // over the chat.
+        let seen = self.present() && !self.popup_over_chat();
         if let Some(open) = self.open.as_mut().filter(|o| o.chat_id == message.chat_id) {
+            let new = !open.messages.contains_key(&message.id);
             open.upsert(message);
+            // Someone else's glows as it comes in, if it's in sight: seen,
+            // and the view following the newest messages. A theme whose
+            // bubbles are the background has none to glow, so nothing wakes
+            // the run loop for it.
+            let in_sight = seen && open.selected.is_none();
+            let bubbles = self.colors.other_bubble != self.colors.bg;
+            let glows = new && !message.outgoing && in_sight && bubbles && self.settings.animations;
+            if glows && open.messages.contains_key(&message.id) {
+                self.motion
+                    .arrived(open.chat_id, message.id, Instant::now());
+            }
             // Edited to another photo, or to no photo at all.
             let msg = open.messages.get(&message.id);
             if self
@@ -3488,22 +3528,32 @@ impl App {
     /// which is why `watching` (read receipts) must treat them as not seen,
     /// not just the settings menu. So does the list of emoji suggestions,
     /// drawn over the bottom of the messages, where the newest one is.
-    fn popup_over_chat(&self) -> bool {
+    pub fn popup_over_chat(&self) -> bool {
         let suggesting = self.focus == Focus::Input
             && self
                 .completion
                 .as_ref()
                 .is_some_and(|c| !c.items.is_empty());
-        suggesting
-            || self.confirm.is_some()
+        suggesting || self.popup_up() || self.resizing.is_some() || self.prompt.is_some()
+    }
+
+    /// One of the popups is up: a confirm, menu, picker, the photo viewer
+    /// or settings. A popup fades in as it comes up.
+    pub fn popup_up(&self) -> bool {
+        self.confirm.is_some()
             || self.settings_menu.is_some()
             || self.delete_menu.is_some()
             || self.react_menu.is_some()
             || self.photo_view.is_some()
             || self.menu.is_some()
             || self.picker.is_some()
-            || self.resizing.is_some()
-            || self.prompt.is_some()
+    }
+
+    /// The toast slides in and out. Not where sixel or iTerm2 pictures may
+    /// be under it: a picture's cells uncovered a frame at a time would
+    /// send it to the terminal again each frame, over the toast.
+    pub fn slides_toast(&self) -> bool {
+        self.settings.animations && !self.images.paints_over()
     }
 
     fn open_externally(&mut self, target: &str) {
@@ -3758,10 +3808,22 @@ impl App {
     }
 
     fn show_toast(&mut self, title: &str, detail: &str) {
+        let now = Instant::now();
+        // One already up stays where it is, rather than slide in again: in
+        // place, or on its way out, from where it got to.
+        let shown = self
+            .toast
+            .as_ref()
+            .filter(|t| t.until > now)
+            .map_or(now, |t| {
+                let going = now.checked_sub(t.until - now).unwrap_or(t.shown);
+                t.shown.max(going)
+            });
         self.toast = Some(Toast {
             title: title.into(),
             detail: detail.split_whitespace().collect::<Vec<_>>().join(" "),
-            until: Instant::now() + TOAST_TIME,
+            shown,
+            until: now + TOAST_TIME,
         });
     }
 
@@ -3930,6 +3992,13 @@ impl App {
                 };
             }
             SettingsMenu::PILLS => settings.nerd_font = !settings.nerd_font,
+            SettingsMenu::ANIMATIONS => {
+                settings.animations = !settings.animations;
+                // Nothing left moving to wake the run loop for.
+                if !settings.animations {
+                    self.motion.stop();
+                }
+            }
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
             SettingsMenu::WRAP_COMPOSER => settings.wrap_composer = !settings.wrap_composer,
             SettingsMenu::SOUND_FOCUSED => {
@@ -5103,6 +5172,92 @@ mod tests {
         let after = saved();
         assert!(!after.normal_after_send, "{after:?}");
         assert!(after.block_gaps, "{after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn getting_focus_back_runs_lights_round_the_pane_with_the_keys() {
+        let dir = std::env::temp_dir().join(format!("tuimeta-lights-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let meta = Meta::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(meta, images, &dir);
+        app.focus = Focus::Chats;
+        // The chat list's bottom left corner, where no light starts.
+        let corner = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            terminal.backend().buffer()[(0, 18)].fg
+        };
+        assert_eq!(corner(&mut app), app.colors.accent);
+
+        app.on_terminal_event(Event::FocusLost);
+        assert_eq!(app.motion.focused, None);
+        app.on_terminal_event(Event::FocusGained);
+        assert!(app.motion.focused.is_some());
+        // Held at its start, however slowly the test runs.
+        app.motion.focused = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(corner(&mut app), app.colors.border, "not come round yet");
+
+        // With a popup up, the keys are in it, and the pane stays as it is.
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(corner(&mut app), app.colors.accent);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        app.motion.focused = None;
+        app.settings.animations = false;
+        app.on_terminal_event(Event::FocusGained);
+        assert_eq!(app.motion.focused, None, "turned off in ?");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_lights_run_round_a_feed_with_the_keys_too() {
+        let dir = std::env::temp_dir().join(format!("tuimeta-feed-lights-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let meta = Meta::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(meta, images, &dir);
+        app.open = None;
+        app.feed = Some(crate::feed::Feed::new(Network::Instagram));
+        app.focus = Focus::Messages;
+        // The feed's bottom left corner, where no light starts.
+        let corner = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            let pane = app.chat_area;
+            terminal.backend().buffer()[(pane.x, pane.bottom() - 1)].fg
+        };
+        assert_eq!(corner(&mut app), app.colors.accent);
+        app.on_terminal_event(Event::FocusGained);
+        assert!(app.motion.focused.is_some());
+        app.motion.focused = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(corner(&mut app), app.colors.border, "not come round yet");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_toast_replaced_while_up_stays_in_place() {
+        let dir = std::env::temp_dir().join(format!("tuimeta-toast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let meta = Meta::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(meta, images, &dir);
+        app.show_toast("Copied", "first");
+        let shown = app.toast.as_ref().unwrap().shown;
+        app.show_toast("Copied", "second");
+        let toast = app.toast.as_ref().unwrap();
+        assert_eq!(toast.detail, "second");
+        assert_eq!(toast.shown, shown, "not sliding in again");
+
+        // One on its way out comes back in from where it got to.
+        let now = Instant::now();
+        let until = now + motion::SLIDE / 2;
+        app.toast.as_mut().unwrap().until = until;
+        let out = motion::toast_out(shown, until, now);
+        app.show_toast("Copied", "third");
+        let back = motion::toast_out(app.toast.as_ref().unwrap().shown, until + TOAST_TIME, now);
+        assert!((back - out).abs() < 0.1, "{out} then {back}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
