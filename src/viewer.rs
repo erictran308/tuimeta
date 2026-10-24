@@ -1,13 +1,17 @@
-//! The photo viewer: Enter on a photo shows it as big as the window allows,
-//! over everything but the status bar, instead of handing it to another app.
-//! `h` / `l` go to the photo before or after it, and `j` / `k` zoom in and
-//! out, never past the size that fills the window, so all of it shows.
+//! The photo viewer: Enter on a photo shows it filling the window, small
+//! ones made bigger too, over everything but the status bar, instead of
+//! handing it to another app. `h` / `l` go to the photo before or after it,
+//! and `j` / `k` zoom out and back in, never past filling the window, so all
+//! of it shows.
 
 use crate::messages::{MediaFile, Msg, Preview};
 
 /// The sizes `j` and `k` go through, as shares of the size that fills the
 /// window.
 pub const SIZES: [f64; 4] = [0.25, 0.5, 0.75, 1.0];
+
+/// Where in [`SIZES`] a photo opens: filling the window.
+pub const FILLING: usize = SIZES.len() - 1;
 
 /// A photo shown in the viewer.
 pub struct PhotoView {
@@ -23,12 +27,9 @@ pub struct PhotoView {
     pub stand_in: Option<Preview>,
     /// What `o` opens and `y` copies.
     pub file: MediaFile,
-    /// The size `j` or `k` picked, in [`SIZES`]. `None` until then: as big
-    /// as fills the window, but not past its own pixels.
-    pub zoom: Option<usize>,
-    /// The share of the size that fills the window it opens at, from the
-    /// last frame: less than all for a photo smaller than the window.
-    pub natural: f64,
+    /// The size it's shown at, in [`SIZES`]: [`FILLING`] until `j` or `k`
+    /// picks another.
+    pub zoom: usize,
 }
 
 impl PhotoView {
@@ -46,30 +47,23 @@ impl PhotoView {
             }),
             photo,
             file,
-            zoom: None,
-            natural: 1.0,
+            zoom: FILLING,
         })
     }
 
     /// How big it is, as a share of the size that fills the window.
     pub fn share(&self) -> f64 {
-        self.zoom.map_or(self.natural, |i| SIZES[i])
+        SIZES[self.zoom]
     }
 
     /// The next size up, up to filling the window.
     pub fn zoom_in(&mut self) {
-        let now = self.share();
-        if let Some(i) = SIZES.iter().position(|&s| s > now + 0.001) {
-            self.zoom = Some(i);
-        }
+        self.zoom = (self.zoom + 1).min(FILLING);
     }
 
     /// The next size down.
     pub fn zoom_out(&mut self) {
-        let now = self.share();
-        if let Some(i) = SIZES.iter().rposition(|&s| s < now - 0.001) {
-            self.zoom = Some(i);
-        }
+        self.zoom = self.zoom.saturating_sub(1);
     }
 
     /// Message `message_id` of chat `chat_id`, now `msg`, no longer has the
@@ -85,7 +79,7 @@ impl PhotoView {
 mod tests {
     use super::*;
 
-    fn view(natural: f64) -> PhotoView {
+    fn view() -> PhotoView {
         let photo = Preview {
             file_id: 1,
             width: 300,
@@ -103,16 +97,16 @@ mod tests {
                 label: "Photo".into(),
                 photo: true,
             },
-            zoom: None,
-            natural,
+            zoom: FILLING,
         }
     }
 
     #[test]
-    fn a_photo_filling_the_window_only_zooms_out_and_back() {
-        let mut view = view(1.0);
+    fn a_photo_opens_filling_the_window_and_only_zooms_out_and_back() {
+        let mut view = view();
+        assert_eq!(view.share(), 1.0);
         view.zoom_in();
-        assert_eq!(view.zoom, None, "it can't get bigger");
+        assert_eq!(view.share(), 1.0, "it can't get bigger");
         view.zoom_out();
         assert_eq!(view.share(), 0.75);
         for _ in 0..5 {
@@ -123,15 +117,5 @@ mod tests {
             view.zoom_in();
         }
         assert_eq!(view.share(), 1.0, "filling the window at most");
-    }
-
-    #[test]
-    fn a_small_photo_zooms_in_from_its_own_size_up_to_filling_the_window() {
-        let mut view = view(0.3);
-        view.zoom_in();
-        assert_eq!(view.share(), 0.5);
-        let mut view = self::view(0.3);
-        view.zoom_out();
-        assert_eq!(view.share(), 0.25);
     }
 }

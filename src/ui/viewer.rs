@@ -1,5 +1,5 @@
-//! The photo viewer: the photo as big as the window allows, keeping its
-//! shape, over everything but the status bar; or smaller, zoomed out.
+//! The photo viewer: the photo filling the window, keeping its shape, over
+//! everything but the status bar; or smaller, zoomed out.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -12,7 +12,7 @@ use super::{Cover, popup_block};
 use crate::images::Images;
 use crate::messages::Preview;
 use crate::theme::Colors;
-use crate::viewer::{PhotoView, SIZES};
+use crate::viewer::PhotoView;
 
 /// Draws the viewer over `area`; `covered` while a warning is over it.
 pub(super) fn draw(
@@ -27,12 +27,11 @@ pub(super) fn draw(
     frame.render_widget(Cover, area);
     let shot = shot(
         &view.photo,
-        view.zoom.map(|i| SIZES[i]),
+        view.share(),
         inner.width,
         inner.height,
         images.font_size(),
     );
-    view.natural = shot.natural;
     let (cols, rows) = (shot.cols, shot.rows);
     // The largest photo, and the bubble's until that's downloaded.
     images.want(&view.photo, cols, rows);
@@ -53,10 +52,10 @@ pub(super) fn draw(
     let broken =
         images.is_broken(&view.photo) && view.stand_in.as_ref().is_none_or(|s| images.is_broken(s));
 
-    let mut title = vec![Span::from(" Photo")];
-    if let Some(i) = view.zoom {
-        title.push(Span::from(format!(" · {:.0}%", SIZES[i] * 100.0)));
-    }
+    let mut title = vec![
+        Span::from(" Photo"),
+        Span::from(format!(" · {:.0}%", view.share() * 100.0)),
+    ];
     if !ready && !broken {
         title.push(Span::from(" · "));
         title.push(Span::from("loading…").fg(colors.accent).bold());
@@ -106,15 +105,12 @@ struct Shot {
     /// From the window's top left corner.
     x: u16,
     y: u16,
-    /// The share of the size that fills the window it takes unzoomed.
-    natural: f64,
 }
 
 /// The photo in the middle of `cols` × `rows` cells: `share` of the size
-/// that fills them with its shape kept, since cells are taller than wide;
-/// unzoomed (`None`), that size, but no bigger than its own pixels, which
-/// would only blur it.
-fn shot(photo: &Preview, share: Option<f64>, cols: u16, rows: u16, font: FontSize) -> Shot {
+/// that fills them with its shape kept, since cells are taller than wide.
+/// A photo smaller than that is made bigger.
+fn shot(photo: &Preview, share: f64, cols: u16, rows: u16, font: FontSize) -> Shot {
     let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
     let (pw, ph) = (
         f64::from(photo.width.max(1)),
@@ -122,8 +118,7 @@ fn shot(photo: &Preview, share: Option<f64>, cols: u16, rows: u16, font: FontSiz
     );
     let (cols, rows) = (cols.max(1), rows.max(1));
     let fill = (f64::from(cols) * fw / pw).min(f64::from(rows) * fh / ph);
-    let natural = (1.0 / fill).min(1.0);
-    let scale = fill * share.unwrap_or(natural);
+    let scale = fill * share;
     let cells =
         |pixels: f64, cell: f64, room: u16| ((pixels * scale / cell).round() as u16).clamp(1, room);
     let (shown_cols, shown_rows) = (cells(pw, fw, cols), cells(ph, fh, rows));
@@ -132,7 +127,6 @@ fn shot(photo: &Preview, share: Option<f64>, cols: u16, rows: u16, font: FontSiz
         rows: shown_rows,
         x: (cols - shown_cols) / 2,
         y: (rows - shown_rows) / 2,
-        natural,
     }
 }
 
@@ -165,7 +159,7 @@ mod tests {
     };
 
     /// The cells it takes at `share` of filling 100 × 40 cells.
-    fn cells(photo: &Preview, share: Option<f64>) -> (u16, u16) {
+    fn cells(photo: &Preview, share: f64) -> (u16, u16) {
         let shot = shot(photo, share, 100, 40, FONT);
         (shot.cols, shot.rows)
     }
@@ -173,32 +167,26 @@ mod tests {
     #[test]
     fn a_wide_photo_takes_the_whole_width_and_rows_by_its_shape() {
         // 2000×1000 px in 100 columns: 1000×500 px of cells, 25 rows.
-        assert_eq!(cells(&photo(2000, 1000), None), (100, 25));
-        let shot = shot(&photo(2000, 1000), None, 100, 40, FONT);
+        assert_eq!(cells(&photo(2000, 1000), 1.0), (100, 25));
+        let shot = shot(&photo(2000, 1000), 1.0, 100, 40, FONT);
         assert_eq!((shot.x, shot.y), (0, 7), "in the middle");
     }
 
     #[test]
     fn a_tall_photo_takes_the_whole_height_and_columns_by_its_shape() {
         // 1000×2000 px in 40 rows: 400×800 px of cells, 40 columns.
-        assert_eq!(cells(&photo(1000, 2000), None), (40, 40));
+        assert_eq!(cells(&photo(1000, 2000), 1.0), (40, 40));
     }
 
     #[test]
-    fn a_small_photo_opens_no_bigger_than_its_pixels() {
-        assert_eq!(cells(&photo(300, 200), None), (30, 10));
-        let shot = shot(&photo(300, 200), None, 100, 40, FONT);
-        assert_eq!(shot.natural, 0.3, "of filling the width");
+    fn a_small_photo_fills_the_window_too() {
+        assert_eq!(cells(&photo(300, 200), 1.0), (100, 33));
     }
 
     #[test]
-    fn zoomed_it_takes_its_share_of_filling_the_window_and_never_more() {
-        assert_eq!(cells(&photo(2000, 1000), Some(0.5)), (50, 13));
-        assert_eq!(
-            cells(&photo(300, 200), Some(1.0)),
-            (100, 33),
-            "a small photo fills it"
-        );
+    fn zoomed_it_takes_its_share_of_filling_the_window() {
+        assert_eq!(cells(&photo(2000, 1000), 0.5), (50, 13));
+        assert_eq!(cells(&photo(300, 200), 0.25), (25, 8));
     }
 
     /// The viewer's rows, drawn 60 × 20 cells.
@@ -230,12 +218,11 @@ mod tests {
                 label: "Photo".into(),
                 photo: true,
             },
-            zoom: None,
-            natural: 1.0,
+            zoom: crate::viewer::FILLING,
         };
-        assert!(title(&mut view, &mut images).contains("Photo · loading…"));
+        assert!(title(&mut view, &mut images).contains("Photo · 100% · loading…"));
 
-        let shot = shot(&view.photo, None, 58, 18, images.font_size());
+        let shot = shot(&view.photo, 1.0, 58, 18, images.font_size());
         let key = Key {
             file_id: 1,
             cols: shot.cols,
@@ -246,7 +233,7 @@ mod tests {
         images.insert_ready(key, DynamicImage::new_rgb8(20, 10));
         let ready = title(&mut view, &mut images);
         assert!(
-            ready.contains("Photo") && !ready.contains("loading"),
+            ready.contains("Photo · 100%") && !ready.contains("loading"),
             "{ready}"
         );
 
@@ -261,7 +248,7 @@ mod tests {
 
     #[test]
     fn a_tiny_window_still_shows_a_cell_of_it() {
-        let shot = shot(&photo(2000, 1000), Some(0.25), 1, 1, FONT);
+        let shot = shot(&photo(2000, 1000), 0.25, 1, 1, FONT);
         assert_eq!((shot.cols, shot.rows), (1, 1));
     }
 }

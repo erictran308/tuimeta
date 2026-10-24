@@ -643,7 +643,7 @@ struct Layers {
     /// A popup over the chat, under which the bubbles' pictures are held back.
     covered: bool,
     /// The viewer's photo, by file id, and the size it's zoomed to.
-    viewer: Option<(i32, Option<usize>)>,
+    viewer: Option<(i32, usize)>,
 }
 
 /// Whether to clear the terminal before drawing a frame with `now` after
@@ -4960,8 +4960,7 @@ fn feed_photo(network: Network, post_id: i64, item: &feed::Item) -> Option<Photo
         // The feed's smaller copy shows until the viewer's is downloaded.
         stand_in: item.still.clone().filter(|s| s.file_id != file.id),
         file,
-        zoom: None,
-        natural: 1.0,
+        zoom: crate::viewer::FILLING,
     })
 }
 
@@ -7300,7 +7299,11 @@ mod tests {
             Some(older),
             "past the messages that aren't photos"
         );
-        assert_eq!(app.photo_view.as_ref().unwrap().zoom, None, "unzoomed");
+        assert_eq!(
+            app.photo_view.as_ref().unwrap().zoom,
+            crate::viewer::FILLING,
+            "filling the window again"
+        );
         press(&mut app, KeyCode::Char('h'), none);
         assert_eq!(shown(&app), Some(older));
         assert_eq!(app.status.as_deref(), Some("No older photos in this chat"));
@@ -7329,22 +7332,22 @@ mod tests {
         make_photo(&mut app, id, 40);
         press(&mut app, KeyCode::Enter, none);
         let zoom = |app: &App| app.photo_view.as_ref().unwrap().zoom;
-        // A big photo opens filling the window: there's no more to zoom in.
+        // It opens filling the window: there's no more to zoom in.
         screen(&mut app);
         press(&mut app, KeyCode::Char('j'), none);
-        assert_eq!(zoom(&app), None);
+        assert_eq!(zoom(&app), crate::viewer::FILLING);
         press(&mut app, KeyCode::Char('k'), none);
-        assert_eq!(zoom(&app), Some(crate::viewer::SIZES.len() - 2));
+        assert_eq!(zoom(&app), crate::viewer::FILLING - 1);
         for _ in 0..10 {
             press(&mut app, KeyCode::Char('-'), none);
         }
-        assert_eq!(zoom(&app), Some(0));
+        assert_eq!(zoom(&app), 0);
         let rows = screen(&mut app);
         assert!(rows[0].contains("Photo · 25% · loading…"), "{rows:#?}");
         for _ in 0..10 {
             press(&mut app, KeyCode::Char('j'), none);
         }
-        assert_eq!(zoom(&app), Some(crate::viewer::SIZES.len() - 1));
+        assert_eq!(zoom(&app), crate::viewer::FILLING);
         assert!(screen(&mut app)[0].contains("Photo · 100%"));
     }
 
@@ -7483,7 +7486,7 @@ mod tests {
         assert!(screen(&mut app).iter().any(|r| r.contains(&title)));
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         let rows = screen(&mut app);
-        assert!(rows[0].contains("Photo · loading…"), "{rows:#?}");
+        assert!(rows[0].contains("Photo · 100% · loading…"), "{rows:#?}");
         assert!(!rows.iter().any(|r| r.contains(&title)), "{rows:#?}");
         assert!(rows.iter().any(|r| r.contains("Loading…")), "{rows:#?}");
         assert!(
