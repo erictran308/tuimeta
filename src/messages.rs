@@ -172,7 +172,8 @@ impl Msg {
     }
 }
 
-/// How part of a message's text looks, from the formatting its sender picked.
+/// How part of a message's text looks, from the formatting its sender
+/// picked, and the people it mentions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Format {
     pub bold: bool,
@@ -182,6 +183,9 @@ pub struct Format {
     pub code: bool,
     /// A block quote.
     pub quote: bool,
+    /// A mention the network made of it, which leads to the person, so it
+    /// isn't taken for words that only start with @.
+    pub mention: bool,
 }
 
 /// A stretch of text with one [`Format`].
@@ -200,9 +204,10 @@ enum Mark {
     Strike,
     Code,
     Quote,
+    Mention,
 }
 
-const MARKS: usize = 5;
+const MARKS: usize = 6;
 
 impl Mark {
     fn of(kind: EntityKind) -> Option<Self> {
@@ -227,6 +232,7 @@ impl Format {
             strike: on(Mark::Strike),
             code: on(Mark::Code),
             quote: on(Mark::Quote),
+            mention: on(Mark::Mention),
         }
     }
 }
@@ -237,8 +243,12 @@ fn styles(entities: &[meta::Entity], offsets: &Utf16Offsets) -> Vec<Styled> {
     // Where each entity starts (+1) and ends (-1).
     let mut edges = Vec::new();
     for entity in entities {
-        let Some(mark) = Mark::of(entity.kind) else {
-            continue;
+        let mark = match entity.kind {
+            EntityKind::Mention => Mark::Mention,
+            kind => match Mark::of(kind) {
+                Some(mark) => mark,
+                None => continue,
+            },
         };
         let (start, end) = offsets.range(entity);
         if start < end {
@@ -1650,6 +1660,25 @@ pub(crate) mod tests {
             [("bold ", bold), ("and italic", both), ("code", code)]
         );
         assert!(msg.formatted, "an edit would lose it");
+    }
+
+    #[test]
+    fn mentions_the_network_made_are_marked_and_lookalikes_are_not() {
+        let msg = msg(
+            serde_json::json!({"text": "hi @Alice, Bob and @ nobody", "entities": [
+                entity(3, 6, "mention"),
+                entity(11, 3, "mention"),
+            ]}),
+        );
+        let mention = Format {
+            mention: true,
+            ..Format::default()
+        };
+        assert_eq!(styled(&msg), [("@Alice", mention), ("Bob", mention)]);
+        assert!(
+            !msg.formatted,
+            "an edit asks only about formatting"
+        );
     }
 
     #[test]

@@ -330,6 +330,7 @@ fn colors(file: &ThemeFile) -> Result<Colors, String> {
         edit: role("edit", p("orange"))?,
         attach: role("attach", p("blue"))?,
         code: role("code", p("green"))?,
+        mention: role("mention", p("blue"))?,
         success: role("success", p("green"))?,
         own_bubble,
         own_meta: role("own_meta", mix(p("fg"), p("blue"), 0.5))?,
@@ -398,6 +399,9 @@ pub struct Colors {
     pub attach: Color,
     /// Code in messages.
     pub code: Color,
+    /// Mentions in messages: a name the network made a mention, which leads
+    /// to the person, not text that only starts with @.
+    pub mention: Color,
     /// Toasts saying something worked.
     pub success: Color,
     pub own_bubble: Color,

@@ -1231,6 +1231,7 @@ impl<'a> Bubble<'a> {
             styles,
             style,
             code: colors.code,
+            mention: colors.mention,
             faded,
         };
         let spans = |line: &str, start: usize| line_spans(line, start, &paint);
@@ -1401,6 +1402,8 @@ struct Paint<'a> {
     style: Style,
     /// Code.
     code: Color,
+    /// Mentions of people.
+    mention: Color,
     /// What's quieter than the text on the bubble: quotes.
     faded: Color,
 }
@@ -1423,6 +1426,10 @@ impl Paint<'_> {
         }
         if format.quote {
             style = style.fg(self.faded);
+        }
+        // In a quote too.
+        if format.mention {
+            style = style.fg(self.mention);
         }
         style
     }
@@ -2088,8 +2095,27 @@ mod tests {
             styles,
             style: Style::new(),
             code: Color::Green,
+            mention: Color::Blue,
             faded: Color::Gray,
         }
+    }
+
+    #[test]
+    fn mentions_have_a_color_of_their_own_even_in_a_quote() {
+        let styled = |range, quote| Styled {
+            range,
+            format: Format {
+                mention: true,
+                quote,
+                ..Format::default()
+            },
+        };
+        let styles = [styled(3..9, false), styled(14..17, true)];
+        let spans = line_spans("hi @Alice and Bob", 0, &paint(&[], &styles));
+        let fg = |part: &str| spans.iter().find(|s| s.content == part).map(|s| s.style.fg);
+        assert_eq!(fg("@Alice"), Some(Some(Color::Blue)));
+        assert_eq!(fg("Bob"), Some(Some(Color::Blue)));
+        assert_eq!(fg("hi "), Some(None));
     }
 
     #[test]
