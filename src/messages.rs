@@ -1675,10 +1675,7 @@ pub(crate) mod tests {
             ..Format::default()
         };
         assert_eq!(styled(&msg), [("@Alice", mention), ("Bob", mention)]);
-        assert!(
-            !msg.formatted,
-            "an edit asks only about formatting"
-        );
+        assert!(!msg.formatted, "an edit asks only about formatting");
     }
 
     #[test]

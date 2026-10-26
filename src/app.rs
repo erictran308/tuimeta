@@ -95,6 +95,8 @@ pub struct Playing {
     /// Where it is and how long it is, in seconds, as pepper-play tells.
     pub position: Option<f64>,
     pub duration: Option<f64>,
+    /// `f`: it fills the window, over everything but the status bar.
+    pub full_screen: bool,
 }
 
 impl Playing {
@@ -609,24 +611,33 @@ impl Finding {
 pub enum Command {
     Login,
     Logout,
+    Following,
+    ForYou,
 }
 
 impl Command {
-    pub const ALL: [Command; 2] = [Command::Login, Command::Logout];
+    pub const ALL: [Command; 4] = [
+        Command::Login,
+        Command::Logout,
+        Command::Following,
+        Command::ForYou,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Command::Login => "login",
             Command::Logout => "logout",
+            Command::Following => "following",
+            Command::ForYou => "for-you",
         }
     }
 
     pub fn about(self) -> &'static str {
         match self {
-            Command::Login => {
-                "Log in to Messenger, Instagram, Threads or WhatsApp, or log in again"
-            }
+            Command::Login => "Log in to another network, or to one again",
             Command::Logout => "Log out of the network of the chat under the cursor (asks first)",
+            Command::Following => "Threads: the accounts you follow, newest first",
+            Command::ForYou => "Threads: For you, the posts Threads picks",
         }
     }
 
@@ -1106,7 +1117,7 @@ impl App {
     fn layers(&self) -> Layers {
         Layers {
             login: matches!(self.screen, Screen::Login(_)),
-            covered: self.popup_over_chat(),
+            covered: self.popup_over_chat() || self.full_screen(),
             viewer: self.photo_view.as_ref().map(|v| (v.photo.file_id, v.zoom)),
         }
     }
@@ -2094,6 +2105,9 @@ impl App {
     /// Normal mode: every key is a command, nothing is typed.
     fn on_normal_key(&mut self, key: KeyEvent, ctrl: bool) {
         let pending_g = std::mem::take(&mut self.pending_g);
+        if self.full_screen() && self.on_full_screen_key(key, ctrl) {
+            return;
+        }
         if self.focus == Focus::Messages
             && self.comments_focus
             && self.comments.is_some()
@@ -2516,6 +2530,8 @@ impl App {
             PromptKind::Command => match Command::parse(&query) {
                 Some(Command::Login) => self.ask_to_log_in(),
                 Some(Command::Logout) => self.ask_to_log_out(),
+                Some(Command::Following) => self.show_threads_feed(true),
+                Some(Command::ForYou) => self.show_threads_feed(false),
                 None => self.status = Some(format!("Not a command: {query}")),
             },
         }
@@ -4326,10 +4342,7 @@ impl App {
             KeyCode::Char('o') => self.open_post_outside(),
             KeyCode::Char('y') => self.copy_post_link(),
             KeyCode::Char('r') => self.reload_feed(),
-            KeyCode::Char('f') if linked => {
-                self.status = Some("This is one post: Esc goes on to the feed".into())
-            }
-            KeyCode::Char('f') => self.switch_threads_feed(),
+            KeyCode::Char('f') => self.full_screen_video(),
             KeyCode::Char('c') => self.toggle_comments(),
             // The comments pane is on the post's right.
             KeyCode::Char('l') if self.comments.is_some() && !self.comments_focus => {
@@ -4433,15 +4446,35 @@ impl App {
         }
     }
 
-    /// `f` on Threads: the accounts followed, newest first, or For you
-    /// again, from the top.
-    fn switch_threads_feed(&mut self) {
+    /// `:following` / `:for-you`: Threads' feed of the accounts followed,
+    /// newest first, or For you again, from the top; opened first if it
+    /// isn't.
+    fn show_threads_feed(&mut self, following: bool) {
+        let open = self
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.network == Network::Threads && f.linked.is_none());
+        if !open {
+            if self.chats.get(chats::THREADS_FEED).is_none() {
+                self.status = Some("Threads isn't logged in: :login logs in".into());
+                return;
+            }
+            // Its row, in Threads' tab when the list of every chat hasn't it.
+            self.chats.reveal(chats::THREADS_FEED);
+            self.open_chat(chats::THREADS_FEED);
+        }
         let picture = self.feed_picture(Network::Threads);
         let Some(feed) = self.feed.as_mut().filter(|f| f.network == Network::Threads) else {
-            self.status = Some("Only Threads has another feed to switch to".into());
             return;
         };
-        feed.following = !feed.following;
+        if feed.following == following {
+            if open {
+                let which = if following { "Following" } else { "For you" };
+                self.status = Some(format!("This is {which} already: r reloads it"));
+            }
+            return;
+        }
+        feed.following = following;
         // Whatever was on its way was the other feed's.
         feed.loading = None;
         if let Some(load) = feed.start_load(true) {
@@ -4586,6 +4619,7 @@ impl App {
             muted: false,
             position: None,
             duration: None,
+            full_screen: false,
         });
         // The helper answers at once if they're already downloaded.
         self.meta.download(file.id);
@@ -4749,6 +4783,7 @@ impl App {
             KeyCode::Char('.') => self.seek_video(player::SEEK_STEP),
             // The post is on the pane's left.
             KeyCode::Char('h') => self.comments_focus = false,
+            KeyCode::Char('f') => self.full_screen_video(),
             KeyCode::Esc | KeyCode::Char('c') => self.close_comments(),
             KeyCode::Char(c) if c == to_list => return false,
             KeyCode::Char('q' | '?' | ':' | 's') | KeyCode::Tab => return false,
@@ -4919,6 +4954,51 @@ impl App {
         }
     }
 
+    /// The video playing fills the window (`f`).
+    pub fn full_screen(&self) -> bool {
+        self.playing.as_ref().is_some_and(|p| p.full_screen)
+    }
+
+    /// `f`: the video under the cursor fills the window, playing as Enter
+    /// plays it (anywhere but Pepper, in the system's player, which has a
+    /// full screen of its own); `f` again puts it back over its post.
+    fn full_screen_video(&mut self) {
+        if let Some(playing) = self.playing.as_mut() {
+            playing.full_screen = !playing.full_screen;
+            return;
+        }
+        let video = self
+            .feed
+            .as_ref()
+            .and_then(|f| f.shown_item())
+            .is_some_and(|(_, item)| item.video);
+        if !video {
+            self.status = Some("No video here to play full screen".into());
+            return;
+        }
+        self.open_feed_item();
+        if let Some(playing) = self.playing.as_mut() {
+            playing.full_screen = true;
+        }
+    }
+
+    /// A key while the video fills the window: its own, and quitting, help
+    /// and commands; nothing else, since what it would act on is under the
+    /// video. False for those three, for Normal mode to take.
+    fn on_full_screen_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        match key.code {
+            _ if ctrl => {}
+            KeyCode::Char('f') | KeyCode::Esc => self.full_screen_video(),
+            KeyCode::Char(' ') => self.pause_video(),
+            KeyCode::Char('m') => self.mute_video(),
+            KeyCode::Char(',') => self.seek_video(-player::SEEK_STEP),
+            KeyCode::Char('.') => self.seek_video(player::SEEK_STEP),
+            KeyCode::Char('q' | '?' | ':') => return false,
+            _ => {}
+        }
+        true
+    }
+
     /// What to tell Pepper after a frame: where the video playing shows now
     /// (`OSC 777;pepper`), or that it's gone, if that changed. Under a
     /// popup, or with its post out of view, it's taken away: it would cover
@@ -5081,6 +5161,15 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         app.on_key(KeyEvent::new(code, modifiers));
+    }
+
+    /// Types `:name` and runs it.
+    fn command(app: &mut App, name: &str) {
+        press(app, KeyCode::Char(':'), KeyModifiers::NONE);
+        for c in name.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(app, KeyCode::Enter, KeyModifiers::NONE);
     }
 
     /// The screen's rows as text.
@@ -7835,6 +7924,100 @@ mod tests {
     }
 
     #[test]
+    fn f_plays_a_video_filling_the_window_and_again_puts_it_back_over_its_post() {
+        let mut app = test_app("feed-video-full-screen");
+        let none = KeyModifiers::NONE;
+        app.pepper = Some(Pepper {
+            port: "x.1".into(),
+            play: "/nonexistent/pepper-play".into(),
+        });
+        open_the_feed(&mut app);
+        feed_page(
+            &mut app,
+            vec![post(1, serde_json::json!({})), video_post(2)],
+            false,
+        );
+        // A photo has nothing to play.
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(app.playing.is_none());
+        assert!(app.status.take().unwrap().contains("No video here"));
+        press(&mut app, KeyCode::Char('j'), none);
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(app.full_screen(), "it plays at once, filling the window");
+        assert!(
+            sent_with(&app, "download")
+                .iter()
+                .any(|p| p["file_id"] == 7)
+        );
+        let rows = screen(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("Video loading…")),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("Instagram · Feed")),
+            "over the list and the feed: {rows:#?}"
+        );
+        // As if pepper-play started on the downloaded file.
+        let playing = app.playing.as_mut().unwrap();
+        let token = playing.token.clone();
+        playing.player = Some(Player::pretend(&token, Path::new("/data/7.mp4"), None, 1));
+        screen(&mut app);
+        let full = app.video_box.expect("its box");
+        // A tall video: every row but the seek bar's and the status bar.
+        assert_eq!((full.y, full.height), (0, 18));
+        assert_eq!(app.video_placement(), pepper::place(&token, full));
+        app.on_player(PlayerEvent::Duration {
+            play: 1,
+            seconds: 15.0,
+        });
+        app.on_player(PlayerEvent::Position {
+            play: 1,
+            seconds: 6.0,
+        });
+        let rows = screen(&mut app);
+        let bar = &rows[18];
+        assert!(
+            bar.contains("0:06 ━") && bar.contains("0:15") && bar.contains("playing"),
+            "{bar}"
+        );
+        // Its own keys work; what's under it waits.
+        press(&mut app, KeyCode::Char(' '), none);
+        assert!(app.playing.as_ref().unwrap().paused);
+        press(&mut app, KeyCode::Char('j'), none);
+        assert_eq!(app.feed.as_ref().unwrap().selected, 1, "still its post");
+        assert!(app.full_screen());
+        // A popup takes the box away until it closes.
+        press(&mut app, KeyCode::Char('?'), none);
+        screen(&mut app);
+        assert_eq!(app.video_placement(), pepper::remove(&token));
+        press(&mut app, KeyCode::Esc, none);
+        screen(&mut app);
+        assert_eq!(app.video_placement(), pepper::place(&token, full));
+        // `f` puts it back over its post, playing on: the box only moves.
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(!app.full_screen() && app.playing.is_some());
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("Instagram · Feed")));
+        let small = app.video_box.expect("its post is in view");
+        assert!(small.height < full.height);
+        assert_eq!(app.video_placement(), pepper::place(&token, small));
+        // So does Esc, without stopping it; from the comments too.
+        press(&mut app, KeyCode::Char('c'), none);
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(app.full_screen());
+        press(&mut app, KeyCode::Esc, none);
+        assert!(!app.full_screen() && app.playing.is_some());
+        assert!(app.comments.is_some(), "still open beside it");
+        // Gone with the video.
+        press(&mut app, KeyCode::Char('f'), none);
+        app.on_player(PlayerEvent::Exited { play: 1 });
+        assert!(!app.full_screen());
+        let rows = screen(&mut app);
+        assert!(rows.iter().any(|r| r.contains("Instagram · Feed")));
+    }
+
+    #[test]
     fn a_video_whose_sound_comes_apart_plays_once_both_are_downloaded_or_without_it() {
         let mut app = test_app("feed-video-sound");
         let none = KeyModifiers::NONE;
@@ -8219,7 +8402,7 @@ mod tests {
     }
 
     #[test]
-    fn threads_feed_opens_for_you_and_f_switches_to_the_accounts_followed() {
+    fn threads_feed_opens_for_you_and_following_switches_to_the_accounts_followed() {
         let mut app = test_app("threads-feed");
         open_threads(&mut app);
         let asked = sent_with(&app, "load_feed");
@@ -8247,7 +8430,7 @@ mod tests {
                 .any(|r| r.contains("12 likes · 3 replies · 2 reposts · 5 shares")),
             "{rows:#?}"
         );
-        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        command(&mut app, "following");
         let asked = sent_with(&app, "load_feed");
         let last = asked.last().unwrap();
         assert_eq!(
@@ -8268,11 +8451,40 @@ mod tests {
                 .any(|r| r.contains("Threads · Following"))
         );
         // Back to For you.
-        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        command(&mut app, "for-you");
         assert_eq!(
             sent_with(&app, "load_feed").last().unwrap()["feed"],
             "for_you"
         );
+    }
+
+    #[test]
+    fn following_and_for_you_open_threads_feed_from_anywhere() {
+        let mut app = test_app("threads-commands");
+        command(&mut app, "following");
+        assert!(
+            app.status
+                .take()
+                .unwrap()
+                .contains("Threads isn't logged in")
+        );
+        assert!(sent_with(&app, "load_feed").is_empty());
+        threads_in(&mut app);
+        // From the demo's open chat.
+        app.focus = Focus::Messages;
+        command(&mut app, "following");
+        assert!(app.open.is_none(), "in the chat's place");
+        let feed = app.feed.as_ref().expect("Threads' feed");
+        assert!(feed.network == Network::Threads && feed.following);
+        assert_eq!(app.selected, Some(chats::THREADS_FEED));
+        assert_eq!(
+            sent_with(&app, "load_feed").last().unwrap()["feed"],
+            "following"
+        );
+        let loads = sent_with(&app, "load_feed").len();
+        command(&mut app, "following");
+        assert!(app.status.take().unwrap().contains("Following already"));
+        assert_eq!(sent_with(&app, "load_feed").len(), loads, "nothing asked");
     }
 
     #[test]
@@ -8531,10 +8743,17 @@ mod tests {
             app.feed_link().map(|l| l.url),
             Some("https://www.threads.net/@maya.lens/post/C8xYz-1".to_string())
         );
+        // `f` is for a video, and this post has none.
         press(&mut app, KeyCode::Char('f'), none);
-        assert!(
-            sent_with(&app, "load_feed").is_empty(),
-            "f isn't for one post"
+        assert!(app.status.take().unwrap().contains("No video here"));
+        assert!(sent_with(&app, "load_feed").is_empty());
+        // `:following` goes on to the feed, the accounts followed.
+        command(&mut app, "following");
+        let feed = app.feed.as_ref().unwrap();
+        assert!(feed.linked.is_none() && feed.following);
+        assert_eq!(
+            sent_with(&app, "load_feed").last().unwrap()["feed"],
+            "following"
         );
     }
 

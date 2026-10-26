@@ -129,10 +129,11 @@ The status bar lists the keys for wherever you are, and `?` lists them all.
 | | `[` / `]` | The photo or video before / after in a carousel |
 | | `Enter` | Show the photo, or play the video (inside Pepper; elsewhere in your player); on a Threads post with a link's card, the link |
 | | `Space` / `m` | Pause / mute the video |
+| | `f` | Play the video filling the window (in Pepper), or put it back over its post; `Esc` too |
 | | `,` / `.` | Back / on 5 seconds (a seek bar shows under the video in Pepper) |
 | | `o` / `y` | Open the post on instagram.com or threads.com / copy its link |
 | | `r` | Reload, for the newest posts |
-| | `f` | Threads: For you, or Following (only the accounts you follow) |
+| | `:following` / `:for-you` | Threads: Following (only the accounts you follow), or For you again |
 | | `c` | The post's comments (Threads' replies), in a pane beside it while its video plays on (`Enter` shows a comment's replies, `y` copies one, `h` / `l` go between post and comments, `Esc` closes) |
 | | `Esc` | On a post a link opened: on to the feed (`Ctrl-o` goes back to the chat) |
 | Writing | `Enter` | Send |
@@ -161,6 +162,7 @@ Instagram's feed and comments aren't something Meta lets other apps use: tuimeta
 [Pepper](https://github.com/erictran308/pepper) is [Ghostty](https://ghostty.org) with one thing added: a program can show a video in a box of cells of its tab, straight from the graphics chip. In Pepper, `Enter` on a video plays it right over its post:
 
 - It loops, as Instagram plays it, with its sound. `Space` pauses it, `m` mutes it, `,` and `.` jump back and on 5 seconds, and a seek bar under it shows where it is. `Esc` stops it, and so does moving to another post.
+- `f` plays it filling the window instead, as large as its shape allows, with its seek bar along the bottom; `Space`, `m`, `,` and `.` work there too, and `f` or `Esc` puts it back over its post, still playing. Elsewhere `f` opens it in your player, like `Enter`.
 - It keeps playing with the post's comments open beside it. A popup (help, the chat finder, a warning) takes the picture away until it closes, so nothing is ever hidden under it.
 
 To use it:
@@ -176,7 +178,7 @@ In any other terminal you see each video's cover, with `▶` and its length, and
 
 When you're logged in to Threads, it has a tab of its own (and, if it's your only network, the list) with one row, **Feed**: Threads has no chats here. `Enter` opens it where a chat would open, laid out as threads.com lays it out.
 
-- **For you and Following.** It opens on For you, Threads' picks; `f` switches to Following, the accounts you follow, newest first, and back. `r` starts again from the newest.
+- **For you and Following.** It opens on For you, Threads' picks; `:following` switches to Following, the accounts you follow, newest first, and `:for-you` back (either opens Threads' feed from anywhere). `r` starts again from the newest.
 - **Posts** are one narrow column: the author's picture on the left, their username and when beside it, the text, then the photos and videos side by side (as many as fit whole, `+2` for the rest: `[` and `]` go through them), then likes, replies, reposts and shares. A post that quotes another shows it in a box, a link shows its card (its picture, title and where it goes, by host) in one too, and `Enter` on a post with a link and no photo opens the link, asking first if its address can pass for another site's. A thread of several posts is joined by a line down from the pictures; a repost says who reposted it.
 - **Replies:** `c` opens a post's replies in a pane beside it, top ones first, as Instagram's comments open; `Enter` shows a reply's own replies. A photo or video in a reply is only named.
 - **Videos** play in Pepper as Instagram's do.

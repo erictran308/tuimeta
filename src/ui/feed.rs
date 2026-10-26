@@ -2,19 +2,19 @@
 //! video (a carousel's one at a time), then its likes and comments and its
 //! caption. The selected post has a bar down its left and more of its
 //! caption. Inside Pepper, a video playing shows over its cover, in the box
-//! [`draw`] returns.
+//! [`draw`] returns, or filling the window ([`draw_full_screen`]).
 
 use chrono::{Datelike, Local, TimeZone};
 use ratatui::Frame;
-use ratatui::layout::{Margin, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
-use super::{border, bordered, truncate};
+use super::{Cover, border, bordered, truncate};
 use crate::feed::{self, Feed, Item, Post};
 use crate::images::Images;
 use crate::messages::{Preview, duration};
@@ -222,6 +222,71 @@ pub fn draw(
         }
     }
     video_box
+}
+
+/// The video playing, filling the window (`f`).
+pub struct FullScreen<'a> {
+    /// Its post's photo or video, whose shape it keeps.
+    pub item: Option<&'a Item>,
+    /// What it's doing: "playing", "paused"…
+    pub label: &'static str,
+    /// Where it is and how long it is, in seconds, once its player says.
+    pub progress: Option<(f64, f64)>,
+}
+
+/// Draws the video playing over all of `area`: its box as large as its
+/// shape allows, centered, with the seek bar and what it's doing on the
+/// last row. Returns the box, for Pepper; `None` with no room for one.
+pub fn draw_full_screen(
+    frame: &mut Frame,
+    area: Rect,
+    shown: FullScreen,
+    font: FontSize,
+    colors: &Colors,
+) -> Option<Rect> {
+    frame.render_widget(Cover, area);
+    frame.render_widget(
+        Block::new().style(Style::new().fg(colors.fg).bg(colors.bg)),
+        area,
+    );
+    let [room, last] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    if room.is_empty() {
+        return None;
+    }
+    let (cols, rows) = media_cells(shown.item, room.width, room.height, font);
+    let rows = rows.min(room.height);
+    let video = Rect::new(
+        room.x + (room.width - cols) / 2,
+        room.y + (room.height - rows) / 2,
+        cols,
+        rows,
+    );
+    // Under Pepper's box once it plays; seen while it loads, or when a
+    // popup takes the box away.
+    let middle = Rect {
+        y: video.y + video.height / 2,
+        height: 1,
+        ..video
+    };
+    frame.render_widget(
+        Line::from(format!("Video {}", shown.label))
+            .fg(colors.subtle)
+            .centered(),
+        middle,
+    );
+    // A column of room on each side, as under a post.
+    let bar = last.inner(Margin::new(1, 0));
+    let label = format!("  {}", shown.label);
+    let mut line = match shown.progress {
+        Some((position, length)) => {
+            let width = usize::from(bar.width).saturating_sub(label.width());
+            seek_bar(position, length, width, colors)
+        }
+        None => Line::default(),
+    };
+    line.push_span(Span::from(label).fg(colors.accent));
+    frame.render_widget(line.right_aligned(), bar);
+    Some(video)
 }
 
 /// What an empty feed's pane says: loading, why it didn't, or `nothing`.

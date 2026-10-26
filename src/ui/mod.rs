@@ -580,6 +580,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     };
 
     app.chat_area = chat_area;
+    // `f`: the video playing fills the window, over the list and the feed.
+    let full_screen = app.full_screen();
     let list = chat_list::ChatList {
         chats: &app.chats,
         users: &app.users,
@@ -590,6 +592,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
         // a toast only when the list is on the right, where toasts go.
         covered: app.settings_menu.is_some()
             || app.photo_view.is_some()
+            || full_screen
             || (app.toast.is_some() && app.settings.chat_list_side == Side::Right)
             || app
                 .prompt
@@ -703,7 +706,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                 let view = feed::View {
                     feed,
                     focused: app.focus == Focus::Messages && !in_comments,
-                    covered: popup_over_chat,
+                    covered: popup_over_chat || full_screen,
                     playing: app
                         .playing
                         .as_ref()
@@ -735,6 +738,21 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     }
     if app.feed.is_none() {
         app.video_box = None;
+    }
+    if full_screen && let Some(playing) = app.playing.as_ref() {
+        let item = app
+            .feed
+            .as_ref()
+            .and_then(|f| f.shown_item())
+            .map(|(_, item)| item)
+            .filter(|item| item.file.as_ref().is_some_and(|f| f.id == playing.file_id));
+        let shown = feed::FullScreen {
+            item,
+            label: playing.label(),
+            progress: playing.position.zip(playing.duration),
+        };
+        app.video_box = feed::draw_full_screen(frame, body, shown, app.images.font_size(), colors);
+        keys_in = None;
     }
     // Under the popups, drawn next. With one up, the keys are in it, and
     // where there's no pane to go round either, the lights stop rather
@@ -2153,6 +2171,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
             "  `h/l` older/newer photo · `j/k` zoom in/out · `o` open in its app · `y` copy · `Enter` or `Esc` close",
         ),
 
+        _ if app.full_screen() => (
+            normal,
+            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `f` or `Esc` back to the post · `?` help · `q` quit",
+        ),
         _ if app.picker.is_some() => (
             normal,
             "  type a name or username · `arrows` choose · `Enter` open · `Esc` cancel",
@@ -2171,19 +2193,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         ),
         Focus::Messages if app.comments.is_some() && app.comments_focus => (
             normal,
-            "  `j/k` move · `Enter` show or hide replies · `y` copy · `Space` pause · `,/.` seek · `m` mute · `h` the post · `g/G` first/last · `c` or `Esc` close",
+            "  `j/k` move · `Enter` show or hide replies · `y` copy · `Space` pause · `,/.` seek · `m` mute · `f` full screen · `h` the post · `g/G` first/last · `c` or `Esc` close",
         ),
         Focus::Messages if app.feed.is_some() && app.comments.is_some() => (
             normal,
-            "  `l` comments · `Space` pause · `,/.` seek · `m` mute · `[ ]` carousel · `Enter` photo or video · `c` close comments · `j/k` another post, closing them",
+            "  `l` comments · `Space` pause · `,/.` seek · `m` mute · `f` full screen · `[ ]` carousel · `Enter` photo or video · `c` close comments · `j/k` another post, closing them",
         ),
         Focus::Messages if app.feed.is_some() && app.playing.is_some() => (
             normal,
-            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `Esc` stop · `j/k` next/previous post · `[ ]` carousel · `o` open on the website · `h` back",
+            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `f` full screen · `Esc` stop · `j/k` next/previous post · `[ ]` carousel · `o` open on the website · `h` back",
         ),
         Focus::Messages if app.feed.as_ref().is_some_and(|f| f.linked.is_some()) => (
             normal,
-            "  `Esc` on to the feed · `Enter` photo, video or link · `[ ]` photos · `c` comments · `o` open on the website · `y` copy link · `r` reload · `Ctrl-o` back · `?` help · `q` quit",
+            "  `Esc` on to the feed · `Enter` photo, video or link · `f` video full screen · `[ ]` photos · `c` comments · `o` open on the website · `y` copy link · `r` reload · `Ctrl-o` back · `?` help · `q` quit",
         ),
         Focus::Messages
             if app
@@ -2193,12 +2215,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
         {
             (
                 normal,
-                "  `j/k` next/previous post · `[ ]` photos · `Enter` photo, video or link · `c` replies · `f` For you/Following · `o` open on threads.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `?` help · `q` quit",
+                "  `j/k` next/previous post · `[ ]` photos · `Enter` photo, video or link · `f` video full screen · `c` replies · `:following` / `:for-you` feeds · `o` open on threads.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `?` help · `q` quit",
             )
         }
         Focus::Messages if app.feed.is_some() => (
             normal,
-            "  `j/k` next/previous post · `[ ]` carousel · `Enter` photo or video · `o` open on instagram.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `s` find anyone · `:` commands · `?` help · `q` quit",
+            "  `j/k` next/previous post · `[ ]` carousel · `Enter` photo or video · `f` video full screen · `o` open on instagram.com · `y` copy link · `r` reload · `gg/G` top/bottom · `h` back · `s` find anyone · `:` commands · `?` help · `q` quit",
         ),
         Focus::Messages if editing => (
             normal,

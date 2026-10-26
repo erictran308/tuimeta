@@ -18,7 +18,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("?", "This help, and settings"),
             (
                 ":",
-                "Type a command: login (add a network, or log in again) or logout",
+                "Type a command (Tab completes): login, logout, following, for-you",
             ),
             (
                 "s",
@@ -105,10 +105,17 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Space / m", "Pause / mute the video playing"),
             (", / .", "Back / on 5 seconds in the video playing"),
             (
+                "f",
+                "The video, filling the window (inside Pepper); again to put it back",
+            ),
+            (
                 "o",
                 "Open the post on instagram.com or threads.com, to like or answer",
             ),
-            ("f", "Threads: For you, or the accounts you follow"),
+            (
+                ":following",
+                "Threads: only the accounts you follow (:for-you goes back)",
+            ),
             ("y", "Copy the post's link"),
             ("r", "Reload: the newest posts"),
             (
@@ -138,6 +145,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Pause / mute the post's video, playing beside them",
             ),
             (", / .", "Back / on 5 seconds in it"),
+            ("f", "Its video filling the window"),
             ("h", "Back to the post"),
             ("Esc / c", "Close them"),
         ],
