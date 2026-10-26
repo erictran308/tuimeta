@@ -38,21 +38,28 @@ const NAME: &str = " tuimeta ";
 /// border has room for them and the whole title, the mark alone where the
 /// name would cut the title, and no logo on a list too narrow for even
 /// that, since the title says what's listed.
-fn with_logo(title: String, width: u16, colors: &Colors) -> Line<'static> {
+fn with_logo(title: Vec<Span<'static>>, width: u16, colors: &Colors) -> Line<'static> {
     let room = usize::from(width.saturating_sub(2));
+    let title_width: usize = title.iter().map(Span::width).sum();
     let logo = Span::from(MARK).fg(colors.logo).bold();
     let mut spans = vec![Span::from(" ")];
-    if 1 + MARK.width() + NAME.width() + 2 + title.width() <= room {
+    if 1 + MARK.width() + NAME.width() + 2 + title_width <= room {
         spans.push(logo);
         spans.push(Span::from(NAME).fg(colors.fg).bold());
         spans.push(Span::from("· "));
-    } else if 1 + MARK.width() + 1 + title.width() <= room {
+    } else if 1 + MARK.width() + 1 + title_width <= room {
         spans.push(logo);
         spans.push(Span::from(" "));
     }
-    spans.push(Span::from(title));
+    spans.extend(title);
     Line::from(spans)
 }
+/// Before the count of unread messages in the title: Font Awesome's bell
+/// with a Nerd Font, else the emoji.
+const BELL: &str = "\u{f0f3}";
+const BELL_EMOJI: &str = "🔔";
+/// The most unread messages the title counts; more show as `999+`.
+const MAX_COUNTED: i64 = 999;
 /// After a muted chat's name.
 const MUTED: &str = " 🔕";
 /// A tab shows at most this many columns of its name.
@@ -79,17 +86,30 @@ pub fn draw(frame: &mut Frame, area: Rect, list: &ChatList, images: &mut Images,
         users: list.users,
         chats,
     };
-    let mut title = if filter.is_empty() {
-        format!("Chats ({}) ", chats.ids().len())
-    } else {
-        format!(
-            "Chats ({} of {}) /{filter} ",
-            chats.ids().len(),
-            chats.total()
-        )
+    let count = match filter.is_empty() {
+        true => format!("Chats ({}) ", chats.ids().len()),
+        false => format!("Chats ({} of {}) ", chats.ids().len(), chats.total()),
     };
+    let mut title = vec![Span::from(count)];
+    // Every network's, so news in a tab that isn't shown is seen too.
+    let unread = chats.unread_messages();
+    if unread > 0 {
+        let bell = if colors.pills { BELL } else { BELL_EMOJI };
+        let count = match unread {
+            ..=MAX_COUNTED => unread.to_string(),
+            _ => format!("{MAX_COUNTED}+"),
+        };
+        title.push(
+            Span::from(format!("{bell} {count} "))
+                .fg(colors.primary)
+                .bold(),
+        );
+    }
+    if !filter.is_empty() {
+        title.push(Span::from(format!("/{filter} ")));
+    }
     if list.loading {
-        title.push_str("loading… ");
+        title.push(Span::from("loading… "));
     }
     let block = super::bordered(colors)
         .title(with_logo(title, area.width, colors))
@@ -463,6 +483,53 @@ mod tests {
         assert!(rows[quiet].contains("Quiet 🔕"), "{rows:#?}");
         let x = rows[quiet].chars().position(|c| c == '4').unwrap() as u16;
         assert_eq!(buf[(x, quiet as u16)].bg, colors.muted, "a grey count");
+    }
+
+    #[test]
+    fn the_bell_over_the_list_counts_unread_messages_of_every_tab_but_muted_chats() {
+        let mut chats = Chats::default();
+        chats.add_local(1, "Friends", None).unread = 2;
+        chats.add_local(2, "Reels", None).unread = 3;
+        chats.place_local(2, Network::Instagram, false);
+        chats.add_local(3, "Old", None).unread = 1;
+        chats.place_local(3, Network::Messenger, true);
+        chats.add_local(4, "Quiet", None).unread = 50;
+        chats.set_muted(4, true);
+        // Messenger's tab, which lists neither Instagram's chat nor the
+        // archived one.
+        chats.show(chats::List::Network(Network::Messenger));
+        chats.refresh();
+        let top = |chats: &Chats, colors: &Colors| {
+            let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+            let mut images = images(ProtocolType::Halfblocks);
+            terminal
+                .draw(|f| draw(f, f.area(), &list(chats, None), &mut images, colors))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let row = cells(&buf, 0, 0, 50);
+            let bell = (0..50).find(|&x| [BELL, BELL_EMOJI].contains(&buf[(x, 0)].symbol()));
+            (row, bell.map(|x| buf[(x, 0)].fg))
+        };
+        let colors = Colors::default();
+        let (row, bell) = top(&chats, &colors);
+        assert!(row.contains("Chats (2) 🔔"), "{row}");
+        assert!(row.contains(" 6 "), "2 + 3 + 1, not the muted 50: {row}");
+        assert_eq!(bell, Some(colors.primary));
+        let nerd = Colors {
+            pills: true,
+            ..colors
+        };
+        let (row, _) = top(&chats, &nerd);
+        assert!(row.contains(&format!("Chats (2) {BELL} 6 ")), "{row}");
+        for id in [1, 2, 3] {
+            chats.set_unread(id, 0);
+        }
+        chats.set_unread(4, 2000);
+        let (row, bell) = top(&chats, &colors);
+        assert_eq!(bell, None, "nothing to hear: {row}");
+        chats.set_muted(4, false);
+        let (row, _) = top(&chats, &colors);
+        assert!(row.contains(" 999+ "), "{row}");
     }
 
     fn render(list: &ChatList, images: &mut Images, width: u16, height: u16) -> Buffer {

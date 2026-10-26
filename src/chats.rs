@@ -504,6 +504,16 @@ impl Chats {
             .count() as i32
     }
 
+    /// Unread messages in the unmuted chats of every list (each network's
+    /// and the archive), for the bell over the list.
+    pub fn unread_messages(&self) -> i64 {
+        self.by_id
+            .values()
+            .filter(|c| !c.muted)
+            .map(|c| i64::from(c.unread.max(0)))
+            .sum()
+    }
+
     pub fn set_my_id(&mut self, network: Network, id: i64) {
         self.my_ids.insert(network, id);
     }
