@@ -2178,7 +2178,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, colors: &Colors) {
 
         _ if app.full_screen() => (
             normal,
-            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `f` or `Esc` back to the post · `?` help · `q` quit",
+            "  `Space` pause · `,/.` back/on 5 s · `m` mute · `f` or `Esc` back to the post · `:` commands · `?` help · `q` quit",
         ),
         _ if app.picker.is_some() => (
             normal,
