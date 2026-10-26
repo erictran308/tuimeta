@@ -4201,27 +4201,29 @@ impl App {
         {
             return;
         }
-        let picture = self.feed_picture(network);
         // The chat, or the other network's feed, is kept as it was.
         self.leave_chat();
         let feed = match self.feeds_kept.remove(&network) {
             Some(feed) => feed,
-            None => {
-                let mut feed = Feed::new(network);
-                if let Some(load) = feed.start_load(false) {
-                    feed.request = Some(self.meta.load_feed(
-                        network,
-                        feed::PAGE,
-                        false,
-                        picture,
-                        feed.following,
-                        load,
-                    ));
-                }
-                feed
-            }
+            None => self.new_feed(network, false),
         };
         self.feed = Some(feed);
+    }
+
+    /// `network`'s feed, its first page asked for: Threads' of the accounts
+    /// followed, with `following`.
+    fn new_feed(&mut self, network: Network, following: bool) -> Feed {
+        let picture = self.feed_picture(network);
+        let mut feed = Feed::new(network);
+        feed.following = following;
+        if let Some(load) = feed.start_load(false) {
+            feed.request =
+                Some(
+                    self.meta
+                        .load_feed(network, feed::PAGE, false, picture, following, load),
+                );
+        }
+        feed
     }
 
     /// Enter on a link to an Instagram or Threads post: the post alone, in
@@ -4458,6 +4460,12 @@ impl App {
             if self.chats.get(chats::THREADS_FEED).is_none() {
                 self.status = Some("Threads isn't logged in: :login logs in".into());
                 return;
+            }
+            // Made here unless it was left, so the first page asked for is
+            // this one, not For you's, called off at once.
+            if !self.feeds_kept.contains_key(&Network::Threads) {
+                let feed = self.new_feed(Network::Threads, following);
+                self.feeds_kept.insert(Network::Threads, feed);
             }
             // Its row, in Threads' tab when the list of every chat hasn't it.
             self.chats.reveal(chats::THREADS_FEED);
@@ -4974,6 +4982,12 @@ impl App {
             .is_some_and(|(_, item)| item.video);
         if !video {
             self.status = Some("No video here to play full screen".into());
+            return;
+        }
+        // As Enter asks again, but for `f`, so the second one fills the
+        // window too.
+        if Self::feed_just_changed(&mut self.feed_changed, &mut self.status) {
+            self.status = Some("The feed just changed: press f again to play it".into());
             return;
         }
         self.open_feed_item();
@@ -7924,6 +7938,26 @@ mod tests {
     }
 
     #[test]
+    fn f_right_after_the_feed_changed_asks_for_f_again() {
+        let mut app = test_app("feed-full-screen-changed");
+        let none = KeyModifiers::NONE;
+        app.pepper = Some(Pepper {
+            port: "x.1".into(),
+            play: "/nonexistent/pepper-play".into(),
+        });
+        open_the_feed(&mut app);
+        feed_page(&mut app, vec![post(1, serde_json::json!({}))], true);
+        // A fresh page takes its place, a video now under the cursor.
+        press(&mut app, KeyCode::Char('r'), none);
+        feed_page(&mut app, vec![video_post(2)], false);
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(app.playing.is_none());
+        assert!(app.status.take().unwrap().contains("press f again"));
+        press(&mut app, KeyCode::Char('f'), none);
+        assert!(app.full_screen(), "the second fills the window");
+    }
+
+    #[test]
     fn f_plays_a_video_filling_the_window_and_again_puts_it_back_over_its_post() {
         let mut app = test_app("feed-video-full-screen");
         let none = KeyModifiers::NONE;
@@ -8477,11 +8511,14 @@ mod tests {
         let feed = app.feed.as_ref().expect("Threads' feed");
         assert!(feed.network == Network::Threads && feed.following);
         assert_eq!(app.selected, Some(chats::THREADS_FEED));
-        assert_eq!(
-            sent_with(&app, "load_feed").last().unwrap()["feed"],
-            "following"
+        let asked = sent_with(&app, "load_feed");
+        assert_eq!(asked.len(), 1, "only the page asked for: {asked:?}");
+        assert_eq!(asked[0]["feed"], "following");
+        assert!(
+            sent_with(&app, "cancel").is_empty(),
+            "no For you to call off"
         );
-        let loads = sent_with(&app, "load_feed").len();
+        let loads = asked.len();
         command(&mut app, "following");
         assert!(app.status.take().unwrap().contains("Following already"));
         assert_eq!(sent_with(&app, "load_feed").len(), loads, "nothing asked");

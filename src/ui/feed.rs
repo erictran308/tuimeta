@@ -253,7 +253,11 @@ pub fn draw_full_screen(
     if room.is_empty() {
         return None;
     }
-    let (cols, rows) = media_cells(shown.item, room.width, room.height, font);
+    let (cols, rows) = match shown.item {
+        Some(item) => media_cells(Some(item), room.width, room.height, font),
+        // Its shape unknown: all the room, which the player fills keeping it.
+        None => (room.width, room.height),
+    };
     let rows = rows.min(room.height);
     let video = Rect::new(
         room.x + (room.width - cols) / 2,
@@ -585,6 +589,47 @@ pub(super) fn draw_still(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_screen_a_video_keeps_its_shape_and_one_of_no_known_shape_takes_all_the_room() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let colors = Colors::default();
+        let font = FontSize::new(10, 20);
+        let mut terminal = Terminal::new(TestBackend::new(80, 21)).unwrap();
+        let mut draw = |item: Option<&Item>| {
+            let mut video = None;
+            terminal
+                .draw(|f| {
+                    let shown = FullScreen {
+                        item,
+                        label: "loading…",
+                        progress: None,
+                    };
+                    video = draw_full_screen(f, f.area(), shown, font, &colors);
+                })
+                .unwrap();
+            video
+        };
+        // A tall one: every row but the last, centered.
+        let tall = Item {
+            video: true,
+            still: Some(Preview {
+                file_id: 8,
+                width: 1080,
+                height: 1920,
+                thumbnail: None,
+                sticker: false,
+            }),
+            file: None,
+            audio: None,
+            duration: 15,
+        };
+        let video = draw(Some(&tall)).unwrap();
+        assert_eq!((video.y, video.height), (0, 20));
+        assert!(video.width < 80 && video.x == (80 - video.width) / 2);
+        assert_eq!(draw(None), Some(Rect::new(0, 0, 80, 20)));
+    }
 
     #[test]
     fn a_post_is_drawn_no_bigger_than_the_box_its_picture_is_asked_for_in() {
