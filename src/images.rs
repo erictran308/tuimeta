@@ -152,6 +152,11 @@ fn large(key: &Key) -> bool {
     u32::from(key.cols) * u32::from(key.rows) > LARGE_CELLS
 }
 
+/// The pixels `key`'s image takes, with cells of `font`'s size.
+fn pixels(key: &Key, font: FontSize) -> u64 {
+    u64::from(key.cols) * u64::from(font.width) * u64::from(key.rows) * u64::from(font.height)
+}
+
 thread_local! {
     /// Set while this thread decodes another user's image.
     static DECODING: Cell<bool> = const { Cell::new(false) };
@@ -331,9 +336,12 @@ pub struct Images {
     /// image at if it's to be made before it's drawn: see
     /// [`Images::prefetch`] and [`Images::prepare`].
     ahead: Vec<(Preview, Option<(u16, u16)>)>,
-    /// Images being made before they're drawn: once made, they count as
-    /// drawn before the last frame, so they never push out one on screen.
+    /// Images being made before they're drawn ([`Images::prepare`]).
     building_ahead: HashSet<Key>,
+    /// What the last frame drew, and what it asked to have made ahead and
+    /// there was room for: never pushed out, so nothing is made over and
+    /// over, each pushing out the last.
+    in_use: HashSet<Key>,
 }
 
 impl Images {
@@ -356,6 +364,7 @@ impl Images {
             wanted_avatars: Vec::new(),
             ahead: Vec::new(),
             building_ahead: HashSet::new(),
+            in_use: HashSet::new(),
         }
     }
 
@@ -544,6 +553,7 @@ impl Images {
     pub fn fetch(&mut self, meta: &Meta) {
         self.frame += 1;
         self.fetch_avatars(meta);
+        let mut in_use = HashSet::new();
         for (photo, cols, rows) in std::mem::take(&mut self.wanted) {
             let full = Key {
                 file_id: photo.file_id,
@@ -552,6 +562,13 @@ impl Images {
                 thumbnail: false,
                 avatar: false,
             };
+            in_use.insert(full);
+            if photo.thumbnail.is_some() {
+                in_use.insert(Key {
+                    thumbnail: true,
+                    ..full
+                });
+            }
             if self.ready.contains_key(&full) {
                 continue;
             }
@@ -576,34 +593,47 @@ impl Images {
                 self.build(key, move || Ok(decode_bytes(&data)?));
             }
         }
-        // Those to be made before they're drawn are made nearest first,
-        // leaving half the decoders free for what comes on screen meanwhile.
+        // Made before they're drawn only within the budget for large ones,
+        // what's on screen counted first, so what's made stays; nearest
+        // first, leaving half the decoders free for what comes on screen.
+        let font = self.picker.font_size();
+        let mut working: u64 = in_use
+            .iter()
+            .filter(|k| large(k))
+            .map(|k| pixels(k, font))
+            .sum();
         for (photo, size) in std::mem::take(&mut self.ahead) {
-            match self.files.get(&photo.file_id) {
-                Some(FileState::Ready(path)) => {
-                    let Some((cols, rows)) = size else {
-                        continue;
-                    };
-                    let key = sharp_key(&photo, cols, rows);
-                    if self.ready.contains_key(&key)
-                        || self.building.contains_key(&key)
-                        || self.building.len() >= MAX_BUILDING / 2
-                    {
-                        continue;
-                    }
-                    let path = path.clone();
-                    self.build_file(key, &photo, path);
-                    if self.building.contains_key(&key) {
-                        self.building_ahead.insert(key);
-                    }
+            self.files.entry(photo.file_id).or_insert_with(|| {
+                meta.download_quiet(photo.file_id);
+                FileState::Ahead
+            });
+            let Some((cols, rows)) = size else {
+                continue;
+            };
+            let key = sharp_key(&photo, cols, rows);
+            if in_use.contains(&key) || self.failed.contains(&key) {
+                continue;
+            }
+            if large(&key) {
+                if working + pixels(&key, font) > LARGE_PIXELS {
+                    continue;
                 }
-                Some(_) => {}
-                None => {
-                    meta.download_quiet(photo.file_id);
-                    self.files.insert(photo.file_id, FileState::Ahead);
+                working += pixels(&key, font);
+            }
+            in_use.insert(key);
+            if let Some(FileState::Ready(path)) = self.files.get(&photo.file_id)
+                && !self.ready.contains_key(&key)
+                && !self.building.contains_key(&key)
+                && self.building.len() < MAX_BUILDING / 2
+            {
+                let path = path.clone();
+                self.build_file(key, &photo, path);
+                if self.building.contains_key(&key) {
+                    self.building_ahead.insert(key);
                 }
             }
         }
+        self.in_use = in_use;
     }
 
     /// Makes the downloaded `photo`, at `path`, into an image of `key`'s
@@ -685,7 +715,10 @@ impl Images {
         let ahead = self.building_ahead.remove(&event.key);
         match event.result {
             Ok(image) if event.key.avatar => self.add_avatar(event.key, image),
-            Ok(image) => self.add_ready(event.key, image, ahead),
+            // Made ahead for what's no longer coming, as when the feed was
+            // left: it would only take memory.
+            Ok(_) if ahead && !self.in_use.contains(&event.key) => {}
+            Ok(image) => self.add_ready(event.key, image),
             Err(_) => {
                 self.failed.insert(event.key);
                 if !event.key.thumbnail {
@@ -695,47 +728,47 @@ impl Images {
         }
     }
 
-    fn add_ready(&mut self, key: Key, image: SlicedProtocol, ahead: bool) {
+    /// Keeps `image`, making room for it within [`LARGE_PIXELS`] and
+    /// [`MAX_READY`] from the least recently drawn, but never from what's in
+    /// use: that would be wanted again at once, made again and push out
+    /// another, without end. What's in use may go past the budget.
+    fn add_ready(&mut self, key: Key, image: SlicedProtocol) {
         let font = self.picker.font_size();
-        let pixels = |key: &Key| {
-            u64::from(key.cols)
-                * u64::from(font.width)
-                * u64::from(key.rows)
-                * u64::from(font.height)
-        };
         if large(&key) {
-            let mut kept: u64 = self.ready.keys().filter(|k| large(k)).map(pixels).sum();
-            while kept + pixels(&key) > LARGE_PIXELS
-                && let Some(oldest) = self
-                    .ready
-                    .iter()
-                    .filter(|(k, _)| large(k))
-                    .min_by_key(|(_, e)| e.used)
-                    .map(|(&k, _)| k)
+            let mut kept: u64 = self
+                .ready
+                .keys()
+                .filter(|k| large(k))
+                .map(|k| pixels(k, font))
+                .sum();
+            while kept + pixels(&key, font) > LARGE_PIXELS
+                && let Some(oldest) = self.oldest(true)
             {
                 self.ready.remove(&oldest);
-                kept -= pixels(&oldest);
+                kept -= pixels(&oldest, font);
             }
         }
         if self.ready.len() >= MAX_READY
-            && let Some(oldest) = self
-                .ready
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(&k, _)| k)
+            && let Some(oldest) = self.oldest(false)
         {
             self.ready.remove(&oldest);
         }
         let encoded = Encoded {
             image,
-            // The last frame's were drawn at `frame - 1`.
-            used: match ahead {
-                true => self.frame.saturating_sub(2),
-                false => self.frame,
-            },
+            used: self.frame,
             shown: false,
         };
         self.ready.insert(key, encoded);
+    }
+
+    /// The least recently drawn image kept that isn't in use; with
+    /// `only_large`, of the large ones.
+    fn oldest(&self, only_large: bool) -> Option<Key> {
+        self.ready
+            .iter()
+            .filter(|(k, _)| !self.in_use.contains(k) && (!only_large || large(k)))
+            .min_by_key(|(_, e)| e.used)
+            .map(|(&k, _)| k)
     }
 
     fn add_avatar(&mut self, key: Key, image: SlicedProtocol) {
@@ -760,6 +793,8 @@ impl Images {
     /// downloads stay.
     pub fn clear(&mut self) {
         self.ready.clear();
+        // Nothing made ahead for what was left is kept when it's done.
+        self.in_use.clear();
     }
 
     /// Forgets every picture and where each downloaded file is, as when a
@@ -839,15 +874,8 @@ impl Images {
         if key.avatar {
             self.add_avatar(key, image);
         } else {
-            self.add_ready(key, image, false);
+            self.add_ready(key, image);
         }
-    }
-
-    #[cfg(test)]
-    pub fn insert_ahead(&mut self, key: Key, image: image::DynamicImage) {
-        let size = Size::new(key.cols, key.rows);
-        let image = SlicedProtocol::new_with_resize(&self.picker, image, size, RESIZE).unwrap();
-        self.add_ready(key, image, true);
     }
 }
 
@@ -1109,10 +1137,13 @@ mod tests {
         assert_eq!(small, 15, "bubbles' photos aren't touched");
     }
 
-    #[test]
-    fn a_photo_made_ahead_never_pushes_out_the_one_on_screen() {
-        let tx = tokio::sync::mpsc::unbounded_channel().0;
-        let mut images = Images::new(Picker::halfblocks(), tx);
+    #[tokio::test]
+    async fn what_is_in_use_is_never_pushed_out_and_what_is_ahead_waits_for_room() {
+        let mut images = Images::new(
+            Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let meta = Meta::detached(tokio::sync::mpsc::unbounded_channel().0);
         let at = |file_id| Key {
             file_id,
             cols: 200,
@@ -1120,21 +1151,52 @@ mod tests {
             thumbnail: false,
             avatar: false,
         };
-        let photo = Preview {
+        let photo = |file_id| Preview {
             width: 2000,
             height: 1000,
-            ..preview(0)
+            ..preview(file_id)
         };
-        images.insert_ready(at(0), image::RgbImage::new(4, 4).into());
-        // Drawn in a frame, then the next ones made after it.
-        images.frame += 1;
-        assert!(images.get(&photo, 200, 50, false).is_some());
-        images.frame += 1;
-        for file_id in 1..8 {
-            images.insert_ahead(at(file_id), image::RgbImage::new(4, 4).into());
+        let made = || image::RgbImage::new(4, 4).into();
+        // Six on screen, two megapixels each at halfblocks' 10 × 20 px
+        // cells: past the budget, and all kept, since each would be wanted
+        // again at once and push out another.
+        for id in 0..6 {
+            images.want(&photo(id), 200, 50);
         }
-        assert!(images.ready.contains_key(&at(0)), "on screen, it stays");
+        images.fetch(&meta);
+        for id in 0..6 {
+            images.insert_ready(at(id), made());
+        }
+        assert_eq!(images.ready.len(), 6);
+        // No room: nothing is made ahead, though its file is there.
+        images.on_downloaded(9, Some("/data/helper/files/9.jpg".into()));
+        for id in 0..6 {
+            images.want(&photo(id), 200, 50);
+        }
+        images.prepare(&photo(9), 200, 50);
+        images.fetch(&meta);
+        assert!(images.building.is_empty());
+        // Once they're off screen, the oldest go for what comes next.
+        images.want(&photo(6), 200, 50);
+        images.fetch(&meta);
+        images.insert_ready(at(6), made());
         assert_eq!(images.ready.len(), 5, "the budget's worth");
+        assert!(images.ready.contains_key(&at(6)));
+        // With room, the one ahead is made; done after it was left, it
+        // isn't kept.
+        images.want(&photo(6), 200, 50);
+        images.prepare(&photo(9), 200, 50);
+        images.fetch(&meta);
+        assert!(images.building_ahead.contains(&at(9)));
+        images.clear();
+        let size = Size::new(200, 50);
+        let image = SlicedProtocol::new_with_resize(&images.picker, made(), size, RESIZE);
+        images.on_built(ImageEvent {
+            key: at(9),
+            generation: images.generation,
+            result: Ok(image.unwrap()),
+        });
+        assert!(images.ready.is_empty());
     }
 
     #[tokio::test]

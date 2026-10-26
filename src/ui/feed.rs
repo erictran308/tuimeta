@@ -294,9 +294,9 @@ pub fn draw_full_screen(
     let bar = last.inner(Margin::new(1, 0));
     let (said, color) = match shown.toast {
         Some((title, detail)) => {
-            let room = usize::from(bar.width / 2).saturating_sub(title.width() + 5);
-            let detail = truncate(detail, room);
-            (format!("  ✓ {title} {detail}"), colors.success)
+            let toast = format!("✓ {title} {detail}");
+            let toast = truncate(&toast, usize::from(bar.width / 2));
+            (format!("  {toast}"), colors.success)
         }
         None => (format!("  {}", shown.label), colors.accent),
     };

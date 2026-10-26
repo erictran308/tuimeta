@@ -205,16 +205,27 @@ pub fn draw(
         y = y.saturating_add(total);
         i += 1;
     }
-    // The next posts' pictures, every one of them, download before they're
-    // in view, and the nearest few posts' are made into images at the size
-    // they'll be drawn (feed::AHEAD, feed::MADE_AHEAD).
+    // The next posts' pictures download before they're in view, and the
+    // nearest few posts' are made into images at the size they'll be drawn
+    // (feed::AHEAD, feed::MADE_AHEAD): every picture of those, laid out, and
+    // of the rest only the photo shown and the author's, without laying
+    // them out every frame.
     let ahead = (feed.selected + 1..feed.posts.len()).take(feed::AHEAD);
     for (n, i) in ahead.enumerate() {
-        for picture in lay(feed, i).pictures {
-            match n < feed::MADE_AHEAD {
-                true => images.prepare(&picture.still, picture.cols, picture.rows),
-                false => images.prefetch(&picture.still),
+        if n < feed::MADE_AHEAD {
+            for picture in lay(feed, i).pictures {
+                images.prepare(&picture.still, picture.cols, picture.rows);
             }
+            continue;
+        }
+        let post = &feed.posts[i];
+        let item = post.media.get(feed.shown_index(post));
+        for still in item
+            .and_then(|it| it.still.as_ref())
+            .into_iter()
+            .chain(post.avatar.as_ref())
+        {
+            images.prefetch(still);
         }
     }
     if i == feed.posts.len() && y < inner.height {
