@@ -82,7 +82,7 @@ pub fn draw(
     if feed.posts.is_empty() {
         let what = empty_feed(
             feed,
-            "Nothing in the feed yet\nf switches between For you and Following",
+            "Nothing in the feed yet\n:following and :for-you switch between the feeds",
         );
         let rows = what.lines().count() as u16;
         let middle = Rect {
@@ -205,16 +205,16 @@ pub fn draw(
         y = y.saturating_add(total);
         i += 1;
     }
-    // The next posts' pictures download before they're in view
-    // (feed::AHEAD).
-    for post in feed.posts.iter().skip(feed.selected + 1).take(feed::AHEAD) {
-        let item = post.media.get(feed.shown_index(post));
-        for still in item
-            .and_then(|it| it.still.as_ref())
-            .into_iter()
-            .chain(post.avatar.as_ref())
-        {
-            images.prefetch(still);
+    // The next posts' pictures, every one of them, download before they're
+    // in view, and the nearest few posts' are made into images at the size
+    // they'll be drawn (feed::AHEAD, feed::MADE_AHEAD).
+    let ahead = (feed.selected + 1..feed.posts.len()).take(feed::AHEAD);
+    for (n, i) in ahead.enumerate() {
+        for picture in lay(feed, i).pictures {
+            match n < feed::MADE_AHEAD {
+                true => images.prepare(&picture.still, picture.cols, picture.rows),
+                false => images.prefetch(&picture.still),
+            }
         }
     }
     if i == feed.posts.len() && y < inner.height {

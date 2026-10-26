@@ -750,6 +750,10 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
             item,
             label: playing.label(),
             progress: playing.position.zip(playing.duration),
+            toast: app
+                .toast
+                .as_ref()
+                .map(|t| (t.title.as_str(), t.detail.as_str())),
         };
         app.video_box = feed::draw_full_screen(frame, body, shown, app.images.font_size(), colors);
         keys_in = None;
@@ -839,7 +843,8 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
     if let (Some(elapsed), Some(under)) = (fading, under) {
         motion::fade_in(frame.buffer_mut(), &under, elapsed);
     }
-    if let Some(toast) = &app.toast {
+    // Full screen says it on the seek bar's row instead.
+    if let Some(toast) = app.toast.as_ref().filter(|_| !full_screen) {
         let out = match app.slides_toast() {
             true => crate::motion::toast_out(toast.shown, toast.until, now),
             false => 0.0,

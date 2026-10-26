@@ -202,11 +202,20 @@ pub fn draw(
         y = y.saturating_add(total);
         i += 1;
     }
-    // The next posts' photos download before they're in view (feed::AHEAD).
-    for post in feed.posts.iter().skip(feed.selected + 1).take(feed::AHEAD) {
+    // The next posts' photos download before they're in view, and the
+    // nearest few are made into images at the size they'll be drawn
+    // (feed::AHEAD, feed::MADE_AHEAD).
+    let ahead = feed.posts.iter().skip(feed.selected + 1).take(feed::AHEAD);
+    for (n, post) in ahead.enumerate() {
         let item = post.media.get(feed.shown_index(post));
         if let Some(still) = item.and_then(|it| it.still.as_ref()) {
-            images.prefetch(still);
+            match n < feed::MADE_AHEAD {
+                true => {
+                    let (cols, rows) = media_cells(item, width, max_rows, font);
+                    images.prepare(still, cols, rows);
+                }
+                false => images.prefetch(still),
+            }
         }
     }
     if i == feed.posts.len() && y < inner.height {
@@ -232,6 +241,9 @@ pub struct FullScreen<'a> {
     pub label: &'static str,
     /// Where it is and how long it is, in seconds, once its player says.
     pub progress: Option<(f64, f64)>,
+    /// The toast's title and detail, said on the seek bar's row instead of
+    /// over the video, which would hide it.
+    pub toast: Option<(&'a str, &'a str)>,
 }
 
 /// Draws the video playing over all of `area`: its box as large as its
@@ -280,15 +292,22 @@ pub fn draw_full_screen(
     );
     // A column of room on each side, as under a post.
     let bar = last.inner(Margin::new(1, 0));
-    let label = format!("  {}", shown.label);
+    let (said, color) = match shown.toast {
+        Some((title, detail)) => {
+            let room = usize::from(bar.width / 2).saturating_sub(title.width() + 5);
+            let detail = truncate(detail, room);
+            (format!("  ✓ {title} {detail}"), colors.success)
+        }
+        None => (format!("  {}", shown.label), colors.accent),
+    };
     let mut line = match shown.progress {
         Some((position, length)) => {
-            let width = usize::from(bar.width).saturating_sub(label.width());
+            let width = usize::from(bar.width).saturating_sub(said.width());
             seek_bar(position, length, width, colors)
         }
         None => Line::default(),
     };
-    line.push_span(Span::from(label).fg(colors.accent));
+    line.push_span(Span::from(said).fg(color));
     frame.render_widget(line.right_aligned(), bar);
     Some(video)
 }
@@ -605,6 +624,7 @@ mod tests {
                         item,
                         label: "loading…",
                         progress: None,
+                        toast: None,
                     };
                     video = draw_full_screen(f, f.area(), shown, font, &colors);
                 })

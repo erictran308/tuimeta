@@ -138,13 +138,15 @@ impl Drop for Running {
 /// Encoded photos kept for the open chat; the least recently drawn go first.
 const MAX_READY: usize = 200;
 
-/// More cells than any photo in a bubble (40 × 16): only the photo viewer
-/// asks for photos this big.
+/// More cells than any photo in a bubble (40 × 16): the photo viewer's, and
+/// the feed's.
 const LARGE_CELLS: u32 = 40 * 16;
 
-/// Of those, at most this many are kept. Each can take tens of MB (kitty's
-/// keeps all it sent), and the viewer shows one at a time.
-const MAX_LARGE: usize = 4;
+/// Of those, only this many pixels' worth are kept, always the newest: each
+/// pixel takes four bytes and more (kitty's keeps all it sent). That's the
+/// feed's posts in view and the few made ahead, or one or two of the
+/// viewer's window-sized photos.
+const LARGE_PIXELS: u64 = 10_000_000;
 
 fn large(key: &Key) -> bool {
     u32::from(key.cols) * u32::from(key.rows) > LARGE_CELLS
@@ -325,8 +327,13 @@ pub struct Images {
     wanted: Vec<(Preview, u16, u16)>,
     /// Chat photos the last frame showed, with their size.
     wanted_avatars: Vec<(ChatPhoto, u16, u16)>,
-    /// Photos about to come into view, by file id: see [`Images::prefetch`].
-    ahead: Vec<i32>,
+    /// Photos about to come into view, with the size to make each into an
+    /// image at if it's to be made before it's drawn: see
+    /// [`Images::prefetch`] and [`Images::prepare`].
+    ahead: Vec<(Preview, Option<(u16, u16)>)>,
+    /// Images being made before they're drawn: once made, they count as
+    /// drawn before the last frame, so they never push out one on screen.
+    building_ahead: HashSet<Key>,
 }
 
 impl Images {
@@ -348,6 +355,7 @@ impl Images {
             wanted: Vec::new(),
             wanted_avatars: Vec::new(),
             ahead: Vec::new(),
+            building_ahead: HashSet::new(),
         }
     }
 
@@ -407,6 +415,7 @@ impl Images {
         self.ready.clear();
         self.avatars.clear();
         self.building.clear();
+        self.building_ahead.clear();
         true
     }
 
@@ -483,10 +492,16 @@ impl Images {
 
     /// Called while drawing, for a photo about to come into view, such as
     /// the next posts' in the feed: its file downloads now, behind the ones
-    /// on screen, so it's there once it's drawn. Only drawing makes it into
-    /// an image, so the ones kept stay the ones shown.
+    /// on screen, so it's there once it's drawn.
     pub fn prefetch(&mut self, photo: &Preview) {
-        self.ahead.push(photo.file_id);
+        self.ahead.push((photo.clone(), None));
+    }
+
+    /// Like [`prefetch`](Self::prefetch), for a photo coming into view next:
+    /// once downloaded, it's made into an image at `cols` × `rows` while a
+    /// decoder is free for it, so it's there as soon as it's drawn.
+    pub fn prepare(&mut self, photo: &Preview, cols: u16, rows: u16) {
+        self.ahead.push((photo.clone(), Some((cols, rows))));
     }
 
     /// The best chat photo ready to draw, as for [`get`](Self::get). While
@@ -543,12 +558,7 @@ impl Images {
             match self.files.get(&photo.file_id) {
                 Some(FileState::Ready(path)) => {
                     let path = path.clone();
-                    let limits = if photo.sticker {
-                        sized(STICKER_SIDE)
-                    } else {
-                        limits()
-                    };
-                    self.build(full, move || Ok(open_within(&path, limits)?));
+                    self.build_file(full, &photo, path);
                 }
                 Some(FileState::Downloading | FileState::Failed) => {}
                 // One asked for ahead is on screen now: it goes before the
@@ -566,12 +576,45 @@ impl Images {
                 self.build(key, move || Ok(decode_bytes(&data)?));
             }
         }
-        for file_id in std::mem::take(&mut self.ahead) {
-            self.files.entry(file_id).or_insert_with(|| {
-                meta.download_quiet(file_id);
-                FileState::Ahead
-            });
+        // Those to be made before they're drawn are made nearest first,
+        // leaving half the decoders free for what comes on screen meanwhile.
+        for (photo, size) in std::mem::take(&mut self.ahead) {
+            match self.files.get(&photo.file_id) {
+                Some(FileState::Ready(path)) => {
+                    let Some((cols, rows)) = size else {
+                        continue;
+                    };
+                    let key = sharp_key(&photo, cols, rows);
+                    if self.ready.contains_key(&key)
+                        || self.building.contains_key(&key)
+                        || self.building.len() >= MAX_BUILDING / 2
+                    {
+                        continue;
+                    }
+                    let path = path.clone();
+                    self.build_file(key, &photo, path);
+                    if self.building.contains_key(&key) {
+                        self.building_ahead.insert(key);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    meta.download_quiet(photo.file_id);
+                    self.files.insert(photo.file_id, FileState::Ahead);
+                }
+            }
         }
+    }
+
+    /// Makes the downloaded `photo`, at `path`, into an image of `key`'s
+    /// size.
+    fn build_file(&mut self, key: Key, photo: &Preview, path: String) {
+        let limits = if photo.sticker {
+            sized(STICKER_SIDE)
+        } else {
+            limits()
+        };
+        self.build(key, move || Ok(open_within(&path, limits)?));
     }
 
     fn fetch_avatars(&mut self, meta: &Meta) {
@@ -639,9 +682,10 @@ impl Images {
             return;
         }
         self.building.remove(&event.key);
+        let ahead = self.building_ahead.remove(&event.key);
         match event.result {
             Ok(image) if event.key.avatar => self.add_avatar(event.key, image),
-            Ok(image) => self.add_ready(event.key, image),
+            Ok(image) => self.add_ready(event.key, image, ahead),
             Err(_) => {
                 self.failed.insert(event.key);
                 if !event.key.thumbnail {
@@ -651,17 +695,27 @@ impl Images {
         }
     }
 
-    fn add_ready(&mut self, key: Key, image: SlicedProtocol) {
-        while large(&key)
-            && self.ready.keys().filter(|k| large(k)).count() >= MAX_LARGE
-            && let Some(oldest) = self
-                .ready
-                .iter()
-                .filter(|(k, _)| large(k))
-                .min_by_key(|(_, e)| e.used)
-                .map(|(&k, _)| k)
-        {
-            self.ready.remove(&oldest);
+    fn add_ready(&mut self, key: Key, image: SlicedProtocol, ahead: bool) {
+        let font = self.picker.font_size();
+        let pixels = |key: &Key| {
+            u64::from(key.cols)
+                * u64::from(font.width)
+                * u64::from(key.rows)
+                * u64::from(font.height)
+        };
+        if large(&key) {
+            let mut kept: u64 = self.ready.keys().filter(|k| large(k)).map(pixels).sum();
+            while kept + pixels(&key) > LARGE_PIXELS
+                && let Some(oldest) = self
+                    .ready
+                    .iter()
+                    .filter(|(k, _)| large(k))
+                    .min_by_key(|(_, e)| e.used)
+                    .map(|(&k, _)| k)
+            {
+                self.ready.remove(&oldest);
+                kept -= pixels(&oldest);
+            }
         }
         if self.ready.len() >= MAX_READY
             && let Some(oldest) = self
@@ -674,7 +728,11 @@ impl Images {
         }
         let encoded = Encoded {
             image,
-            used: self.frame,
+            // The last frame's were drawn at `frame - 1`.
+            used: match ahead {
+                true => self.frame.saturating_sub(2),
+                false => self.frame,
+            },
             shown: false,
         };
         self.ready.insert(key, encoded);
@@ -714,6 +772,7 @@ impl Images {
         self.ready.clear();
         self.avatars.clear();
         self.building.clear();
+        self.building_ahead.clear();
         self.failed.clear();
         self.files.clear();
     }
@@ -731,11 +790,12 @@ impl Images {
         };
         // One that never finishes mustn't hold its place for good: it counts
         // as failed, and the others get their turn.
-        let failed = &mut self.failed;
+        let (failed, ahead) = (&mut self.failed, &mut self.building_ahead);
         self.building.retain(|&key, started| {
             let alive = started.elapsed() < BUILD_TIMEOUT;
             if !alive {
                 failed.insert(key);
+                ahead.remove(&key);
             }
             alive
         });
@@ -779,8 +839,15 @@ impl Images {
         if key.avatar {
             self.add_avatar(key, image);
         } else {
-            self.add_ready(key, image);
+            self.add_ready(key, image, false);
         }
+    }
+
+    #[cfg(test)]
+    pub fn insert_ahead(&mut self, key: Key, image: image::DynamicImage) {
+        let size = Size::new(key.cols, key.rows);
+        let image = SlicedProtocol::new_with_resize(&self.picker, image, size, RESIZE).unwrap();
+        self.add_ready(key, image, true);
     }
 }
 
@@ -1019,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_few_window_sized_photos_are_kept() {
+    fn large_photos_are_kept_within_a_budget_of_pixels() {
         let tx = tokio::sync::mpsc::unbounded_channel().0;
         let mut images = Images::new(Picker::halfblocks(), tx);
         let at = |file_id, cols| Key {
@@ -1029,14 +1096,45 @@ mod tests {
             thumbnail: false,
             avatar: false,
         };
-        for file_id in 0..10 {
+        // Two megapixels each, at halfblocks' 10 × 20 px cells: five fit.
+        for file_id in 0..15 {
+            images.frame += 1;
             images.insert_ready(at(file_id, 4), image::RgbImage::new(4, 4).into());
             images.insert_ready(at(file_id, 200), image::RgbImage::new(4, 4).into());
         }
-        let large = images.ready.keys().filter(|k| k.cols == 200).count();
-        assert_eq!(large, MAX_LARGE);
+        let large = images.ready.keys().filter(|k| k.cols == 200);
+        assert_eq!(large.clone().count(), 5);
+        assert!(large.clone().all(|k| k.file_id >= 10), "the oldest went");
         let small = images.ready.keys().filter(|k| k.cols == 4).count();
-        assert_eq!(small, 10, "bubbles' photos aren't touched");
+        assert_eq!(small, 15, "bubbles' photos aren't touched");
+    }
+
+    #[test]
+    fn a_photo_made_ahead_never_pushes_out_the_one_on_screen() {
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut images = Images::new(Picker::halfblocks(), tx);
+        let at = |file_id| Key {
+            file_id,
+            cols: 200,
+            rows: 50,
+            thumbnail: false,
+            avatar: false,
+        };
+        let photo = Preview {
+            width: 2000,
+            height: 1000,
+            ..preview(0)
+        };
+        images.insert_ready(at(0), image::RgbImage::new(4, 4).into());
+        // Drawn in a frame, then the next ones made after it.
+        images.frame += 1;
+        assert!(images.get(&photo, 200, 50, false).is_some());
+        images.frame += 1;
+        for file_id in 1..8 {
+            images.insert_ahead(at(file_id), image::RgbImage::new(4, 4).into());
+        }
+        assert!(images.ready.contains_key(&at(0)), "on screen, it stays");
+        assert_eq!(images.ready.len(), 5, "the budget's worth");
     }
 
     #[tokio::test]
@@ -1057,8 +1155,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn a_photo_coming_up_downloads_behind_the_others_until_it_is_drawn() {
+    #[tokio::test]
+    async fn a_photo_coming_up_downloads_behind_the_others_then_is_made_ready() {
         let mut images = Images::new(
             Picker::halfblocks(),
             tokio::sync::mpsc::unbounded_channel().0,
@@ -1082,11 +1180,29 @@ mod tests {
         images.want(&preview(2), 4, 2);
         images.fetch(&meta);
         assert_eq!(downloads()[2], "2 high", "on screen now: it goes first");
-        images.on_downloaded(3, Some("/data/helper/files/3.jpg".into()));
-        images.prefetch(&preview(3));
+        // Downloaded, one only fetched isn't made into an image until it's
+        // drawn; one coming next is, nearest first, leaving half the
+        // decoders for what comes on screen.
+        images.on_downloaded(7, Some("/data/helper/files/7.jpg".into()));
+        images.prefetch(&preview(7));
+        for id in 3..=5 {
+            images.on_downloaded(id, Some(format!("/data/helper/files/{id}.jpg")));
+            images.prepare(&preview(id), 4, 2);
+        }
         images.fetch(&meta);
-        assert!(images.building.is_empty(), "only drawing makes an image");
+        assert!(!images.building.contains_key(&key(7)));
         assert_eq!(downloads().len(), 3);
+        assert!(images.building_ahead.contains(&key(3)));
+        assert!(images.building_ahead.contains(&key(4)));
+        assert_eq!(images.building.len(), MAX_BUILDING / 2);
+        images.on_downloaded(6, Some("/data/helper/files/6.jpg".into()));
+        images.want(&preview(6), 4, 2);
+        images.fetch(&meta);
+        assert!(
+            images.building.contains_key(&key(6)),
+            "one on screen still starts"
+        );
+        assert!(!images.building_ahead.contains(&key(6)));
     }
 
     #[test]

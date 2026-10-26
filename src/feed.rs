@@ -18,10 +18,17 @@ use crate::text;
 
 /// Posts asked for at a time.
 pub const PAGE: i32 = 10;
-/// Posts after the selected one kept ready: within this many of the last
-/// one loaded, the next page is asked for, and their photos download before
-/// they're in view (`ui::feed::draw`), so moving on doesn't wait.
-pub const AHEAD: usize = 5;
+/// Within this many posts of the last one loaded, the next page is asked
+/// for, so moving on doesn't wait; not sooner, since the feed is loaded
+/// only as it's read.
+pub const MORE_WITHIN: usize = 5;
+/// Posts after the selected one whose pictures download before they're in
+/// view (`ui::feed::draw`), of those loaded: files, which take no memory.
+pub const AHEAD: usize = 10;
+/// Of those, the posts whose pictures are also made into images before
+/// they're in view: few, since each takes memory, but enough for the next
+/// post's to be there when `j` gets to it.
+pub const MADE_AHEAD: usize = 3;
 /// A caption is cut after this many characters, which is what Instagram
 /// allows.
 const MAX_CAPTION: usize = 2200;
@@ -444,7 +451,7 @@ impl Feed {
         self.has_more
             && self.loading.is_none()
             && self.error.is_none()
-            && self.selected + AHEAD >= self.posts.len()
+            && self.selected + MORE_WITHIN >= self.posts.len()
     }
 
     /// The answer to load `load`. A fresh one takes the place of what was
@@ -747,7 +754,7 @@ pub(crate) mod tests {
         feed.move_cursor(1);
         assert!(!feed.wants_more());
         feed.move_cursor(1);
-        assert!(feed.wants_more(), "within {AHEAD} of the end");
+        assert!(feed.wants_more(), "within {MORE_WITHIN} of the end");
         let second = feed.start_load(false).unwrap();
         feed.on_page(
             second,

@@ -4568,7 +4568,11 @@ impl App {
         let Some((post, item)) = feed.shown_item() else {
             match card {
                 Some(link)
-                    if !Self::feed_just_changed(&mut self.feed_changed, &mut self.status) =>
+                    if !Self::feed_just_changed(
+                        &mut self.feed_changed,
+                        &mut self.status,
+                        "Enter",
+                    ) =>
                 {
                     self.open_link_outside(link)
                 }
@@ -4579,7 +4583,7 @@ impl App {
         };
         // The posts were replaced a moment ago, maybe just as the key went
         // down: the one under the cursor isn't what the user meant to open.
-        if Self::feed_just_changed(&mut self.feed_changed, &mut self.status) {
+        if Self::feed_just_changed(&mut self.feed_changed, &mut self.status, "Enter") {
             return;
         }
         let Some(file) = item.file.clone() else {
@@ -4636,16 +4640,22 @@ impl App {
         }
     }
 
-    /// The posts were replaced a moment ago, maybe just as Enter went down:
-    /// the one under the cursor isn't what the user meant to open, so it
-    /// asks for Enter again. Fields rather than `self`, so the post can stay
-    /// borrowed.
-    fn feed_just_changed(changed: &mut Option<Instant>, status: &mut Option<String>) -> bool {
+    /// The posts were replaced a moment ago, maybe just as `again` went
+    /// down: the one under the cursor isn't what the user meant to open, so
+    /// it asks for that key again. Fields rather than `self`, so the post can
+    /// stay borrowed.
+    fn feed_just_changed(
+        changed: &mut Option<Instant>,
+        status: &mut Option<String>,
+        again: &str,
+    ) -> bool {
         let just = changed
             .take()
             .is_some_and(|at| at.elapsed() < CONFIRM_GRACE);
         if just {
-            *status = Some("The feed just changed: press Enter again to open it".into());
+            *status = Some(format!(
+                "The feed just changed: press {again} again to open it"
+            ));
         }
         just
     }
@@ -4986,8 +4996,7 @@ impl App {
         }
         // As Enter asks again, but for `f`, so the second one fills the
         // window too.
-        if Self::feed_just_changed(&mut self.feed_changed, &mut self.status) {
-            self.status = Some("The feed just changed: press f again to play it".into());
+        if Self::feed_just_changed(&mut self.feed_changed, &mut self.status, "f") {
             return;
         }
         self.open_feed_item();
@@ -7762,12 +7771,12 @@ mod tests {
     }
 
     #[test]
-    fn the_photos_of_the_next_five_posts_download_before_they_are_in_view() {
+    fn the_photos_of_the_next_ten_posts_download_before_they_are_in_view() {
         let mut app = test_app("feed-ahead");
         open_the_feed(&mut app);
         feed_page(
             &mut app,
-            (1..=10).map(|i| post(i, serde_json::json!({}))).collect(),
+            (1..=15).map(|i| post(i, serde_json::json!({}))).collect(),
             true,
         );
         // What a frame asks for, as `App::run` fetches after each.
@@ -7779,17 +7788,16 @@ mod tests {
                 .map(|p| format!("{} {}", p["file_id"], p["priority"].as_str().unwrap()))
                 .collect()
         };
-        // The first two posts are in view; the next five download behind them.
+        // The first two posts are in view; the next ten download behind them.
         let asked = downloads(&mut app);
-        assert_eq!(
-            asked,
-            ["10 high", "20 high", "30 low", "40 low", "50 low", "60 low"]
-        );
+        let behind: Vec<String> = (3..=11).map(|i| format!("{} low", i * 10)).collect();
+        assert_eq!(asked[..2], ["10 high", "20 high"]);
+        assert_eq!(asked[2..], behind);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         let asked = downloads(&mut app);
         assert_eq!(
-            asked[6..],
-            ["30 high", "70 low"],
+            asked[11..],
+            ["30 high", "120 low"],
             "in view now, it goes first"
         );
     }
@@ -8015,6 +8023,12 @@ mod tests {
             bar.contains("0:06 ━") && bar.contains("0:15") && bar.contains("playing"),
             "{bar}"
         );
+        // A toast is said there too, rather than under the video.
+        app.show_toast("Copied", "the link");
+        let rows = screen(&mut app);
+        assert!(rows[18].contains("✓ Copied the link"), "{}", rows[18]);
+        assert!(!rows[..18].iter().any(|r| r.contains("Copied")), "no box");
+        app.toast = None;
         // Its own keys work; what's under it waits.
         press(&mut app, KeyCode::Char(' '), none);
         assert!(app.playing.as_ref().unwrap().paused);
