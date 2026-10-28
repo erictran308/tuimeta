@@ -850,10 +850,12 @@ impl Images {
         // Large ones go first: they free the most, and the viewer shows one
         // at a time.
         let bytes = kitty.as_ref().map_or(0, |k| k.bytes);
-        while self.kitty_bytes() + bytes > self.kitty_budget
+        let mut kept = self.kitty_bytes();
+        while kept + bytes > self.kitty_budget
             && let Some(oldest) = self.oldest(true).or_else(|| self.oldest(false))
+            && let Some(dropped) = self.ready.remove(&oldest)
         {
-            self.ready.remove(&oldest);
+            kept -= dropped.kitty.as_ref().map_or(0, |k| k.bytes);
         }
         let encoded = Encoded {
             image,
