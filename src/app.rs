@@ -1019,6 +1019,11 @@ impl App {
                     self.meta.find_chats(network, query.clone());
                 }
             }
+            // Before the frame, which may send images in their place, and
+            // like it, not once writing to the terminal failed.
+            if failed.is_none() {
+                self.images.send_deletions(terminal);
+            }
             if failed.is_none()
                 && let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut self))
             {
@@ -1089,6 +1094,11 @@ impl App {
         self.stop_video();
         if failed.is_none() {
             notify::send(&self.video_placement());
+        }
+        // The terminal would keep the images after tuimeta is gone.
+        self.images.drop_all();
+        if failed.is_none() {
+            self.images.send_deletions(terminal);
         }
         match failed {
             Some(e) => Err(e),

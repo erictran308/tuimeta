@@ -179,6 +179,7 @@ async fn show(dir: &Path) -> Result<()> {
 
     let mut keys = EventStream::new();
     let result = loop {
+        app.images.send_deletions(&mut terminal);
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(e.into());
         }
@@ -208,6 +209,8 @@ async fn show(dir: &Path) -> Result<()> {
             else => break Ok(()),
         }
     };
+    app.images.drop_all();
+    app.images.send_deletions(&mut terminal);
     ratatui::restore();
     crate::tmux::restore();
     result
