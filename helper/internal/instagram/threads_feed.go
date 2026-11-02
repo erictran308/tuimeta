@@ -32,6 +32,9 @@ const (
 	// maxUnits is the most feed items remembered for feed_state: a long
 	// read keeps only the latest.
 	maxUnits = 500
+	// maxGiven is the most posts remembered as given since the top; past
+	// it, that starts over, since tuimeta drops a post it has anyway.
+	maxGiven = 5000
 	// maxContext caps the line over a post.
 	maxContext = 120
 	// maxLinkTitle caps a link card's title, and maxLinkURL its address.
@@ -59,6 +62,14 @@ type threadsFeed struct {
 	cursor  string
 	started bool
 	more    bool
+	// dry is set when the last page brought nothing new while Threads said
+	// there's more, with no rows or no cursor to go on from, as it does
+	// after some pages: the next is asked for as a new start, naming what
+	// was given, with no cursor (so none is needed), so the feed goes on.
+	dry bool
+	// given are the posts given since the top, so a new start's repeats
+	// aren't given again.
+	given map[int64]bool
 	// session and source are what the last page said to page on with;
 	// units are the feed items given, and lastAt when the last page was
 	// asked for (ms), for feed_state.
@@ -101,8 +112,8 @@ func (f *threadsFeed) reset() {
 
 // clear is reset's; f.mu is held.
 func (f *threadsFeed) clear() {
-	f.kind, f.cursor, f.started, f.more = backend.ForYou, "", false, false
-	f.session, f.source, f.units, f.lastAt = nil, "", nil, 0
+	f.kind, f.cursor, f.started, f.more, f.dry = backend.ForYou, "", false, false, false
+	f.session, f.source, f.units, f.lastAt, f.given = nil, "", nil, 0, map[int64]bool{}
 	f.posts = map[string]int64{}
 	f.refs = map[int64]postRef{}
 	f.comments = map[string]int64{}
@@ -121,8 +132,8 @@ func (f *threadsFeed) sync(epoch int) {
 
 // restart goes back to the top of feed kind; f.mu is held.
 func (f *threadsFeed) restart(kind backend.FeedKind) {
-	f.kind, f.cursor, f.started, f.more = kind, "", false, false
-	f.session, f.source, f.units = nil, "", nil
+	f.kind, f.cursor, f.started, f.more, f.dry = kind, "", false, false, false
+	f.session, f.source, f.units, f.given = nil, "", nil, map[int64]bool{}
 }
 
 // paginationSource is what the website calls each feed when paging it.
@@ -198,15 +209,22 @@ func buildFeedState(units []feedUnit, at int64, n int) textAppState {
 }
 
 // variables are the next page's, as the website's feed asks for it: the
-// first, then each after it. now is when it's asked (ms).
+// first, then each after it, or after a page that came empty, a first one
+// again that names what was given. now is when it's asked (ms).
 func (f *threadsFeed) variables(now int64) map[string]any {
 	var state textAppState
 	data := map[string]any{"feed_view_info": "[]"}
-	if !f.started {
+	switch {
+	case !f.started:
 		// A first load names nothing given yet, as of now.
 		state = buildFeedState(nil, now, 0)
 		data["pagination_source"] = paginationSource(f.kind)
-	} else {
+	case f.dry:
+		// Threads ran out of posts for this run of pages: a first load
+		// again, but naming what was given, so it isn't given again.
+		state = buildFeedState(f.units, f.lastAt, threadsLastN)
+		data["pagination_source"] = paginationSource(f.kind)
+	default:
 		state = buildFeedState(f.units, f.lastAt, threadsLastN)
 		source := f.source
 		if source == "" {
@@ -222,7 +240,7 @@ func (f *threadsFeed) variables(now int64) map[string]any {
 	encoded, _ := json.Marshal(state)
 	data["feed_state"] = string(encoded)
 	vars := map[string]any{"first": threadsPageSize, "variant": string(f.kind), "data": data}
-	if f.started {
+	if f.started && !f.dry {
 		vars["after"] = f.cursor
 	}
 	return vars
@@ -249,33 +267,47 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 		return []proto.Post{}, false, nil
 	}
 	posts := []proto.Post{}
-	given := map[int64]bool{}
+	var page threadsFeedPage
+	tries := 0
 	for range feedTries {
+		tries++
 		now := time.Now().UnixMilli()
 		data, err := t.ask(ctx, epoch, threadsFeedQuery, f.variables(now), threadsBase+"/")
 		if err != nil {
 			warnFailed(ctx, "threads: feed failed", err)
 			return nil, false, err
 		}
-		page, err := parseThreadsFeed(data)
+		page, err = parseThreadsFeed(data)
 		if err != nil {
 			hlog.Warn("threads: feed unreadable", hlog.Kind(err))
 			return nil, false, errThreadsFeedAnswer
 		}
+		anew := f.dry
 		f.started, f.lastAt = true, now
 		f.cursor = page.cursor
-		f.more = page.more && page.cursor != ""
 		f.session, f.source = page.session, page.source
 		f.units = append(f.units, page.units...)
 		if over := len(f.units) - maxUnits; over > 0 {
 			f.units = f.units[over:]
 		}
-		st := feedStats{threads: true, ads: page.ads, unreadable: page.unreadable}
+		st := feedStats{threads: true, ads: page.ads, unreadable: page.unreadable, rows: page.rows}
+		news := 0
 		for _, p := range t.feedPosts(f, page.threads, box, &st) {
-			if !given[p.ID] {
-				given[p.ID] = true
+			if !f.given[p.ID] {
+				if len(f.given) >= maxGiven {
+					f.given = map[int64]bool{}
+				}
+				f.given[p.ID] = true
 				posts = append(posts, p)
+				news++
 			}
+		}
+		// With no cursor, or nothing at all, the next is a new start.
+		f.dry = page.more && (page.cursor == "" || (news == 0 && page.edges == 0))
+		f.more = page.more
+		if anew {
+			hlog.Info("threads: feed asked anew", hlog.Int("edges", int64(page.edges)), hlog.Int("posts", int64(news)),
+				hlog.Int("units", int64(len(f.units))))
 		}
 		if page.people > 0 {
 			hlog.Info("threads: feed rows left out", hlog.Int("people", int64(page.people)))
@@ -285,7 +317,27 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 			break
 		}
 	}
+	if len(posts) == 0 || !f.more {
+		// Why the feed ends or came empty, in counts only: Threads saying
+		// it has no more can't be told apart from pages of rows this
+		// doesn't read.
+		msg := "threads: feed ends"
+		if f.more {
+			msg = "threads: feed came empty"
+		}
+		hlog.Info(msg, hlog.Int("has_next", oneIf(page.more)), hlog.Int("cursor", oneIf(page.cursor != "")),
+			hlog.Int("edges", int64(page.edges)), hlog.Int("posts", int64(len(posts))), hlog.Int("tries", int64(tries)),
+			hlog.Int("units", int64(len(f.units))))
+	}
 	return posts, f.more, nil
+}
+
+// oneIf is a yes or no for the log: 1 or 0.
+func oneIf(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // --- reading a page ---------------------------------------------------------
@@ -331,32 +383,38 @@ type threadsFeedPage struct {
 	session json.RawMessage
 	source  string
 	// people counts the rows of people to follow left out; ads and
-	// unreadable, the posts.
-	people, ads, unreadable int
+	// unreadable, the posts. edges is how many rows came, and rows the
+	// ones of a kind this doesn't read, by name, for the log.
+	people, ads, unreadable, edges int
+	rows                           map[string]*rowCount
+}
+
+// threadsNode is one row of a page: a thread, or people to follow.
+type threadsNode struct {
+	Thread *struct {
+		Header *struct {
+			Text string `json:"text"`
+		} `json:"thread_header_context"`
+		Items []struct {
+			Post json.RawMessage `json:"post"`
+		} `json:"thread_items"`
+	} `json:"text_post_app_thread"`
+	People *struct {
+		ID    flexString      `json:"id"`
+		Type  flexInt         `json:"view_state_item_type"`
+		Cards json.RawMessage `json:"suggestion_cards"`
+	} `json:"suggested_users"`
 }
 
 // parseThreadsFeed reads an answer's data: each thread's posts in order.
 // A post that doesn't read is left out alone; rows of people to follow are
-// counted for feed_state and left out.
+// counted for feed_state and left out, and rows of other kinds are counted
+// by name for the log.
 func parseThreadsFeed(data []byte) (threadsFeedPage, error) {
 	var r struct {
 		Feed *struct {
 			Edges []struct {
-				Node struct {
-					Thread *struct {
-						Header *struct {
-							Text string `json:"text"`
-						} `json:"thread_header_context"`
-						Items []struct {
-							Post json.RawMessage `json:"post"`
-						} `json:"thread_items"`
-					} `json:"text_post_app_thread"`
-					People *struct {
-						ID    flexString      `json:"id"`
-						Type  flexInt         `json:"view_state_item_type"`
-						Cards json.RawMessage `json:"suggestion_cards"`
-					} `json:"suggested_users"`
-				} `json:"node"`
+				Node json.RawMessage `json:"node"`
 			} `json:"edges"`
 			Source   string          `json:"pagination_source"`
 			Session  json.RawMessage `json:"session_id"`
@@ -372,7 +430,8 @@ func parseThreadsFeed(data []byte) (threadsFeedPage, error) {
 	if r.Feed == nil {
 		return threadsFeedPage{}, errThreadsFeedAnswer
 	}
-	page := threadsFeedPage{more: bool(r.Feed.PageInfo.HasNext), source: r.Feed.Source}
+	page := threadsFeedPage{more: bool(r.Feed.PageInfo.HasNext), source: r.Feed.Source, edges: len(r.Feed.Edges),
+		rows: map[string]*rowCount{}}
 	if r.Feed.PageInfo.End != nil {
 		page.cursor = *r.Feed.PageInfo.End
 	}
@@ -380,7 +439,15 @@ func parseThreadsFeed(data []byte) (threadsFeedPage, error) {
 		page.session = s
 	}
 	for _, e := range r.Feed.Edges {
-		switch n := e.Node; {
+		if !present(e.Node) {
+			continue
+		}
+		var n threadsNode
+		if json.Unmarshal(e.Node, &n) != nil {
+			page.unreadable++
+			continue
+		}
+		switch {
 		case n.Thread != nil:
 			th := feedThread{}
 			if n.Thread.Header != nil {
@@ -412,6 +479,13 @@ func parseThreadsFeed(data []byte) (threadsFeedPage, error) {
 			if present(n.People.Cards) {
 				page.units = append(page.units, feedUnit{items: []unitItem{{ID: string(n.People.ID), Type: int64(n.People.Type)}}})
 			}
+		default:
+			var fields map[string]json.RawMessage
+			key := "other"
+			if json.Unmarshal(e.Node, &fields) == nil {
+				key = rowKey(fields)
+			}
+			countRow(page.rows, key)
 		}
 	}
 	return page, nil

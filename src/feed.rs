@@ -29,6 +29,10 @@ pub const AHEAD: usize = 10;
 /// they're in view: few, since each takes memory, but enough for the next
 /// post's to be there when `j` gets to it.
 pub const MADE_AHEAD: usize = 3;
+/// Pages in a row that may bring nothing new before the feed counts as
+/// ended: each is up to three requests in the helper, and a key held down
+/// at the end would otherwise go on asking.
+const MAX_EMPTY_PAGES: u8 = 3;
 /// A caption is cut after this many characters, which is what Instagram
 /// allows.
 const MAX_CAPTION: usize = 2200;
@@ -369,6 +373,15 @@ pub struct Feed {
     fresh: bool,
     /// The network has more after the last post.
     pub has_more: bool,
+    /// The last page brought nothing new though there's more (Threads
+    /// sends empty pages at times): the next is asked for when the cursor
+    /// moves again, not at once and again and again.
+    stalled: bool,
+    /// Pages in a row that brought nothing new, up to `MAX_EMPTY_PAGES`.
+    empty_pages: u8,
+    /// So many did that the feed was left there, though the network said
+    /// there's more.
+    gave_up: bool,
     /// Threads: the accounts followed, rather than For you.
     pub following: bool,
     /// Why the last load failed.
@@ -391,6 +404,9 @@ impl Feed {
             request: None,
             fresh: false,
             has_more: true,
+            stalled: false,
+            empty_pages: 0,
+            gave_up: false,
             following: false,
             error: None,
             linked: None,
@@ -449,9 +465,21 @@ impl Feed {
     /// The cursor is near enough the end for the next page.
     pub fn wants_more(&self) -> bool {
         self.has_more
+            && !self.stalled
             && self.loading.is_none()
             && self.error.is_none()
             && self.selected + MORE_WITHIN >= self.posts.len()
+    }
+    /// The last page brought nothing new, though the network says there's
+    /// more: moving the cursor asks again.
+    pub fn stalled(&self) -> bool {
+        self.stalled && self.has_more
+    }
+
+    /// Pages in a row brought nothing new, so many that the feed was left
+    /// there, though the network said there's more.
+    pub fn gave_up(&self) -> bool {
+        self.gave_up
     }
 
     /// The answer to load `load`. A fresh one takes the place of what was
@@ -476,15 +504,22 @@ impl Feed {
             self.shown.clear();
             self.selected = 0;
             self.top = 0;
+            self.empty_pages = 0;
         }
+        let before = self.posts.len();
         for post in &posts {
             if self.ids.insert(post.id) {
                 self.posts.push(Post::new(post, self.network));
             }
         }
-        // A page that brought nothing new would be asked for again and
-        // again.
-        self.has_more = more && !posts.is_empty();
+        self.stalled = self.posts.len() == before;
+        self.empty_pages = if self.stalled {
+            self.empty_pages.saturating_add(1)
+        } else {
+            0
+        };
+        self.has_more = more && self.empty_pages < MAX_EMPTY_PAGES;
+        self.gave_up = more && !self.has_more;
         true
     }
 
@@ -492,8 +527,20 @@ impl Feed {
     pub fn move_cursor(&mut self, delta: isize) {
         let last = self.posts.len().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
-        // Moving on after a failed load tries again near the end.
+        // Moving on after a failed load tries again near the end, and so
+        // does moving down after one that brought nothing new.
+        if delta > 0 {
+            self.ask_again();
+        } else {
+            self.error = None;
+        }
+    }
+
+    /// Asks again for what's after the last post, as moving down past it
+    /// does: after a failed load, or one that brought nothing new.
+    pub fn ask_again(&mut self) {
         self.error = None;
+        self.stalled = false;
     }
 
     pub fn selected_post(&self) -> Option<&Post> {
@@ -786,6 +833,48 @@ pub(crate) mod tests {
         assert_eq!(feed.selected, 0);
         assert!(!feed.has_more && !feed.wants_more());
         assert_eq!(feed.start_load(false), None, "nothing after the end");
+    }
+
+    #[test]
+    fn a_page_with_nothing_new_waits_for_the_cursor_to_move_and_isnt_the_end() {
+        let mut feed = Feed::new(Network::Threads);
+        let load = feed.start_load(false).unwrap();
+        feed.on_page(load, Ok((vec![post(1, serde_json::json!({}))], true)));
+        assert!(feed.wants_more() && !feed.stalled());
+        // Empty, and then only what's there already: more, but not at once,
+        // nor when the cursor goes up; going down, or the viewer going on
+        // past the last photo, asks again.
+        for page in [vec![], vec![post(1, serde_json::json!({}))]] {
+            let load = feed.start_load(false).unwrap();
+            feed.on_page(load, Ok((page, true)));
+            assert!(feed.has_more && feed.stalled() && !feed.wants_more());
+            feed.move_cursor(-1);
+            assert!(feed.stalled() && !feed.wants_more());
+            feed.move_cursor(1);
+            assert!(feed.wants_more() && !feed.stalled());
+        }
+        // Something new, and the count of pages without starts over.
+        let load = feed.start_load(false).unwrap();
+        feed.on_page(load, Ok((vec![post(2, serde_json::json!({}))], true)));
+        assert_eq!(feed.posts.len(), 2);
+        assert!(feed.wants_more() && !feed.stalled());
+    }
+
+    #[test]
+    fn so_many_pages_in_a_row_with_nothing_new_end_the_feed() {
+        let mut feed = Feed::new(Network::Threads);
+        for n in 1..=MAX_EMPTY_PAGES {
+            let load = feed.start_load(false).unwrap();
+            feed.on_page(load, Ok((vec![], true)));
+            assert_eq!(feed.has_more, n < MAX_EMPTY_PAGES);
+            feed.ask_again();
+        }
+        assert!(!feed.wants_more() && !feed.stalled() && feed.gave_up());
+        assert_eq!(feed.start_load(false), None, "nothing after the end");
+        // Loaded again from the top, it counts again.
+        let load = feed.start_load(true).unwrap();
+        feed.on_page(load, Ok((vec![], true)));
+        assert!(feed.has_more && feed.stalled() && !feed.gave_up());
     }
 
     #[test]

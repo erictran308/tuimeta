@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/erictran308/tuimeta/helper/internal/backend"
+	"github.com/erictran308/tuimeta/helper/internal/hlog"
 	"github.com/erictran308/tuimeta/helper/internal/proto"
 )
 
@@ -641,5 +643,119 @@ func TestThreadsWaitsBetweenRequests(t *testing.T) {
 	h.feed(false, "")
 	if took := time.Since(start); took < 60*time.Millisecond {
 		t.Errorf("two requests in %v", took)
+	}
+}
+
+func TestTheThreadsLogSaysWhyTheFeedEndedAndNothingOfIt(t *testing.T) {
+	log := &logBuffer{}
+	hlog.SetOutput(log)
+	t.Cleanup(func() { hlog.SetOutput(io.Discard) })
+	h := newThreadsHarness(t)
+	h.login()
+	// A row of a kind this doesn't read.
+	trending := `{"node":{"text_post_app_thread":null,"suggested_users":null,"trending_topics":{"title":"secret topic"},"__typename":"XDTFeedItem"},"cursor":null}`
+	h.answers(
+		tFeed("cursor-1", true, tThread("", tPost("101", "maya.lens", 19, "hello"))),
+		tFeed("cursor-2", false, trending),
+	)
+	if _, more := h.feed(false, ""); !more {
+		t.Fatal("the first page says there's no more")
+	}
+	if posts, more := h.feed(false, ""); len(posts) != 0 || more {
+		t.Fatalf("second page: %v %v", posts, more)
+	}
+	got := log.String()
+	for _, line := range []string{
+		"INFO threads: feed rows trending_topics=1/0\n",
+		"INFO threads: feed ends has_next=0 cursor=1 edges=1 posts=0 tries=1 units=1\n",
+	} {
+		if !strings.Contains(got, line) {
+			t.Errorf("no line %q in:\n%s", line, got)
+		}
+	}
+	if n := strings.Count(got, "feed ends"); n != 1 {
+		t.Errorf("the feed ended %d times:\n%s", n, got)
+	}
+	for _, secret := range []string{"secret", "maya", "hello", "cursor-"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("the log says %q:\n%s", secret, got)
+		}
+	}
+}
+
+func TestAThreadsFeedThatComesEmptyStartsAgainNamingWhatWasGiven(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	h.answers(
+		tFeed("cursor-1", true, tThread("", tPost("101", "maya.lens", 19, "hello"))),
+		// No posts, though there's more, as Threads answers after some
+		// pages, and here with no cursor and a row with no node either.
+		tFeed("", true, `{"cursor":null}`),
+		// A new start, with what was given already among what's new.
+		tFeed("cursor-3", true, tThread("", tPost("101", "maya.lens", 19, "hello")),
+			tThread("", tPost("102", "sam.climbs", 19, "again"))),
+		tFeed("cursor-4", true, tThread("", tPost("103", "noor.draws", 19, "and on"))),
+	)
+	h.feed(false, "")
+	posts, more := h.feed(false, "")
+	if len(posts) != 1 || !more || posts[0].Caption != "again" {
+		t.Fatalf("after the empty page: %v %v", posts, more)
+	}
+	// Asked as a first page, from no cursor and no session, but naming
+	// what was given.
+	v := vars(t, h.site.lastForm())
+	data := v["data"].(map[string]any)
+	if v["after"] != nil || data["reason"] != nil || data["session_id"] != nil || data["feed_view_info"] != "[]" ||
+		data["pagination_source"] != "text_post_feed_threads" {
+		t.Errorf("asked anew with %v", v)
+	}
+	var state textAppState
+	if err := json.Unmarshal([]byte(data["feed_state"].(string)), &state); err != nil ||
+		len(state.LastNItems) != 1 || state.LastNItems[0].ThreadItems[0].Post.ID != "101_9000" {
+		t.Errorf("feed_state %v %v", data["feed_state"], err)
+	}
+	// Then on from that page's cursor.
+	if posts, _ := h.feed(false, ""); len(posts) != 1 || posts[0].Caption != "and on" {
+		t.Fatalf("next page: %v", posts)
+	}
+	v = vars(t, h.site.lastForm())
+	if v["after"] != "cursor-3" || v["data"].(map[string]any)["reason"] != "pagination" {
+		t.Errorf("next page asked with %v", v)
+	}
+}
+
+func TestAThreadsPageOfOtherRowsGoesOnFromItsCursor(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	h.answers(
+		tFeed("cursor-1", true, tThread("", tPost("101", "maya.lens", 19, "hello"))),
+		// Only people to follow, with a cursor: no new start.
+		tFeed("cursor-2", true, tPeople),
+		tFeed("cursor-3", true, tThread("", tPost("102", "sam.climbs", 19, "again"))),
+	)
+	h.feed(false, "")
+	if posts, more := h.feed(false, ""); len(posts) != 1 || !more || posts[0].Caption != "again" {
+		t.Fatalf("after the page of people: %v %v", posts, more)
+	}
+	if v := vars(t, h.site.lastForm()); v["after"] != "cursor-2" {
+		t.Errorf("asked with %v", v)
+	}
+}
+
+func TestAThreadsPageWithNoCursorIsFollowedByANewStart(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	h.answers(
+		tFeed("", true, tThread("", tPost("101", "maya.lens", 19, "hello"))),
+		tFeed("cursor-2", true, tThread("", tPost("102", "sam.climbs", 19, "again"))),
+	)
+	if posts, more := h.feed(false, ""); len(posts) != 1 || !more {
+		t.Fatalf("first page: %v %v", posts, more)
+	}
+	if posts, more := h.feed(false, ""); len(posts) != 1 || !more || posts[0].Caption != "again" {
+		t.Fatalf("second page: %v %v", posts, more)
+	}
+	if v := vars(t, h.site.lastForm()); v["after"] != nil || v["data"].(map[string]any)["reason"] != nil {
+		t.Errorf("asked with %v", v)
 	}
 }

@@ -140,3 +140,14 @@ func schemaName(k string) bool {
 type rowCount struct {
 	rows, withPosts int
 }
+
+// countRow counts one more row of kind key in rows, and returns its count.
+func countRow(rows map[string]*rowCount, key string) *rowCount {
+	count := rows[key]
+	if count == nil {
+		count = &rowCount{}
+		rows[key] = count
+	}
+	count.rows++
+	return count
+}

@@ -312,24 +312,29 @@ pub fn draw_full_screen(
     Some(video)
 }
 
-/// What an empty feed's pane says: loading, why it didn't, or `nothing`.
+/// What an empty feed's pane says: loading, why it didn't, that nothing
+/// came this time, or `nothing`.
 pub(super) fn empty_feed(feed: &Feed, nothing: &str) -> String {
     match (&feed.error, feed.loading.is_some(), &feed.linked) {
         (_, true, Some(_)) => "Loading the post…".to_string(),
         (_, true, None) => "Loading the feed…".to_string(),
         (Some(why), _, Some(_)) => format!("{why}\nr tries again · Esc goes on to the feed"),
         (Some(why), _, None) => format!("{why}\nPress r to try again"),
+        _ if feed.stalled() => "Nothing came this time\nj asks again".to_string(),
         _ => nothing.to_string(),
     }
 }
 
 /// What's said under the last post: more coming, why they didn't, that
-/// there are none, or, under a post a link opened, where Esc goes.
+/// none came this time or for so long it stopped asking, that there are
+/// none, or, under a post a link opened, where Esc goes.
 pub(super) fn feed_end(feed: &Feed) -> Option<String> {
     match (&feed.error, feed.loading.is_some(), feed.has_more) {
         _ if feed.linked.is_some() => Some("Esc goes on to the feed".to_string()),
         (_, true, _) => Some("Loading more…".to_string()),
         (Some(why), ..) => Some(format!("Couldn't load more: {why}")),
+        _ if feed.stalled() => Some("Nothing new came · j asks again".to_string()),
+        _ if feed.gave_up() => Some("Nothing new came · r loads the feed again".to_string()),
         (None, false, false) => Some("You're all caught up".to_string()),
         _ => None,
     }
@@ -841,5 +846,49 @@ mod tests {
             let rest: String = row(y).chars().skip(column_end).collect();
             assert_eq!(rest.trim_end_matches(['│', ' ']), "", "row {y}: {}", row(y));
         }
+    }
+
+    #[test]
+    fn the_end_of_the_feed_says_whether_more_may_come() {
+        let mut feed = Feed::new(crate::meta::Network::Threads);
+        let load = feed.start_load(false).unwrap();
+        let posts = vec![crate::feed::tests::post(1, serde_json::json!({}))];
+        feed.on_page(load, Ok((posts, true)));
+        assert_eq!(feed_end(&feed), None);
+        let load = feed.start_load(false).unwrap();
+        assert_eq!(feed_end(&feed).as_deref(), Some("Loading more…"));
+        feed.on_page(load, Ok((vec![], true)));
+        assert_eq!(
+            feed_end(&feed).as_deref(),
+            Some("Nothing new came · j asks again")
+        );
+        // Empty pages in a row until it stops asking, then the end.
+        for _ in 0..2 {
+            feed.move_cursor(1);
+            let load = feed.start_load(false).unwrap();
+            feed.on_page(load, Ok((vec![], true)));
+        }
+        assert_eq!(
+            feed_end(&feed).as_deref(),
+            Some("Nothing new came · r loads the feed again")
+        );
+        let load = feed.start_load(true).unwrap();
+        let posts = vec![crate::feed::tests::post(1, serde_json::json!({}))];
+        feed.on_page(load, Ok((posts, false)));
+        assert_eq!(feed_end(&feed).as_deref(), Some("You're all caught up"));
+    }
+
+    #[test]
+    fn an_empty_feed_says_when_nothing_came_but_more_may() {
+        let mut feed = Feed::new(crate::meta::Network::Threads);
+        let load = feed.start_load(true).unwrap();
+        feed.on_page(load, Ok((vec![], true)));
+        assert_eq!(
+            empty_feed(&feed, "No posts"),
+            "Nothing came this time\nj asks again"
+        );
+        let load = feed.start_load(true).unwrap();
+        feed.on_page(load, Ok((vec![], false)));
+        assert_eq!(empty_feed(&feed, "No posts"), "No posts");
     }
 }

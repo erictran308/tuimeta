@@ -472,12 +472,7 @@ func parseFeed(body []byte) (feedPage, error) {
 			continue
 		}
 		key := rowKey(item)
-		count := page.rows[key]
-		if count == nil {
-			count = &rowCount{}
-			page.rows[key] = count
-		}
-		count.rows++
+		count := countRow(page.rows, key)
 		if slices.Contains(postless, key) {
 			continue
 		}

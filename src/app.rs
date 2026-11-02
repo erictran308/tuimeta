@@ -4690,8 +4690,8 @@ impl App {
             }
             None if newer && feed.has_more => {
                 self.status = Some("Loading more posts…".into());
-                feed.selected = feed.posts.len().saturating_sub(1);
-                self.load_more_feed();
+                // To the last post, which asks again for what's after it.
+                self.move_feed_cursor(isize::MAX);
             }
             None if newer => self.status = Some("No more photos in the feed".into()),
             None => self.status = Some("No photos before this one".into()),
