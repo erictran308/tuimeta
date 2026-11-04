@@ -70,7 +70,9 @@ raw newline (JSON escapes them).
   within two seconds.
 - Nothing but protocol lines goes to stdout. The helper logs to
   `<data-dir>/helper.log` (connection states and error kinds only: never
-  message text, names, cookies, tokens or keys). stderr stays quiet.
+  message text, names, cookies, tokens or keys). stderr stays quiet: the
+  runtime's report of a crash nothing recovers from goes to
+  `<data-dir>/crash.log` instead.
 
 ## Ids
 

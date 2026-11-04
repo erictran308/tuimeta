@@ -89,6 +89,7 @@ link or another user's; every file 0600, umask 077 on Unix):
 | path | what |
 |---|---|
 | `helper.log` | connection states and error kinds; moved to `helper.log.1` at startup once past 4 MB; opened only as a plain file of yours, never through a link in its place |
+| `crash.log` | the Go runtime's report of a crash nothing could recover from (a panic in one of a library's own goroutines), since stderr goes nowhere; it can quote what the crash was about, a message's words included, and never leaves this folder; emptied at startup once past 1 MB; opened only as a plain file of yours, never through a link in its place |
 | `ids.json` | the chat and person ids handed to tuimeta, by network-side id |
 | `<network>/` | the login session (cookies; for Messenger, the encrypted chats' keys and messages; for WhatsApp, the linked device's keys and the chats and messages it has; for Threads, also `catalog.json`, how threads.com's queries are asked once they had to be read again from its JavaScript) |
 | `files/<network>/` | downloads, named by a hash and a cleaned-up file name (a picture, video or recording never under another kind's extension: its type's, a media one, or `.bin`) |

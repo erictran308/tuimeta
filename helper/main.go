@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -106,6 +107,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, quiet func())
 		fmt.Fprintln(stderr, "tuimeta-helper: can't read ids.json in the data dir")
 		return 1
 	}
+	if err := keepCrashes(o.dataDir); err != nil {
+		hlog.Warn("can't keep crash reports", hlog.Kind(err))
+	}
 	if quiet != nil {
 		quiet()
 	}
@@ -165,4 +169,34 @@ func dataDir(dir string) error {
 		return errors.New("it belongs to another user")
 	}
 	return nil
+}
+
+// crashLog is where the Go runtime writes its report of a crash nothing can
+// recover from, such as a panic in one of a library's own goroutines: stderr
+// goes nowhere once the helper serves, and such a crash used to leave no
+// trace at all.
+const crashLog = "crash.log"
+
+// maxCrashLog is how big crash.log may grow before a start empties it. A
+// report is a few kilobytes, so this keeps a run of crashes, not one.
+const maxCrashLog = 1 << 20
+
+// keepCrashes has the runtime write the report of a crash that ends the
+// helper into crash.log in the data folder, a plain file of the user's, 0600,
+// never through a link in its place. A report can quote what the crash was
+// about, a message's words included, so it stays in the data folder with the
+// messages themselves and is never sent anywhere.
+func keepCrashes(dir string) error {
+	f, err := fsutil.OpenPrivate(filepath.Join(dir, crashLog), os.O_WRONLY|os.O_CREATE|os.O_APPEND)
+	if err != nil {
+		return err
+	}
+	// The runtime keeps a copy of the descriptor, so this one can go.
+	defer f.Close()
+	if info, err := f.Stat(); err == nil && info.Size() > maxCrashLog {
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+	}
+	return debug.SetCrashOutput(f, debug.CrashOptions{})
 }

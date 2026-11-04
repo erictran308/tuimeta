@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -30,7 +32,24 @@ func TestMain(m *testing.M) {
 		main()
 		return
 	}
+	if dir := os.Getenv("TUIMETA_HELPER_TEST_CRASH"); dir != "" {
+		crashInAGoroutine(dir)
+	}
 	os.Exit(m.Run())
+}
+
+// crashInAGoroutine does what a library's goroutine panicking in a serving
+// helper does: no recover anywhere, stderr already pointed nowhere.
+func crashInAGoroutine(dir string) {
+	if err := keepCrashes(dir); err != nil {
+		os.Exit(3)
+	}
+	quietStderr()
+	go func() {
+		var table map[string]int
+		table["CRASHWORD"] = 1
+	}()
+	select {}
 }
 
 type helper struct {
@@ -1046,7 +1065,7 @@ func TestTheBinaryStartsQuietlyAndQuitsOnStdinEOF(t *testing.T) {
 			t.Errorf("not a protocol line: %q", l.Raw)
 		}
 	}
-	modes := map[string]os.FileMode{"": 0o700, "helper.log": 0o600, "ids.json": 0o600}
+	modes := map[string]os.FileMode{"": 0o700, "helper.log": 0o600, "ids.json": 0o600, crashLog: 0o600}
 	for name, want := range modes {
 		info, err := os.Stat(filepath.Join(dir, name))
 		if err != nil || info.Mode().Perm() != want {
@@ -1090,5 +1109,71 @@ func TestBadArgumentsAreRefused(t *testing.T) {
 	}
 	if info, _ := os.Stat(loose); info.Mode().Perm() != 0o700 {
 		t.Errorf("mode %v", info.Mode())
+	}
+}
+
+// TestACrashNothingRecoversIsWrittenToCrashLog crashes a process as a panic
+// in a library's own goroutine crashes the helper, and finds the runtime's
+// report in crash.log, while stderr stays quiet.
+func TestACrashNothingRecoversIsWrittenToCrashLog(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), "TUIMETA_HELPER_TEST_CRASH="+dir)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 2 {
+		t.Fatalf("exit: %v, want the runtime's crash (2)", err)
+	}
+	if runtime.GOOS != "windows" && stderr.Len() > 0 {
+		t.Errorf("stderr: %q", stderr.String())
+	}
+	report, err := os.ReadFile(filepath.Join(dir, crashLog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"assignment to entry in nil map", "crashInAGoroutine", "goroutine "} {
+		if !bytes.Contains(report, []byte(want)) {
+			t.Errorf("crash.log doesn't say %q:\n%s", want, report)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(dir, crashLog)); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("crash.log: %v %v, want 0600", info.Mode(), err)
+	}
+}
+
+func TestCrashLogIsEmptiedOncePastItsCapAndNeverFollowsALink(t *testing.T) {
+	t.Cleanup(func() { debug.SetCrashOutput(nil, debug.CrashOptions{}) })
+	dir := t.TempDir()
+	path := filepath.Join(dir, crashLog)
+	if err := os.WriteFile(path, []byte("an old crash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := keepCrashes(dir); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "an old crash\n" {
+		t.Errorf("a small crash.log was changed: %q", b)
+	}
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), maxCrashLog+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := keepCrashes(dir); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() != 0 {
+		t.Errorf("crash.log past its cap: %v %v, want emptied", info.Size(), err)
+	}
+
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(elsewhere, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linked := t.TempDir()
+	if err := os.Symlink(elsewhere, filepath.Join(linked, crashLog)); err != nil {
+		t.Fatal(err)
+	}
+	if err := keepCrashes(linked); err == nil {
+		t.Error("crash.log through a link was taken")
 	}
 }
