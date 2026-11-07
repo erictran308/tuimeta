@@ -281,8 +281,11 @@ puts them.
     ("sam reposted", "First thread"). A repost comes as the post reposted,
     with `context` naming who reposted it.
   - `continues` is set on a post that goes on from the one before it in the
-    feed: a thread of several posts comes as consecutive posts, the first
-    without `continues`.
+    page: a thread of several posts comes as consecutive posts, the first
+    without `continues`. A thread comes whole whenever a post of it wasn't
+    given before, the posts that were included, and not at all otherwise. A
+    client that keeps each post once draws a post's line only if what's above
+    it is an earlier post of its thread.
   - `quoted` is the post this one quotes, as a Post with `id` 0 (it isn't
     one of the feed's: it has no comments to load) and no `quoted`,
     `context` or `continues` of its own.

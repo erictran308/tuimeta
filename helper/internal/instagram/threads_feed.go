@@ -67,8 +67,8 @@ type threadsFeed struct {
 	// after some pages: the next is asked for as a new start, naming what
 	// was given, with no cursor (so none is needed), so the feed goes on.
 	dry bool
-	// given are the posts given since the top, so a new start's repeats
-	// aren't given again.
+	// given are the posts given since the top, so a thread of nothing but
+	// repeats, as a new start brings, isn't given again.
 	given map[int64]bool
 	// session and source are what the last page said to page on with;
 	// units are the feed items given, and lastAt when the last page was
@@ -291,17 +291,8 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 			f.units = f.units[over:]
 		}
 		st := feedStats{threads: true, ads: page.ads, unreadable: page.unreadable, rows: page.rows}
-		news := 0
-		for _, p := range t.feedPosts(f, page.threads, box, &st) {
-			if !f.given[p.ID] {
-				if len(f.given) >= maxGiven {
-					f.given = map[int64]bool{}
-				}
-				f.given[p.ID] = true
-				posts = append(posts, p)
-				news++
-			}
-		}
+		got, news := t.feedPosts(f, page.threads, box, &st)
+		posts = append(posts, got...)
 		// With no cursor, or nothing at all, the next is a new start.
 		f.dry = page.more && (page.cursor == "" || (news == 0 && page.edges == 0))
 		f.more = page.more
@@ -502,12 +493,15 @@ func oneLine(s string, n int) string {
 // --- making posts -----------------------------------------------------------
 
 // feedPosts are a page's threads' posts, in order: a thread's later posts
-// go on from the one before (continues); f.mu is held.
-func (t *Threads) feedPosts(f *threadsFeed, threads []feedThread, box backend.Box, st *feedStats) []proto.Post {
+// go on from the one before (continues). A thread with a post not given
+// before comes whole, since only tuimeta knows what's above that post once
+// it drops the ones it has; a thread with nothing new doesn't come. news
+// counts the posts not given before. f.mu is held.
+func (t *Threads) feedPosts(f *threadsFeed, threads []feedThread, box backend.Box, st *feedStats) (out []proto.Post, news int) {
 	fs := feedFiles{t.d.Files, proto.Threads}
-	var out []proto.Post
 	for _, th := range threads {
 		first := true
+		var thread []proto.Post
 		for i := range th.posts {
 			m := &th.posts[i]
 			context := ""
@@ -528,10 +522,24 @@ func (t *Threads) feedPosts(f *threadsFeed, threads []feedThread, box backend.Bo
 			}
 			p.ID, p.Context, p.Continues = f.idFor(m, p.URL), context, !first
 			first = false
-			out = append(out, p)
+			thread = append(thread, p)
+		}
+		anyNew := false
+		for _, p := range thread {
+			if !f.given[p.ID] {
+				if len(f.given) >= maxGiven {
+					f.given = map[int64]bool{}
+				}
+				f.given[p.ID] = true
+				news++
+				anyNew = true
+			}
+		}
+		if anyNew {
+			out = append(out, thread...)
 		}
 	}
-	return out
+	return out, news
 }
 
 // idFor is the id of post m, which opens at url: the one it was given

@@ -484,7 +484,9 @@ impl Feed {
 
     /// The answer to load `load`. A fresh one takes the place of what was
     /// there, the cursor back on the first post; a next page goes after it,
-    /// without posts already there. True if it was the load waited for.
+    /// without posts already there. A post keeps its line to the one above
+    /// only if that's a post of its own thread. True if it was the load waited
+    /// for.
     pub fn on_page(&mut self, load: u64, page: Result<(Vec<FeedPost>, bool), String>) -> bool {
         if self.loading != Some(load) {
             return false;
@@ -507,9 +509,22 @@ impl Feed {
             self.empty_pages = 0;
         }
         let before = self.posts.len();
+        // A post dropped as already there can leave the next one under another
+        // thread's post, where its line would join two unrelated posts.
+        let mut thread = Vec::new();
         for post in &posts {
+            if !post.continues {
+                thread.clear();
+            }
+            let goes_on = self
+                .posts
+                .last()
+                .is_some_and(|above| thread.contains(&above.id));
+            thread.push(post.id);
             if self.ids.insert(post.id) {
-                self.posts.push(Post::new(post, self.network));
+                let mut post = Post::new(post, self.network);
+                post.continues = goes_on;
+                self.posts.push(post);
             }
         }
         self.stalled = self.posts.len() == before;
@@ -833,6 +848,43 @@ pub(crate) mod tests {
         assert_eq!(feed.selected, 0);
         assert!(!feed.has_more && !feed.wants_more());
         assert_eq!(feed.start_load(false), None, "nothing after the end");
+    }
+
+    #[test]
+    fn a_post_keeps_its_line_only_under_a_post_of_its_own_thread() {
+        let mut feed = Feed::new(Network::Threads);
+        let head = |id| post(id, serde_json::json!({}));
+        let next = |id| post(id, serde_json::json!({"continues": true}));
+        for page in [
+            vec![head(1), head(2)],
+            // Post 1 again with replies: what's above them is post 2, another
+            // thread's.
+            vec![head(1), next(3), next(4)],
+            // Again with one more: what's above it is post 4, of its thread.
+            vec![head(1), next(3), next(4), next(5)],
+            // One already there in the middle of a thread.
+            vec![head(6), next(3), next(7)],
+            // A post alone, then the first of a thread, in one page.
+            vec![head(8), head(8), next(9)],
+        ] {
+            let load = feed.start_load(false).unwrap();
+            feed.on_page(load, Ok((page, true)));
+        }
+        let lines: Vec<(i64, bool)> = feed.posts.iter().map(|p| (p.id, p.continues)).collect();
+        assert_eq!(
+            lines,
+            [
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, true),
+                (5, true),
+                (6, false),
+                (7, true),
+                (8, false),
+                (9, true),
+            ]
+        );
     }
 
     #[test]

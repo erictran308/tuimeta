@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -757,5 +758,36 @@ func TestAThreadsPageWithNoCursorIsFollowedByANewStart(t *testing.T) {
 	}
 	if v := vars(t, h.site.lastForm()); v["after"] != nil || v["data"].(map[string]any)["reason"] != nil {
 		t.Errorf("asked with %v", v)
+	}
+}
+
+func TestAThreadsThreadWithSomethingNewComesWholeAndOneWithNothingNewDoesnt(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	clip := tPost("101", "maya.lens", 19, "a clip")
+	reply := tPost("103", "noor.draws", 19, "a reply")
+	h.answers(
+		tFeed("cursor-1", true, tThread("", clip), tThread("", tPost("102", "sam.climbs", 19, "nothing to do with it"))),
+		// The clip again, now with a reply under it: the clip comes too, so
+		// tuimeta can tell what the reply goes on from.
+		tFeed("cursor-2", true, tThread("", clip, reply)),
+		// The same again, with nothing new, beside a thread that's new.
+		tFeed("", false, tThread("", clip, reply), tThread("", tPost("105", "oliver.k", 19, "next"))),
+	)
+	lines := func(posts []proto.Post) string {
+		var out []string
+		for _, p := range posts {
+			out = append(out, fmt.Sprintf("%s:%v", p.Caption, p.Continues))
+		}
+		return strings.Join(out, ", ")
+	}
+	h.feed(false, "")
+	posts, _ := h.feed(false, "")
+	if got := lines(posts); got != "a clip:false, a reply:true" {
+		t.Errorf("a reply to a post given before: %s", got)
+	}
+	posts, _ = h.feed(false, "")
+	if got := lines(posts); got != "next:false" {
+		t.Errorf("a thread with nothing new: %s", got)
 	}
 }
