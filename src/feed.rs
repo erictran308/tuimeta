@@ -11,9 +11,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::messages::{self, MediaFile, Preview};
-use crate::meta::{self, FeedPost, MediaKind, Network};
+use crate::meta::{self, FeedPost, FeedView, MediaKind, Network};
 use crate::text;
 
 /// Posts asked for at a time.
@@ -29,6 +32,11 @@ pub const AHEAD: usize = 10;
 /// they're in view: few, since each takes memory, but enough for the next
 /// post's to be there when `j` gets to it.
 pub const MADE_AHEAD: usize = 3;
+/// A post in view for less than this isn't told about: threads.com's limit.
+const MIN_VIEW: Duration = Duration::from_millis(250);
+/// The most posts kept to tell about, the oldest going first: as many as one
+/// `load_feed` takes.
+const MAX_VIEWS: usize = 200;
 /// Pages in a row that may bring nothing new before the feed counts as
 /// ended: each is up to three requests in the helper, and a key held down
 /// at the end would otherwise go on asking.
@@ -389,6 +397,16 @@ pub struct Feed {
     /// The one post a link names, instead of the feed: Esc goes on to the
     /// feed.
     pub linked: Option<PostLink>,
+    /// The posts the last frame showed enough of to count as in view
+    /// (`ui::threads::draw`), until [`Feed::note_views`] takes them.
+    pub drawn: Vec<i64>,
+    /// The posts in view, and since when.
+    in_view: Vec<(i64, Instant)>,
+    /// The posts that left view since the last load, for the next to tell.
+    views: Vec<FeedView>,
+    /// The posts here are the other feed's, until this one's first page takes
+    /// their place: `:for-you` keeps Following's on screen until it comes.
+    others_posts: bool,
 }
 
 impl Feed {
@@ -410,7 +428,82 @@ impl Feed {
             following: false,
             error: None,
             linked: None,
+            drawn: Vec::new(),
+            in_view: Vec::new(),
+            views: Vec::new(),
+            others_posts: false,
         }
+    }
+
+    /// This feed tells its network what's in view: Threads' For you, as
+    /// threads.com does, whose pages thin out without it. Nothing else does:
+    /// not threads.com's Following or a post's own page, nor Instagram here.
+    fn reports_views(&self) -> bool {
+        self.network == Network::Threads
+            && !self.following
+            && self.linked.is_none()
+            && !self.others_posts
+    }
+
+    /// Brings what's in view up to date after a frame. A post is timed from
+    /// when it comes into view to when it leaves it, as on threads.com, so
+    /// one still in view isn't told about yet. `watched` is false when nobody
+    /// can be looking: nothing is in view then, and `until` is when that
+    /// began.
+    pub fn note_views(&mut self, watched: bool, until: Instant) {
+        let drawn = std::mem::take(&mut self.drawn);
+        let shown = match watched && self.reports_views() {
+            true => drawn,
+            false => Vec::new(),
+        };
+        let mut left = Vec::new();
+        self.in_view.retain(|&(id, since)| {
+            let stays = shown.contains(&id);
+            if !stays {
+                left.push((id, since));
+            }
+            stays
+        });
+        for (id, since) in left {
+            self.add_view(id, until.saturating_duration_since(since));
+        }
+        for id in shown {
+            if !self.in_view.iter().any(|&(post, _)| post == id) {
+                self.in_view.push((id, until));
+            }
+        }
+    }
+
+    /// Keeps how long a post just stayed in view: its newest time, as on
+    /// threads.com.
+    fn add_view(&mut self, post_id: i64, time: Duration) {
+        if time < MIN_VIEW {
+            return;
+        }
+        let ms = u64::try_from(time.as_millis()).unwrap_or(u64::MAX);
+        if let Some(view) = self.views.iter_mut().find(|v| v.post_id == post_id) {
+            view.ms = ms;
+            return;
+        }
+        if self.views.len() >= MAX_VIEWS {
+            self.views.remove(0);
+        }
+        self.views.push(FeedView { post_id, ms });
+    }
+
+    /// What the next load is to tell the network, and it's told only once.
+    pub fn take_views(&mut self) -> Vec<FeedView> {
+        std::mem::take(&mut self.views)
+    }
+
+    /// Going to the other feed: what's in view and what was is forgotten, as
+    /// threads.com's page does, and the posts still showing are the other
+    /// feed's until a page of this one takes their place.
+    pub fn switched(&mut self) {
+        self.drawn.clear();
+        self.in_view.clear();
+        self.views.clear();
+        self.others_posts = true;
     }
 
     /// The post `link` names, alone: loaded with [`Feed::start_load`]
@@ -507,6 +600,7 @@ impl Feed {
             self.selected = 0;
             self.top = 0;
             self.empty_pages = 0;
+            self.others_posts = false;
         }
         let before = self.posts.len();
         // A post dropped as already there can leave the next one under another
@@ -848,6 +942,115 @@ pub(crate) mod tests {
         assert_eq!(feed.selected, 0);
         assert!(!feed.has_more && !feed.wants_more());
         assert_eq!(feed.start_load(false), None, "nothing after the end");
+    }
+
+    #[test]
+    fn a_post_is_told_about_once_it_left_view_with_how_long_it_stayed() {
+        let mut feed = Feed::new(Network::Threads);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        for (drawn, ms) in [
+            (vec![1, 2], 0),
+            (vec![2, 3], 1800),
+            (vec![3], 1900),
+            // Post 3 came and went too fast to count.
+            (vec![], 2000),
+        ] {
+            feed.drawn = drawn;
+            feed.note_views(true, at(ms));
+        }
+        assert_eq!(
+            feed.take_views(),
+            [
+                FeedView {
+                    post_id: 1,
+                    ms: 1800
+                },
+                FeedView {
+                    post_id: 2,
+                    ms: 1900
+                },
+            ]
+        );
+        assert!(feed.take_views().is_empty(), "told once");
+        // In view again, and the newest time goes out; one still in view waits.
+        feed.drawn = vec![4];
+        feed.note_views(true, at(3000));
+        feed.drawn = vec![1, 4];
+        feed.note_views(true, at(4000));
+        assert!(feed.take_views().is_empty());
+        feed.drawn = vec![4];
+        feed.note_views(true, at(4500));
+        assert_eq!(
+            feed.take_views(),
+            [FeedView {
+                post_id: 1,
+                ms: 500
+            }]
+        );
+    }
+
+    #[test]
+    fn nobody_watching_ends_a_posts_time_in_view_when_they_stopped() {
+        let mut feed = Feed::new(Network::Threads);
+        let start = Instant::now();
+        feed.drawn = vec![1];
+        feed.note_views(true, start);
+        // Away since a second in, seen a long while later.
+        feed.drawn = vec![1];
+        feed.note_views(false, start + Duration::from_secs(1));
+        assert_eq!(
+            feed.take_views(),
+            [FeedView {
+                post_id: 1,
+                ms: 1000
+            }]
+        );
+        // And nothing's timed until someone's back.
+        feed.drawn = vec![1];
+        feed.note_views(false, start + Duration::from_secs(50));
+        feed.drawn = vec![];
+        feed.note_views(true, start + Duration::from_secs(60));
+        assert!(feed.take_views().is_empty());
+    }
+
+    #[test]
+    fn only_threads_for_you_tells_what_was_in_view() {
+        let linked = PostLink {
+            network: Network::Threads,
+            code: "ABC".into(),
+            username: None,
+            url: "https://www.threads.com/post/ABC".into(),
+        };
+        let mut instagram = Feed::new(Network::Instagram);
+        let mut following = Feed::new(Network::Threads);
+        following.following = true;
+        let mut post = Feed::linked(linked);
+        let start = Instant::now();
+        for feed in [&mut instagram, &mut following, &mut post] {
+            feed.drawn = vec![1];
+            feed.note_views(true, start);
+            feed.note_views(true, start + Duration::from_secs(5));
+            assert!(feed.take_views().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_posts_kept_to_tell_about_are_bounded() {
+        let mut feed = Feed::new(Network::Threads);
+        let start = Instant::now();
+        for id in 0..(MAX_VIEWS as i64 + 3) {
+            feed.add_view(id, Duration::from_secs(1));
+        }
+        let views = feed.take_views();
+        assert_eq!(views.len(), MAX_VIEWS);
+        assert_eq!(views[0].post_id, 3, "the oldest go first");
+        feed.drawn = vec![9];
+        feed.note_views(true, start);
+        feed.add_view(1, Duration::from_secs(1));
+        feed.switched();
+        feed.note_views(true, start + Duration::from_secs(9));
+        assert!(feed.take_views().is_empty(), "forgotten with the feed");
     }
 
     #[test]

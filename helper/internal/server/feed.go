@@ -25,6 +25,10 @@ func feedLimit(n int) int {
 	return min(n, MaxFeedLimit)
 }
 
+// MaxFeedViews is the most posts one load_feed reports as seen: a screenful
+// at a time, some loads apart.
+const MaxFeedViews = 200
+
 // MaxBoxSide is the most a side of load_feed's box counts as, in pixels:
 // past any screen's width.
 const MaxBoxSide = 8192
@@ -111,7 +115,30 @@ func (t *turn) wait(ctx context.Context) error {
 	}
 }
 
+// noteViews hands what was in view to a network that reports it, before the
+// load waits its turn: tuimeta forgets them once sent, so a load called off
+// or refused must leave them for the next (PROTOCOL.md). It runs on the
+// call's own goroutine, so a load holding the network's feed only delays this
+// call.
+func (s *Server) noteViews(params json.RawMessage) {
+	p, err := decode[struct {
+		Network string             `json:"network"`
+		Views   []backend.FeedView `json:"views"`
+	}](params)
+	if err != nil || len(p.Views) == 0 {
+		return
+	}
+	_, b, err := s.network(p.Network)
+	if err != nil {
+		return
+	}
+	if r, ok := b.(backend.ViewReporter); ok {
+		r.NoteViews(p.Views[:min(len(p.Views), MaxFeedViews)])
+	}
+}
+
 func (s *Server) loadFeed(c *call) (any, error) {
+	s.noteViews(c.params)
 	if c.turn != nil {
 		// Given up while waiting, wait lets the next one go in its turn.
 		if err := c.turn.wait(c.ctx); err != nil {

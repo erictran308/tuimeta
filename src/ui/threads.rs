@@ -55,6 +55,16 @@ const MEDIA_GAP: u16 = 1;
 const REPOST: &str = "\u{f079}";
 const SHARE: &str = "\u{f1d8}";
 
+/// Enough of a post shows to count as in view, by threads.com's rule: all of
+/// it or nearly, half the pane, or 200 pixels of it.
+fn counts_as_in_view(shown: u16, total: u16, pane: u16, font: FontSize) -> bool {
+    let shown = u32::from(shown);
+    shown > 0
+        && (shown * 100 > u32::from(total) * 95
+            || shown * 2 >= u32::from(pane)
+            || shown * u32::from(font.height) >= 200)
+}
+
 /// Draws Threads' feed in `area`. Returns where the video playing is to
 /// show, when it's in view.
 pub fn draw(
@@ -143,10 +153,14 @@ pub fn draw(
     let mut video_box = None;
     let mut y: u16 = 0;
     let mut i = feed.top;
+    let mut in_view = Vec::new();
     while i < feed.posts.len() && y < inner.height {
         let drawn = lay(feed, i);
         let total = drawn.lines.len() as u16;
         let shown = total.min(inner.height - y);
+        if counts_as_in_view(shown, total, inner.height, font) {
+            in_view.push(feed.posts[i].id);
+        }
         let at = Rect {
             y: inner.y + y,
             height: shown,
@@ -205,6 +219,7 @@ pub fn draw(
         y = y.saturating_add(total);
         i += 1;
     }
+    feed.drawn = in_view;
     // The next posts' pictures download before they're in view, and the
     // nearest few posts' are made into images at the size they'll be drawn
     // (feed::AHEAD, feed::MADE_AHEAD): every picture of those, laid out, and
@@ -828,6 +843,18 @@ mod tests {
     }
 
     #[test]
+    fn a_post_counts_as_in_view_by_threads_coms_rule() {
+        let font = FontSize::new(10, 20);
+        assert!(counts_as_in_view(30, 30, 200, font), "all of it");
+        assert!(counts_as_in_view(5, 5, 200, font), "however little that is");
+        assert!(counts_as_in_view(97, 100, 200, font), "nearly all of it");
+        assert!(counts_as_in_view(25, 200, 50, font), "half the pane");
+        assert!(counts_as_in_view(10, 200, 60, font), "200 pixels of it");
+        assert!(!counts_as_in_view(9, 200, 60, font), "less than all that");
+        assert!(!counts_as_in_view(0, 5, 60, font));
+    }
+
+    #[test]
     fn the_counts_are_threads_four_with_icons_and_in_words_without() {
         let p = post(
             1,
@@ -1003,6 +1030,11 @@ mod tests {
         let row = |y: u16| -> String { (0..cols).map(|x| buf[(x, y)].symbol()).collect() };
         let all: Vec<String> = (0..rows).map(row).collect();
         assert!(all[0].contains("Threads · For you"), "{all:#?}");
+        assert_eq!(
+            feed.drawn.first(),
+            Some(&1),
+            "the post at the top is in view"
+        );
         // The column is centered: (118 - 72) / 2 columns in, then the bar.
         let header = &all[1];
         let bar = header.find('▌').expect("the selected post's bar");

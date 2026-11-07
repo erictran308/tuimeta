@@ -205,7 +205,7 @@ func TestALoginOfAnotherThreadsAccountNeverWaitsOnTheFeed(t *testing.T) {
 	}
 }
 
-func TestThreadsFeedAsksAsTheWebsiteDoesAndSaysNothingWasSeen(t *testing.T) {
+func TestThreadsFeedAsksAsTheWebsiteDoes(t *testing.T) {
 	h := newThreadsHarness(t)
 	h.login()
 	h.answers(
@@ -218,7 +218,7 @@ func TestThreadsFeedAsksAsTheWebsiteDoesAndSaysNothingWasSeen(t *testing.T) {
 	}
 	form := h.site.lastForm()
 	for k, want := range map[string]string{
-		"doc_id": "28783769534619828", "fb_api_req_friendly_name": threadsFeedQuery, "fb_api_caller_class": "RelayModern",
+		"doc_id": "29138999889064048", "fb_api_req_friendly_name": threadsFirstQuery, "fb_api_caller_class": "RelayModern",
 		"fb_dtsg": "dtsg-1", "lsd": "lsd-token", "jazoest": jazoest("dtsg-1"), "av": threadsActor, "__user": "0", "__a": "1",
 		"__req": "1", "__comet_req": "29", "__rev": "1001", "__hsi": "7000000000000000001", "__spin_r": "1001",
 		"__spin_b": "trunk", "__spin_t": "1792200000", "__crn": "comet.threads.BarcelonaHomeRouteV2", "__ccg": "EXCELLENT",
@@ -232,26 +232,33 @@ func TestThreadsFeedAsksAsTheWebsiteDoesAndSaysNothingWasSeen(t *testing.T) {
 		t.Errorf("__s %q, __hs %q", form.Get("__s"), form.Get("__hs"))
 	}
 	r := h.site.lastRequest("/api/graphql")
-	for k, want := range map[string]string{"x-fb-friendly-name": threadsFeedQuery, "x-fb-lsd": "lsd-token", "x-ig-app-id": "238260118697367",
+	for k, want := range map[string]string{"x-fb-friendly-name": threadsFirstQuery, "x-fb-lsd": "lsd-token", "x-ig-app-id": "238260118697367",
 		"x-csrftoken": "csrf1", "referer": "https://www.threads.com/", "origin": "https://www.threads.com", "sec-fetch-mode": "cors",
-		"sec-fetch-site": "same-origin", "content-type": "application/x-www-form-urlencoded", "cookie": threadsCookieText} {
+		"sec-fetch-site": "same-origin", "content-type": "application/x-www-form-urlencoded", "cookie": threadsCookieText,
+		"x-web-session-id": form.Get("__s"), "x-fb-entry-nonce": "aBcD1234"} {
 		if got := r.Header.Get(k); got != want {
 			t.Errorf("header %s = %q, want %q", k, got, want)
 		}
 	}
+	// The website's first request names only the feed and its data.
 	v := vars(t, form)
-	if v["variant"] != "for_you" || v["first"] != 10.0 || v["after"] != nil || v["sort_by"] != nil {
+	if v["variant"] != "for_you" {
 		t.Errorf("variables %v", v)
 	}
-	if _, ok := v["after"]; !ok {
-		t.Error("a declared variable not given isn't sent as null")
+	for _, k := range []string{"first", "after", "before", "last", "sort_by"} {
+		if _, ok := v[k]; ok {
+			t.Errorf("the first request has %s", k)
+		}
 	}
 	data := v["data"].(map[string]any)
-	if data["feed_view_info"] != "[]" || data["pagination_source"] != "text_post_feed_threads" || data["reason"] != nil {
+	if data["pagination_source"] != "text_post_feed_threads" || data["reason"] != "cold_start_fetch" {
 		t.Errorf("data %v", data)
 	}
+	if _, ok := data["feed_view_info"]; ok {
+		t.Errorf("the first request reports views: %v", data)
+	}
 	var state textAppState
-	if err := json.Unmarshal([]byte(data["feed_state"].(string)), &state); err != nil || state.NumTotalItems != 0 || state.LastRequestTimeMs == 0 {
+	if err := json.Unmarshal([]byte(data["feed_state"].(string)), &state); err != nil || state.NumTotalItems != 0 || state.LastRequestTimeMs != 0 {
 		t.Errorf("first feed_state %v %v", data["feed_state"], err)
 	}
 	// Every flag the query declares, worked out from the page's gates.
@@ -281,8 +288,12 @@ func TestThreadsFeedAsksAsTheWebsiteDoesAndSaysNothingWasSeen(t *testing.T) {
 	form = h.site.lastForm()
 	v = vars(t, form)
 	data = v["data"].(map[string]any)
-	if v["after"] != "cursor-1" || data["reason"] != "pagination" || data["session_id"] != nil || data["feed_view_info"] != "[]" {
+	if form.Get("doc_id") != "29611863618399704" || form.Get("fb_api_req_friendly_name") != threadsFeedQuery ||
+		v["after"] != "cursor-1" || v["first"] != 10.0 || data["reason"] != "pagination" || data["session_id"] != nil || data["feed_view_info"] != "[]" {
 		t.Errorf("second page variables %v", v)
+	}
+	if _, ok := v["sort_by"]; !ok {
+		t.Error("a declared variable not given isn't sent as null")
 	}
 	if _, ok := data["session_id"]; !ok {
 		t.Error("no session_id")
@@ -399,8 +410,142 @@ func TestThreadsFollowingFeedIsAFeedOfItsOwn(t *testing.T) {
 	h.feed(false, backend.ForYou)
 	h.feed(false, backend.Following)
 	v := vars(t, h.site.lastForm())
-	if v["variant"] != "following" || v["after"] != nil || v["data"].(map[string]any)["pagination_source"] != "text_post_feed_following" {
+	data := v["data"].(map[string]any)
+	if v["variant"] != "following" || v["after"] != nil || data["pagination_source"] != "text_post_feed_following" {
 		t.Errorf("switching feeds: %v", v)
+	}
+	if got := h.site.lastRequest("/api/graphql").Header.Get("referer"); got != "https://www.threads.com/following" {
+		t.Errorf("referer %q", got)
+	}
+}
+
+// viewReportOf is what the website writes for a post in view for ms.
+func viewReportOf(pk string, ms int) string {
+	return fmt.Sprintf(`{"media_id":%q,"media_pct":1,"time_info":{"10":%d,"25":%d,"50":%d,"75":%d},"version":24}`, pk, ms, ms, ms, ms)
+}
+
+func TestThreadsForYouReportsWhatWasInViewAsTheWebsiteDoes(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	quote := tPost("102", "sam.climbs", 19, "two", `"text_post_app_info":`+tInfo(`"share_info":{"quoted_post":`+tPost("301", "noor.draws", 19, "the original")+`}`))
+	h.answers(
+		tFeed("c1", true, tThread("", tPost("101", "maya.lens", 19, "one")), tThread("", quote)),
+		tFeed("c2", true, tThread("", tPost("103", "maya.lens", 19, "three"))),
+		tFeed("c3", true, tThread("", tPost("104", "maya.lens", 19, "four"))),
+	)
+	info := func() string {
+		return vars(t, h.site.lastForm())["data"].(map[string]any)["feed_view_info"].(string)
+	}
+	posts, _ := h.feed(false, "")
+	one, two := posts[0].ID, posts[1].ID
+	h.b.NoteViews([]backend.FeedView{
+		{PostID: one, Ms: 1000},
+		{PostID: two, Ms: 1800},
+		{PostID: 99999, Ms: 5000},             // a post this run didn't give
+		{PostID: one, Ms: minViewMs - 1},      // too short to count, as on the website
+		{PostID: one, Ms: 2 * 60 * 60 * 1000}, // seen again: the newest wins, cut at an hour
+	})
+	h.feed(false, "")
+	// A quoted post is drawn with its post, and counted on its own.
+	want := "[" + viewReportOf("101", maxViewMs) + "," + viewReportOf("102", 1800) + "," + viewReportOf("301", 1800) + "]"
+	if got := info(); got != want {
+		t.Errorf("reported\n %s\nwant\n %s", got, want)
+	}
+	// Each goes out once.
+	h.feed(false, "")
+	if got := info(); got != "[]" {
+		t.Errorf("reported again: %s", got)
+	}
+}
+
+func TestThreadsKeepsWhatWasInViewForTheNextLoadWhenOneFails(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	h.answers(tFeed("c1", true, tThread("", tPost("101", "maya.lens", 19, "one"))))
+	posts, _ := h.feed(false, "")
+	h.b.NoteViews([]backend.FeedView{{PostID: posts[0].ID, Ms: 900}})
+	h.site.graphql = func(url.Values) string { return `{"data":null,"errors":[{"message":"try later"}]}` }
+	if _, _, err := h.b.LoadFeed(context.Background(), 10, false, backend.Box{}, ""); err == nil {
+		t.Fatal("the load didn't fail")
+	}
+	h.answers(tFeed("c2", true, tThread("", tPost("102", "maya.lens", 19, "two"))))
+	h.feed(false, "")
+	if got := vars(t, h.site.lastForm())["data"].(map[string]any)["feed_view_info"]; got != "["+viewReportOf("101", 900)+"]" {
+		t.Errorf("reported %v", got)
+	}
+}
+
+func TestAThreadsLoadFromTheTopAgainIsTheFirstQueryAndReportsWhatWasInView(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	h.answers(tFeed("c1", true, tThread("", tPost("101", "maya.lens", 19, "one"))), tFeed("c2", true, tThread("", tPost("102", "maya.lens", 19, "two"))))
+	posts, _ := h.feed(false, "")
+	h.b.NoteViews([]backend.FeedView{{PostID: posts[0].ID, Ms: 900}})
+	h.feed(true, "")
+	form := h.site.lastForm()
+	data := vars(t, form)["data"].(map[string]any)
+	if form.Get("fb_api_req_friendly_name") != threadsFirstQuery || data["reason"] != "cold_start_fetch" || data["feed_view_info"] != "["+viewReportOf("101", 900)+"]" {
+		t.Errorf("asked again with %v", data)
+	}
+	var state textAppState
+	if err := json.Unmarshal([]byte(data["feed_state"].(string)), &state); err != nil || state.NumTotalItems != 0 || state.LastRequestTimeMs == 0 {
+		t.Errorf("feed_state %v %v", data["feed_state"], err)
+	}
+}
+
+func TestThreadsFollowingReportsNothingAsItsWebsiteDoesnt(t *testing.T) {
+	h := newThreadsHarness(t)
+	h.login()
+	h.answers(
+		tFeed("c1", true, tThread("", tPost("101", "maya.lens", 19, "one"))),
+		tFeed("c2", true, tThread("", tPost("102", "maya.lens", 19, "two"))),
+		tFeed("c3", true, tThread("", tPost("103", "maya.lens", 19, "three"))),
+		tFeed("c4", true, tThread("", tPost("104", "maya.lens", 19, "four"))),
+	)
+	posts, _ := h.feed(false, "")
+	h.b.NoteViews([]backend.FeedView{{PostID: posts[0].ID, Ms: 900}})
+	for range 2 {
+		h.feed(false, backend.Following)
+		if data := vars(t, h.site.lastForm())["data"].(map[string]any); data["feed_view_info"] != nil {
+			t.Errorf("Following reported %v", data["feed_view_info"])
+		}
+	}
+	// What was noted for For you isn't kept to bring back there.
+	h.feed(false, backend.ForYou)
+	if got := vars(t, h.site.lastForm())["data"].(map[string]any)["feed_view_info"]; got != "[]" {
+		t.Errorf("reported %v", got)
+	}
+}
+
+func TestThreadsFeedStateNamesWhatThePagesExperimentSays(t *testing.T) {
+	named := func(setup func(*threadsHarness)) int {
+		t.Helper()
+		h := newThreadsHarness(t)
+		setup(h)
+		h.login()
+		var rows []string
+		for i := range 25 {
+			rows = append(rows, tThread("", tPost(fmt.Sprint(1000+i), "maya.lens", 19, "words")))
+		}
+		h.answers(tFeed("c1", true, rows...), tFeed("c2", true, tThread("", tPost("2000", "maya.lens", 19, "words"))))
+		h.feed(false, "")
+		h.feed(false, "")
+		var state textAppState
+		if err := json.Unmarshal([]byte(vars(t, h.site.lastForm())["data"].(map[string]any)["feed_state"].(string)), &state); err != nil {
+			t.Fatal(err)
+		}
+		return len(state.LastNItems)
+	}
+	if n := named(func(*threadsHarness) {}); n != threadsLastN {
+		t.Errorf("named %d", n)
+	}
+	n := named(func(h *threadsHarness) {
+		h.site.home = func(r *http.Request) *http.Response {
+			return respond(200, strings.Replace(threadsHTML(true, "dtsg-1"), `"3519":{"r":null}`, `"3519":{"r":null},"5205":{"r":2}`, 1))(r)
+		}
+	})
+	if n != 2 {
+		t.Errorf("named %d with the experiment saying 2", n)
 	}
 }
 
@@ -428,8 +573,10 @@ func TestThreadsSendsOnlyQueriesNeverAMutation(t *testing.T) {
 
 // newBundle is JavaScript defining the feed query anew: doc id 999, a
 // variable more, and a new flag with its provider.
-const newBundle = `__d("BarcelonaFeedPaginationDirectQuery_threadsRelayOperation",[],(function(t,n,r,o,a,i){a.exports="999"}),null);
-__d("BarcelonaFeedPaginationDirectQuery.threads.graphql",["BarcelonaFeedPaginationDirectQuery_threadsRelayOperation"],(function(t,n,r,o,a,i,l){"use strict";var e=[{defaultValue:null,kind:"LocalArgument",name:"after"},{defaultValue:null,kind:"LocalArgument",name:"data"},{defaultValue:null,kind:"LocalArgument",name:"first"},{defaultValue:null,kind:"LocalArgument",name:"variant"},{defaultValue:null,kind:"LocalArgument",name:"mood"},{defaultValue:null,kind:"LocalArgument",name:"__relay_internal__pv__BarcelonaIsLoggedInrelayprovider"},{defaultValue:null,kind:"LocalArgument",name:"__relay_internal__pv__BarcelonaHasNewThingrelayprovider"}];return{params:{id:n("BarcelonaFeedPaginationDirectQuery_threadsRelayOperation"),metadata:{is_fully_www_executable:!0},name:"BarcelonaFeedPaginationDirectQuery",operationKind:"query",text:null}}}),null);
+const newBundle = `__d("BarcelonaFeedDirectQuery_threadsRelayOperation",[],(function(t,n,r,o,a,i){a.exports="999"}),null);
+__d("BarcelonaFeedDirectQuery.threads.graphql",["BarcelonaFeedDirectQuery_threadsRelayOperation"],(function(t,n,r,o,a,i,l){"use strict";var e=[{defaultValue:null,kind:"LocalArgument",name:"after"},{defaultValue:null,kind:"LocalArgument",name:"data"},{defaultValue:null,kind:"LocalArgument",name:"first"},{defaultValue:null,kind:"LocalArgument",name:"variant"},{defaultValue:null,kind:"LocalArgument",name:"mood"},{defaultValue:null,kind:"LocalArgument",name:"__relay_internal__pv__BarcelonaIsLoggedInrelayprovider"},{defaultValue:null,kind:"LocalArgument",name:"__relay_internal__pv__BarcelonaHasNewThingrelayprovider"}];return{params:{id:n("BarcelonaFeedDirectQuery_threadsRelayOperation"),metadata:{is_fully_www_executable:!0},name:"BarcelonaFeedDirectQuery",operationKind:"query",text:null}}}),null);
+__d("BarcelonaFeedPaginationDirectQuery_threadsRelayOperation",[],(function(t,n,r,o,a,i){a.exports="998"}),null);
+__d("BarcelonaFeedPaginationDirectQuery.threads.graphql",["BarcelonaFeedPaginationDirectQuery_threadsRelayOperation"],(function(t,n,r,o,a,i,l){"use strict";var e=[{defaultValue:null,kind:"LocalArgument",name:"after"},{defaultValue:null,kind:"LocalArgument",name:"data"},{defaultValue:null,kind:"LocalArgument",name:"first"},{defaultValue:null,kind:"LocalArgument",name:"variant"},{defaultValue:null,kind:"LocalArgument",name:"__relay_internal__pv__BarcelonaIsLoggedInrelayprovider"}];return{params:{id:n("BarcelonaFeedPaginationDirectQuery_threadsRelayOperation"),metadata:{is_fully_www_executable:!0},name:"BarcelonaFeedPaginationDirectQuery",operationKind:"query",text:null}}}),null);
 __d("BarcelonaHasNewThing.relayprovider",["gkx"],(function(t,n,r,o,a,i,l){"use strict";var e={get:function(){return r("gkx")("6542")===!1}};l.default=e}),98);`
 
 func TestThreadsReadsAChangedQueryAgainFromTheWebsiteWithoutCookies(t *testing.T) {
@@ -470,12 +617,12 @@ func TestThreadsReadsAChangedQueryAgainFromTheWebsiteWithoutCookies(t *testing.T
 	}
 	// Kept, with the bundles that held nothing.
 	var saved threadsCatalog
-	if ok, err := h.deps.Session.LoadJSON(catalogFile, &saved); !ok || err != nil || saved.Queries[threadsFeedQuery].Doc != "999" || len(saved.Empty) != 2 {
+	if ok, err := h.deps.Session.LoadJSON(catalogFile, &saved); !ok || err != nil || saved.Queries[threadsFirstQuery].Doc != "999" || saved.Queries[threadsFeedQuery].Doc != "998" || len(saved.Empty) != 2 {
 		t.Errorf("catalog kept: %v %v %+v", ok, err, saved)
 	}
 	// A new backend starts from it.
 	h2 := newThreadsHarnessIn(t, h.dir)
-	if h2.b.cat.Queries[threadsFeedQuery].Doc != "999" {
+	if h2.b.cat.Queries[threadsFirstQuery].Doc != "999" {
 		t.Error("the kept catalog wasn't read")
 	}
 
@@ -623,7 +770,7 @@ func TestThreadsLogoutForgetsTheSessionAndWhatWasLearned(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(h.dir, "threads")); !os.IsNotExist(err) {
 		t.Error("the folder is still there")
 	}
-	if h.b.cat.Queries[threadsFeedQuery].Doc != "28783769534619828" {
+	if h.b.cat.Queries[threadsFeedQuery].Doc != "29611863618399704" {
 		t.Error("the learned catalog outlived the logout")
 	}
 	if s := h.rec.events("account"); s[len(s)-1]["state"] != "logged_out" {

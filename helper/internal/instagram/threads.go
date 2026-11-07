@@ -78,6 +78,8 @@ var (
 	_ backend.Backend   = (*Threads)(nil)
 	_ backend.Feeder    = (*Threads)(nil)
 	_ backend.Commenter = (*Threads)(nil)
+
+	_ backend.ViewReporter = (*Threads)(nil)
 )
 
 // NewThreads is the Threads account.
@@ -482,10 +484,14 @@ func (t *Threads) rediscover(ctx context.Context, s *threadsSession, name, from 
 	if err != nil {
 		return err
 	}
-	// The query and the others like it (replies come with more replies).
-	want := []string{name}
+	// The query and the others like it: replies come with more replies, the
+	// feed's first page with the next. Only one rediscovery goes per
+	// rediscoverEvery, so one read for the other soon after would be refused.
+	want := []string{threadsFirstQuery, threadsFeedQuery}
 	if name == threadsRepliesQuery || name == threadsMoreQuery {
 		want = []string{threadsRepliesQuery, threadsMoreQuery}
+	} else if name != threadsFirstQuery && name != threadsFeedQuery {
+		want = []string{name}
 	}
 	d := newDiscovery(want...)
 	cat := newDiscovery().merge(t.cat)
@@ -503,7 +509,7 @@ func (t *Threads) rediscover(ctx context.Context, s *threadsSession, name, from 
 		}
 		read += len(js)
 		bundles++
-		if !d.scan(js) {
+		if !d.scan(js) && !namesAQuery(js) {
 			cat.markEmpty(u)
 		}
 		if d.done() || read >= maxDiscovery {

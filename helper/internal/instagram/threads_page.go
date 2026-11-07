@@ -24,7 +24,7 @@ type threadsPage struct {
 	rev, spinR, spinT  string
 	spinB, hsi, haste  string
 	cometReq, ccg, crn string
-	dpr                string
+	dpr, nonce         string
 	// actor is the account's id as the website's requests name it (av);
 	// viewerID its Instagram user id; username its name on Threads.
 	actor, viewerID, username string
@@ -58,8 +58,27 @@ var (
 	pageExp      = regexp.MustCompile(`"(\d+)":\{"r":(true|false|null|-?\d+(?:\.\d+)?|"[^"\\]{0,200}")`)
 	pageConfig   = regexp.MustCompile(`"(\d+)":\{"value":(true|false|null|-?\d+(?:\.\d+)?|"[^"\\]{0,200}")\}`)
 	pageBundle   = regexp.MustCompile(`https:(?:\\/\\/|//)static\.cdninstagram\.com(?:\\/|/)rsrc\.php(?:\\/|/)[A-Za-z0-9_\\/,.+-]{1,300}?\.js`)
+	pageNonce    = regexp.MustCompile(`"nonce":"([A-Za-z0-9_-]{1,64})"`)
+	pageEntryEnd = regexp.MustCompile(`\},\d+\]`)
 	threadsDigit = regexp.MustCompile(`^\d{1,25}$`)
 )
+
+// bootloaderNonce is the nonce the page's loader sends with each request,
+// from its own settings: another "nonce" in the page isn't it.
+func bootloaderNonce(html string) string {
+	i := strings.Index(html, `"BootloaderConfig",[],{`)
+	if i < 0 {
+		return ""
+	}
+	entry := html[i:min(i+4000, len(html))]
+	if end := pageEntryEnd.FindStringIndex(entry); end != nil {
+		entry = entry[:end[0]]
+	}
+	if m := pageNonce.FindStringSubmatch(entry); m != nil {
+		return m[1]
+	}
+	return ""
+}
 
 // maxBundles is the most JavaScript files a page's list keeps: the home
 // page names about 420.
@@ -79,7 +98,7 @@ func parseThreadsPage(html string) (p threadsPage, ok bool) {
 		dtsg: first(pageDTSG), lsd: first(pageLSD), appID: first(pageAppID),
 		rev: first(pageRev), spinR: first(pageSpinR), spinT: first(pageSpinT), spinB: first(pageSpinB),
 		hsi: first(pageHSI), haste: first(pageHaste), cometReq: first(pageComet), ccg: first(pageCCG),
-		crn: first(pageCRN), dpr: first(pageDPR),
+		crn: first(pageCRN), dpr: first(pageDPR), nonce: bootloaderNonce(html),
 		actor: first(pageActor),
 		gkx:   map[string]bool{}, qex: map[string]json.RawMessage{}, config: map[string]json.RawMessage{},
 	}

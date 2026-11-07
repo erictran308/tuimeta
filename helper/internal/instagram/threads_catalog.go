@@ -6,9 +6,9 @@ package instagram
 // is a persisted document (its doc id), with the variables it declares,
 // among them the website's feature flags, whose values the website's code
 // works out from the gates and experiments its page shipped. What the
-// website did on 2026-10-17 is built in. Threads changes its queries from
-// time to time; when it stops taking one as sent (a variable it now needs,
-// a doc id it no longer knows), the definitions are read again from the
+// website did is built in (builtinCatalog says when). Threads changes its
+// queries from time to time; when it stops taking one as sent (a variable it
+// now needs, a doc id it no longer knows), the definitions are read again from the
 // website's own JavaScript, as a browser loading the page would get it, and
 // kept in <data-dir>/threads/catalog.json.
 
@@ -25,6 +25,7 @@ import (
 // The queries the helper sends. Replies of a reply are the reply's own
 // first and later replies, asked for with these two as for a post.
 const (
+	threadsFirstQuery   = "BarcelonaFeedDirectQuery"
 	threadsFeedQuery    = "BarcelonaFeedPaginationDirectQuery"
 	threadsRepliesQuery = "BarcelonaPostPageDownwardQuery"
 	threadsMoreQuery    = "BarcelonaPostPageDirectRepliesRefetchQuery"
@@ -70,9 +71,27 @@ type threadsCatalog struct {
 
 func words(s string) []string { return strings.Fields(s) }
 
-// threadsFlags are the feature flags the three queries declared on
-// 2026-10-17; the reply queries add one more.
+// threadsFlags are the feature flags the feed's two queries declared on
+// 2026-11-07.
 var threadsFlags = words(`BarcelonaIsLoggedIn BarcelonaShouldFetchPostAuthorFullName BarcelonaHasDearAlgoConsumption
+	BarcelonaHasMetaAiContentAttachments BarcelonaHasMWRConsumption BarcelonaMessagesHasLiveChatMessaging
+	BarcelonaHasEventBadge BarcelonaHasBestOfThreads BarcelonaMessagingHasMetaAIBot
+	BarcelonaHasMembersOnlyReplyConsumption BarcelonaGenAIRepliesEnabled BarcelonaIsSearchDiscoveryEnabled
+	BarcelonaHasCommunities BarcelonaHasGameScoreShare BarcelonaHasPublicViewCountCard
+	BarcelonaHasCommunityEmojiUpdateCard BarcelonaHasCommunityEntityCard BarcelonaHasCommunityIntroCard
+	BarcelonaHasCommunityChampionCard BarcelonaHasCommunityFounderCard BarcelonaHasScorecardCommunity
+	BarcelonaHasSportTeamAllegianceCard BarcelonaHasStitchedAttachment BarcelonaHasNewspaperLinkStyle
+	BarcelonaHasMessaging BarcelonaHasProfileUpdatePost BarcelonaHasLiveChatHostlessUI
+	BarcelonaOptionalCookiesEnabled BarcelonaShouldFulfillLightboxQuery BarcelonaCanSeeSponsoredContent
+	BarcelonaHasUnseenReplies BarcelonaHasWebFavicons BarcelonaIsCrawler BarcelonaHasDearAlgoWebProduction
+	BarcelonaHasCommunityTopContributors BarcelonaHasTopLevelSaveButton BarcelonaHasCustomLikesConsumption
+	BarcelonaHasViewerReplied BarcelonaHasPrivateRepliesDeprecation BarcelonaHasGhostPostEmojiActivation
+	BarcelonaHasGhostPostProduction BarcelonaHasKeyboardShortcuts BarcelonaHasNewsletterLinkPreview
+	BarcelonaIsLoggedOutShareTestEnabled BarcelonaHasPodcastTranscriptConsumption BarcelonaHasPodcastV2Consumption
+	BarcelonaHasPublicViewCountShareCard BarcelonaShouldShowFediverseM075Features BarcelonaIsInternalUser`)
+
+// threadsReplyFlags are the ones the reply queries declared on 2026-10-17.
+var threadsReplyFlags = words(`BarcelonaIsLoggedIn BarcelonaShouldFetchPostAuthorFullName BarcelonaHasDearAlgoConsumption
 	BarcelonaHasMetaAiContentAttachments BarcelonaHasMWRLocationConsumption
 	BarcelonaMessagesHasLiveChatMessaging BarcelonaHasEventBadge BarcelonaHasBestOfThreads
 	BarcelonaMessagingHasMetaAIBot BarcelonaGenAIRepliesEnabled BarcelonaIsSearchDiscoveryEnabled
@@ -86,30 +105,45 @@ var threadsFlags = words(`BarcelonaIsLoggedIn BarcelonaShouldFetchPostAuthorFull
 	BarcelonaHasGhostPostEmojiActivation BarcelonaHasGhostPostProduction
 	BarcelonaHasPodcastTranscriptConsumption BarcelonaHasPodcastV2Consumption
 	BarcelonaHasNewsletterLinkPreview BarcelonaHasPublicViewCountShareCard
-	BarcelonaShouldShowFediverseM075Features BarcelonaIsInternalUser`)
+	BarcelonaShouldShowFediverseM075Features BarcelonaIsInternalUser BarcelonaHasPermalinkIndentation`)
 
-// builtinCatalog is the website's queries as of 2026-10-17.
+// builtinCatalog is the website's queries: the feed's as of 2026-11-07, the
+// replies' as of 2026-10-17.
 func builtinCatalog() *threadsCatalog {
-	replyFlags := append(slices.Clone(threadsFlags), "BarcelonaHasPermalinkIndentation")
 	return &threadsCatalog{
 		Version: 1,
 		Queries: map[string]threadsQuery{
-			threadsFeedQuery: {Name: threadsFeedQuery, Doc: "28783769534619828", Kind: "query",
+			threadsFirstQuery: {Name: threadsFirstQuery, Doc: "29138999889064048", Kind: "query",
+				Vars: words("data variant"), Flags: slices.Clone(threadsFlags)},
+			threadsFeedQuery: {Name: threadsFeedQuery, Doc: "29611863618399704", Kind: "query",
 				Vars: words("after before data first last sort_by variant"), Flags: slices.Clone(threadsFlags)},
 			threadsRepliesQuery: {Name: threadsRepliesQuery, Doc: "28686245017651778", Kind: "query",
-				Vars: words("after filterType first postID sortOrder"), Flags: replyFlags},
+				Vars: words("after filterType first postID sortOrder"), Flags: slices.Clone(threadsReplyFlags)},
 			threadsMoreQuery: {Name: threadsMoreQuery, Doc: "30205808475684005", Kind: "query",
-				Vars: words("after filterType first postID sortOrder"), Flags: slices.Clone(replyFlags)},
+				Vars: words("after filterType first postID sortOrder"), Flags: slices.Clone(threadsReplyFlags)},
 		},
 		Providers: map[string]string{
-			"BarcelonaCanSeeSponsoredContent":          `return!1`,
-			"BarcelonaGenAIRepliesEnabled":             `return r("qex")._("5477")===!0`,
-			"BarcelonaHasBestOfThreads":                `return!0`,
+			"BarcelonaCanSeeSponsoredContent":         `return!1`,
+			"BarcelonaGenAIRepliesEnabled":            `return r("qex")._("5477")===!0`,
+			"BarcelonaHasBestOfThreads":               `return!0`,
+			"BarcelonaHasCommunityChampionCard":       `return r("gkx")("28195")===!0`,
+			"BarcelonaHasCommunityFounderCard":        `return r("gkx")("28780")===!0`,
+			"BarcelonaHasCommunityIntroCard":          `return r("gkx")("28091")===!0`,
+			"BarcelonaHasKeyboardShortcuts":           `return r("qex")._("2590")===!0`,
+			"BarcelonaHasLiveChatHostlessUI":          `return r("gkx")("1622")===!0`,
+			"BarcelonaHasMWRConsumption":              `return r("gkx")("27626")===!0||r("gkx")("28517")===!0||r("gkx")("28518")===!0`,
+			"BarcelonaHasMembersOnlyReplyConsumption": `return r("gkx")("7479")&&r("gkx")("27750")`,
+			"BarcelonaHasProfileUpdatePost":           `return r("MetaConfig")._("659",!0)===!0`,
+			"BarcelonaHasTopLevelSaveButton":          `return r("qex")._("4492")===!0`,
+			// The website's is `var e=QEX;if(e!=null)return e===1||e===2;var
+			// t=GKX;return t===!0`, a shape flagExpr doesn't read: once
+			// rediscovery replaces this, the flag is off.
+			"BarcelonaIsLoggedOutShareTestEnabled":     `return r("qex")._("407")===1||r("qex")._("407")===2||r("qex")._("407")===null&&r("gkx")("20242")===!0`,
 			"BarcelonaHasCommunities":                  `return r("gkx")("6542")===!0`,
 			"BarcelonaHasCommunityEmojiUpdateCard":     `return r("gkx")("22366")===!0`,
 			"BarcelonaHasCommunityEntityCard":          `return r("gkx")("23446")===!0`,
 			"BarcelonaHasCommunityTopContributors":     `return r("gkx")("17942")===!0`,
-			"BarcelonaHasCustomLikesConsumption":       `return r("gkx")("12807")===!0`,
+			"BarcelonaHasCustomLikesConsumption":       `return r("qex")._("2752")===!0`,
 			"BarcelonaHasDearAlgoConsumption":          `return r("gkx")("4511")`,
 			"BarcelonaHasDearAlgoWebProduction":        `return r("gkx")("14866")`,
 			"BarcelonaHasEventBadge":                   `return r("gkx")("3960")`,
@@ -128,7 +162,7 @@ func builtinCatalog() *threadsCatalog {
 			"BarcelonaHasPublicViewCountCard":          `return r("gkx")("21940")===!0`,
 			"BarcelonaHasPublicViewCountShareCard":     `return r("gkx")("1708")===!0`,
 			"BarcelonaHasScorecardCommunity":           `return r("gkx")("22721")===!0`,
-			"BarcelonaHasSportTeamAllegianceCard":      `var e;return(e=r("qex")._("518"))!=null?e:!1`,
+			"BarcelonaHasSportTeamAllegianceCard":      `var e;return r("gkx")("27712")||((e=r("qex")._("518"))!=null?e:!1)`,
 			"BarcelonaHasStitchedAttachment":           `return r("gkx")("17978")===!0`,
 			"BarcelonaHasUnseenReplies":                `return r("qex")._("4226")===!0`,
 			"BarcelonaHasViewerReplied":                `return r("gkx")("7316")`,
@@ -147,13 +181,13 @@ func builtinCatalog() *threadsCatalog {
 	}
 }
 
-// usable reports whether c has the three queries, each a query with a doc
+// usable reports whether c has the four queries, each a query with a doc
 // id: a saved catalog that hasn't isn't used.
 func (c *threadsCatalog) usable() bool {
 	if c == nil || c.Version != 1 {
 		return false
 	}
-	for _, name := range []string{threadsFeedQuery, threadsRepliesQuery, threadsMoreQuery} {
+	for _, name := range []string{threadsFirstQuery, threadsFeedQuery, threadsRepliesQuery, threadsMoreQuery} {
 		q, ok := c.Queries[name]
 		if !ok || q.Kind != "query" || !threadsDigit.MatchString(q.Doc) {
 			return false
@@ -225,17 +259,10 @@ type flagExpr struct {
 	depth int
 }
 
-// orFalse is `var e;return(e=X)!=null?e:!1`: X, or false if it's null.
-var orFalse = regexp.MustCompile(`^var e;return\(e=(.+)\)!=null\?e:!1$`)
-
 func (ex *flagExpr) run() (any, error) {
-	src := strings.TrimSpace(ex.src)
-	nullIsFalse := false
-	if m := orFalse.FindStringSubmatch(src); m != nil {
-		src, nullIsFalse = m[1], true
-	} else if rest, ok := strings.CutPrefix(src, "return"); ok {
-		src = rest
-	} else {
+	// `var e;` only names what `(e=X)!=null?e:!1` uses (atom).
+	src, ok := strings.CutPrefix(strings.TrimPrefix(strings.TrimSpace(ex.src), "var e;"), "return")
+	if !ok {
 		return nil, errBadFlag
 	}
 	ex.src, ex.at = strings.TrimSpace(src), 0
@@ -245,9 +272,6 @@ func (ex *flagExpr) run() (any, error) {
 	}
 	if ex.at != len(ex.src) {
 		return nil, errBadFlag
-	}
-	if nullIsFalse && v == nil {
-		return false, nil
 	}
 	return v, nil
 }
@@ -304,8 +328,9 @@ func (ex *flagExpr) eq() (any, error) {
 var (
 	flagGate     = regexp.MustCompile(`^r\("gkx"\)\("(\d+)"\)`)
 	flagExp      = regexp.MustCompile(`^r\("qex"\)\._\("(\d+)"\)`)
-	flagSetting  = regexp.MustCompile(`^r\("MetaConfig"\)\._\("(\d+)"\)`)
+	flagSetting  = regexp.MustCompile(`^r\("MetaConfig"\)\._\("(\d+)"(?:,(!0|!1))?\)`)
 	flagProvider = regexp.MustCompile(`^r\("([A-Za-z0-9]+)\.relayprovider"\)\.get\(\)`)
+	flagNumber   = regexp.MustCompile(`^-?\d+`)
 )
 
 func (ex *flagExpr) atom() (any, error) {
@@ -317,6 +342,16 @@ func (ex *flagExpr) atom() (any, error) {
 		return false, nil
 	case ex.eat("null"):
 		return nil, nil
+	case ex.eat("(e="):
+		// `(e=X)!=null?e:!1`: X, or false if it's null.
+		v, err := ex.or()
+		if err == nil && !ex.eat(")!=null?e:!1") {
+			err = errBadFlag
+		}
+		if v == nil {
+			v = false
+		}
+		return v, err
 	case ex.eat("("):
 		v, err := ex.or()
 		if err == nil && !ex.eat(")") {
@@ -334,7 +369,19 @@ func (ex *flagExpr) atom() (any, error) {
 	}
 	if m := flagSetting.FindStringSubmatch(rest); m != nil {
 		ex.at += len(m[0])
-		return ex.shipped(func(p *threadsPage) json.RawMessage { return p.config[m[1]] }), nil
+		v := ex.shipped(func(p *threadsPage) json.RawMessage { return p.config[m[1]] })
+		if v == nil && m[2] != "" {
+			return m[2] == "!0", nil
+		}
+		return v, nil
+	}
+	if m := flagNumber.FindString(rest); m != "" {
+		ex.at += len(m)
+		var v any
+		if json.Unmarshal([]byte(m), &v) != nil {
+			return nil, errBadFlag
+		}
+		return v, nil
 	}
 	if m := flagProvider.FindStringSubmatch(rest); m != nil {
 		ex.at += len(m[0])
@@ -534,6 +581,18 @@ func (d *discovery) merge(c *threadsCatalog) *threadsCatalog {
 func bundleKey(u string) string {
 	sum := sha256.Sum256([]byte(u))
 	return hex.EncodeToString(sum[:12])
+}
+
+// namesAQuery reports whether js has anything of a query the helper sends:
+// a bundle read for one query isn't empty if it holds another's, which
+// would then never be found.
+func namesAQuery(js string) bool {
+	for _, q := range []string{threadsFirstQuery, threadsFeedQuery, threadsRepliesQuery, threadsMoreQuery} {
+		if strings.Contains(js, q) {
+			return true
+		}
+	}
+	return false
 }
 
 // isEmpty reports whether a rediscovery found nothing in bundle u.

@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::config;
 
 /// The protocol version this build speaks; the helper says its own first.
-const PROTOCOL_VERSION: u32 = 8;
+const PROTOCOL_VERSION: u32 = 9;
 /// How long the helper may take to say hello before it counts as broken.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line read from the helper, twice what it writes at most. A
@@ -368,6 +368,14 @@ pub struct FileToSend {
     pub size: u64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+}
+
+/// A post that was in view, and how long it last stayed there (`load_feed`'s
+/// `views` in PROTOCOL.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct FeedView {
+    pub post_id: i64,
+    pub ms: u64,
 }
 
 /// A post of a network's home feed (`load_feed` in PROTOCOL.md).
@@ -1070,8 +1078,10 @@ impl Meta {
     /// newest posts again, answered by [`MetaEvent::Feed`] numbered `load`.
     /// `picture` is the largest box, in pixels, a post's picture is drawn
     /// in: the helper then sends none bigger than that needs. On Threads,
-    /// `following` asks for the accounts followed rather than For you.
+    /// `following` asks for the accounts followed rather than For you, and
+    /// `views` tell For you what was in view, as threads.com does.
     /// Returns the request's id, for [`cancel`](Self::cancel).
+    #[allow(clippy::too_many_arguments)]
     pub fn load_feed(
         &self,
         network: Network,
@@ -1080,11 +1090,15 @@ impl Meta {
         picture: Option<(u32, u32)>,
         following: bool,
         load: u64,
+        views: &[FeedView],
     ) -> u64 {
         let mut params = json!({"network": network, "limit": limit, "fresh": fresh});
         if let Some((width, height)) = picture {
             params["width"] = width.into();
             params["height"] = height.into();
+        }
+        if !views.is_empty() {
+            params["views"] = json!(views);
         }
         if network == Network::Threads {
             params["feed"] = if following { "following" } else { "for_you" }.into();
@@ -1698,7 +1712,7 @@ mod tests {
 
         // Instagram's feed: a page of posts, each one shown, and a video
         // that downloads to a file a player can open.
-        meta.load_feed(Network::Messenger, 10, false, None, false, 1);
+        meta.load_feed(Network::Messenger, 10, false, None, false, 1, &[]);
         let refused = next(&mut rx, |e| match e {
             MetaEvent::Feed { page, .. } => Some(page),
             _ => None,
@@ -1720,7 +1734,15 @@ mod tests {
             _ => None,
         })
         .await;
-        meta.load_feed(Network::Instagram, 10, false, Some((600, 600)), false, 2);
+        meta.load_feed(
+            Network::Instagram,
+            10,
+            false,
+            Some((600, 600)),
+            false,
+            2,
+            &[],
+        );
         let (posts, more) = next(&mut rx, |e| match e {
             MetaEvent::Feed { load: 2, page, .. } => Some(page.expect("a page")),
             _ => None,
@@ -1750,7 +1772,7 @@ mod tests {
         .await
         .expect("downloaded");
         assert!(Path::new(&path).is_absolute() && Path::new(&path).is_file());
-        meta.load_feed(Network::Instagram, 10, true, None, false, 3);
+        meta.load_feed(Network::Instagram, 10, true, None, false, 3, &[]);
         let (again, _) = next(&mut rx, |e| match e {
             MetaEvent::Feed { load: 3, page, .. } => Some(page.expect("a page")),
             _ => None,
@@ -1822,7 +1844,7 @@ mod tests {
             _ => None,
         })
         .await;
-        meta.load_feed(Network::Threads, 10, false, Some((600, 600)), false, 8);
+        meta.load_feed(Network::Threads, 10, false, Some((600, 600)), false, 8, &[]);
         let (threads, more) = next(&mut rx, |e| match e {
             MetaEvent::Feed {
                 network: Network::Threads,
@@ -1842,7 +1864,12 @@ mod tests {
         assert!(shown.iter().any(|p| p.quoted.is_some()), "a quote");
         assert!(shown.iter().any(|p| p.link.is_some()), "a link card");
         assert!(shown.iter().any(|p| p.context.is_some()), "a repost");
-        meta.load_feed(Network::Threads, 10, false, None, false, 10);
+        // The fake takes what was in view, as the real one does.
+        let view = FeedView {
+            post_id: threads[0].id,
+            ms: 900,
+        };
+        meta.load_feed(Network::Threads, 10, false, None, false, 10, &[view]);
         let (next_page, _) = next(&mut rx, |e| match e {
             MetaEvent::Feed {
                 network: Network::Threads,
@@ -1858,7 +1885,7 @@ mod tests {
                 .all(|p| threads.iter().all(|t| t.id != p.id))
         );
         assert!(next_page.iter().any(|p| p.continues), "a thread");
-        meta.load_feed(Network::Threads, 10, true, None, true, 9);
+        meta.load_feed(Network::Threads, 10, true, None, true, 9, &[]);
         let (following, _) = next(&mut rx, |e| match e {
             MetaEvent::Feed {
                 network: Network::Threads,
@@ -2038,14 +2065,15 @@ mod tests {
 
     #[test]
     fn only_a_helper_speaking_this_protocol_is_used() {
-        check_hello(br#"{"event":"hello","version":8,"helper":"0.1.0"}"#).unwrap();
-        let newer = check_hello(br#"{"event":"hello","version":9}"#).unwrap_err();
+        check_hello(br#"{"event":"hello","version":9,"helper":"0.1.0"}"#).unwrap();
+        let newer = check_hello(br#"{"event":"hello","version":10}"#).unwrap_err();
         assert!(newer.to_string().contains("same release"), "{newer}");
         // Version 3 read `send_files` by path alone, so a file swapped after
         // the composer checked it would go out; version 4 has no feed,
         // version 5 no Threads, version 6 doesn't open posts by their links,
-        // and version 7 can't call off a load nobody waits for.
-        for older in [3, 4, 5, 6, 7] {
+        // version 7 can't call off a load nobody waits for, and version 8
+        // never tells Threads what was in view, so its pages thin out.
+        for older in [3, 4, 5, 6, 7, 8] {
             let line = format!(r#"{{"event":"hello","version":{older}}}"#);
             let older = check_hello(line.as_bytes()).unwrap_err();
             assert!(older.to_string().contains("same release"), "{older}");

@@ -16,11 +16,11 @@ Anything another Messenger or Instagram user, or a file, link or folder tuimeta 
 - files sent that you didn't pick;
 - the helper fetching a URL from a message, or sending anything the app didn't ask for;
 - a post, comment, caption or name in Instagram's feed that does any of the above, passes for another account, or opens something without asking;
-- the feed telling Instagram what you looked at or watched, or liking, commenting or following on its own;
+- the feed telling Instagram what you looked at or watched, telling Threads anything beyond For you's reports of what was on screen (see the README), or liking, commenting or following on its own;
 - Pepper's player (`pepper-play`) being made to play anything but the file tuimeta downloaded, to fetch something, or to draw where tuimeta didn't place it.
 
 Bugs in mautrix-meta or whatsmeow themselves belong at <https://github.com/mautrix/meta> and <https://github.com/tulir/whatsmeow>.
 
 ## What tuimeta can't protect you from
 
-tuimeta isn't made or allowed by Meta. Meta can tell an unofficial client apart, and may lock or ban an account that uses one. Instagram's direct messages aren't end-to-end encrypted, so Meta can read them whatever app you use; Messenger's encrypted chats are encrypted between the devices in them, tuimeta's helper among them.
+tuimeta isn't made or allowed by Meta. Meta can tell an unofficial client apart, and may lock or ban an account that uses one. Threads' For you feed is told which posts you looked at and for how long, as threads.com tells it, by design since 0.5.0. Instagram's direct messages aren't end-to-end encrypted, so Meta can read them whatever app you use; Messenger's encrypted chats are encrypted between the devices in them, tuimeta's helper among them.

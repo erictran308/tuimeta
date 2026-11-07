@@ -23,7 +23,7 @@ func TestAThreadsPageIsReadForItsTokensItsViewerItsGatesAndItsCode(t *testing.T)
 			t.Errorf("no %s", what)
 		}
 	}
-	if p.dtsg != "tok" || p.actor != threadsActor || p.viewerID != threadsViewer || p.username != "robin.hale" || p.appID != "238260118697367" {
+	if p.dtsg != "tok" || p.actor != threadsActor || p.viewerID != threadsViewer || p.username != "robin.hale" || p.appID != "238260118697367" || p.nonce != "aBcD1234" {
 		t.Errorf("read %+v", p)
 	}
 	if !p.gkx["7479"] || p.gkx["6542"] || string(p.qex["5477"]) != "true" || string(p.qex["518"]) != "null" || string(p.config["92"]) != "true" {
@@ -41,6 +41,27 @@ func TestAThreadsPageIsReadForItsTokensItsViewerItsGatesAndItsCode(t *testing.T)
 	}
 	if jazoest("ab") != "2195" {
 		t.Errorf("jazoest %s", jazoest("ab"))
+	}
+}
+
+func TestTheEntryNonceIsOnlyTheLoadersOwn(t *testing.T) {
+	for page, want := range map[string]string{
+		`["BootloaderConfig",[],{"a":1,"nonce":"mine"},329]`:                          "mine",
+		`["BootloaderConfig",[],{"a":1},329],["Other",[],{"nonce":"someone-else"},5]`: "",
+		`["Other",[],{"nonce":"someone-else"},5]`:                                     "",
+	} {
+		if got := bootloaderNonce(page); got != want {
+			t.Errorf("%s: got %q", page, got)
+		}
+	}
+}
+
+func TestABundleHoldingAnotherQueryIsntEmpty(t *testing.T) {
+	if !namesAQuery(`__d("BarcelonaPostPageDownwardQuery_threadsRelayOperation",[],(function(){}),null);`) {
+		t.Error("the replies' bundle would be skipped from then on")
+	}
+	if namesAQuery(`__d("Nothing",[],(function(){}),1);`) {
+		t.Error("a bundle of nothing wanted isn't marked")
 	}
 }
 
@@ -65,36 +86,45 @@ func TestTheBuiltInCatalogHasEveryFlagsCode(t *testing.T) {
 func TestFlagsAreWorkedOutAsTheWebsitesOwnCodeWorksThemOut(t *testing.T) {
 	page := &threadsPage{
 		gkx:    map[string]bool{"1": true, "2": false},
-		qex:    map[string]json.RawMessage{"10": json.RawMessage("true"), "11": json.RawMessage("null"), "12": json.RawMessage("false"), "13": json.RawMessage(`"x"`)},
+		qex:    map[string]json.RawMessage{"10": json.RawMessage("true"), "11": json.RawMessage("null"), "12": json.RawMessage("false"), "13": json.RawMessage(`"x"`), "14": json.RawMessage("1")},
 		config: map[string]json.RawMessage{"20": json.RawMessage("true")},
 	}
 	c := &threadsCatalog{Providers: map[string]string{"On": `return r("gkx")("1")`}}
 	for code, want := range map[string]bool{
-		`return!0`:                                                  true,
-		`return!1`:                                                  false,
-		`return r("gkx")("1")`:                                      true,
-		`return r("gkx")("2")`:                                      false,
-		`return r("gkx")("404")`:                                    false, // a gate the page didn't ship
-		`return r("gkx")("1")===!0`:                                 true,
-		`return r("gkx")("2")===!1`:                                 true,
-		`return r("qex")._("10")===!0`:                              true,
-		`return r("qex")._("11")===!0`:                              false,
-		`return r("qex")._("11")!==!1`:                              true, // null isn't false
-		`return r("qex")._("12")!==!1`:                              false,
-		`return r("qex")._("13")`:                                   true,
-		`return r("qex")._("404")===!0`:                             false,
-		`return r("MetaConfig")._("20")`:                            true,
-		`return r("MetaConfig")._("21")`:                            false,
-		`return r("gkx")("1")===!0&&r("gkx")("2")===!0`:             false,
-		`return r("gkx")("2")===!0||r("qex")._("10")===!0`:          true,
-		`return r("On.relayprovider").get()&&r("qex")._("11")!==!1`: true,
-		`var e;return(e=r("qex")._("11"))!=null?e:!1`:               false,
-		`var e;return(e=r("qex")._("10"))!=null?e:!1`:               true,
-		`return (r("gkx")("2")||r("gkx")("1"))===!0`:                true,
-		`return r("Missing.relayprovider").get()`:                   false,
-		`return r("Date").now()>0`:                                  false, // a shape providers don't have
-		`fetch("https://evil.example");return!0`:                    false,
-		`return r("gkx")("1");doSomething()`:                        false,
+		`return!0`:                                                      true,
+		`return!1`:                                                      false,
+		`return r("gkx")("1")`:                                          true,
+		`return r("gkx")("2")`:                                          false,
+		`return r("gkx")("404")`:                                        false, // a gate the page didn't ship
+		`return r("gkx")("1")===!0`:                                     true,
+		`return r("gkx")("2")===!1`:                                     true,
+		`return r("qex")._("10")===!0`:                                  true,
+		`return r("qex")._("11")===!0`:                                  false,
+		`return r("qex")._("11")!==!1`:                                  true, // null isn't false
+		`return r("qex")._("12")!==!1`:                                  false,
+		`return r("qex")._("13")`:                                       true,
+		`return r("qex")._("404")===!0`:                                 false,
+		`return r("MetaConfig")._("20")`:                                true,
+		`return r("MetaConfig")._("21")`:                                false,
+		`return r("gkx")("1")===!0&&r("gkx")("2")===!0`:                 false,
+		`return r("gkx")("2")===!0||r("qex")._("10")===!0`:              true,
+		`return r("On.relayprovider").get()&&r("qex")._("11")!==!1`:     true,
+		`var e;return(e=r("qex")._("11"))!=null?e:!1`:                   false,
+		`var e;return(e=r("qex")._("10"))!=null?e:!1`:                   true,
+		`return (r("gkx")("2")||r("gkx")("1"))===!0`:                    true,
+		`return r("Missing.relayprovider").get()`:                       false,
+		`return r("MetaConfig")._("21",!0)===!0`:                        true, // the default of a setting not shipped
+		`return r("MetaConfig")._("21",!1)`:                             false,
+		`return r("MetaConfig")._("20",!1)`:                             true,
+		`var e;return r("gkx")("2")||((e=r("qex")._("11"))!=null?e:!1)`: false,
+		`var e;return r("gkx")("2")||((e=r("qex")._("10"))!=null?e:!1)`: true,
+		`return r("qex")._("14")===1||r("qex")._("14")===2`:             true,
+		`return r("qex")._("13")===1`:                                   false,
+		`return r("qex")._("11")===null&&r("gkx")("1")===!0`:            true,
+		`var e=r("qex")._("14");if(e!=null)return e===1;return!1`:       false, // a shape not read
+		`return r("Date").now()>0`:                                      false, // a shape providers don't have
+		`fetch("https://evil.example");return!0`:                        false,
+		`return r("gkx")("1");doSomething()`:                            false,
 	} {
 		c.Providers["Under"] = code
 		if got := c.flag("Under", page); got != want {

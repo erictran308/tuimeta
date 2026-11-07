@@ -10,7 +10,7 @@ import (
 )
 
 // Version is the protocol version the hello line announces.
-const Version = 8
+const Version = 9
 
 // Network is "messenger", "instagram", "whatsapp" or "threads".
 type Network string

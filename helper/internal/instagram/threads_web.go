@@ -420,6 +420,10 @@ func (t *Threads) post(ctx context.Context, s *threadsSession, name string, give
 	h.Set("x-fb-friendly-name", q.Name)
 	h.Set("x-fb-lsd", s.page.lsd)
 	h.Set("x-ig-app-id", s.page.appID)
+	h.Set("x-web-session-id", s.sid)
+	if s.page.nonce != "" {
+		h.Set("x-fb-entry-nonce", s.page.nonce)
+	}
 	h.Set("cookie", s.header())
 	resp, err := t.web.Do(r)
 	if err != nil {

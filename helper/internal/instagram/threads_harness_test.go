@@ -44,6 +44,7 @@ func threadsHTML(viewer bool, dtsg string) string {
 ["SiteData",[],{"server_revision":1001,"client_revision":1001,"push_phase":"C3","pkg_cohort":"HYP:barcelona_web_pkg","haste_session":"20380.HYP:barcelona_web_pkg.2.1...0","pr":2,"hsi":"7000000000000000001","comet_env":29,"spin":4,"__spin_r":1001,"__spin_b":"trunk","__spin_t":1792200000},317],
 ["CurrentUserInitialData",[],{"ACCOUNT_ID":"0","USER_ID":"0","NAME":"","APP_ID":"238260118697367","NON_FACEBOOK_USER_ID":"` + nonFB + `","IS_THREADS_USER":1},270],
 ["DTSGInitialData",[],{"token":"` + dtsg + `"},258],["LSD",[],{"token":"lsd-token"},323],
+["BootloaderConfig",[],{"deferBootloads":false,"nonce":"aBcD1234"},329],
 ["WebConnectionClassServerGuess",[],{"connectionClass":"EXCELLENT"},4705],
 ["RelayAPIConfigDefaults",[],{"accessToken":"","actorID":"` + actor + `","customHeaders":{"X-IG-App-ID":"238260118697367"}},5094],
 {"route":{"canonicalRouteName":"comet.threads.BarcelonaHomeRouteV2"},"viewer":` + who + `}

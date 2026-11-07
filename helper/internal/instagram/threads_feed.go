@@ -2,12 +2,13 @@
 
 package instagram
 
-// Threads' feed (load_feed): a page at a time, with the query threads.com's
-// home page pages its feed with, sent as the page sends it, less what
-// reports views: the list of posts seen (feed_view_info) always goes out
-// empty, as from a page just opened. What it does tell is what any page
-// does to get the next one: which threads it was given (feed_state, ids
-// only), so Threads doesn't give them again.
+// Threads' feed (load_feed): a page at a time, with the queries threads.com's
+// home page loads and pages its feed with, sent as the page sends them. Like
+// the page they tell Threads which threads it gave (feed_state, ids only) and,
+// on For you, which posts were in view and for how long (feed_view_info), as
+// tuimeta measured it: without that, Threads' pages thin out from about the
+// eighth on (1 to 4 rows instead of 7) and run dry. None of the website's
+// logging requests are made.
 
 import (
 	"context"
@@ -27,8 +28,15 @@ const (
 	// "load more" does.
 	threadsPageSize = 10
 	// threadsLastN is how many of the latest threads feed_state names,
-	// unless the page's experiment (qex 5205) says otherwise.
-	threadsLastN = 10
+	// unless the page's experiment (qex 5205) says otherwise. It said 20 on
+	// 2026-11-07, without the home page's text naming it.
+	threadsLastN = 20
+	// A report of a post in view is as the website's (BarcelonaSeenStateContext):
+	// not under minViewMs. maxViewMs and maxViews are bounds of tuimeta's own.
+	minViewMs   = 250
+	maxViewMs   = 60 * 60 * 1000
+	viewVersion = 24
+	maxViews    = 500
 	// maxUnits is the most feed items remembered for feed_state: a long
 	// read keeps only the latest.
 	maxUnits = 500
@@ -80,8 +88,11 @@ type threadsFeed struct {
 	// posts are the ids given, by Threads' post pk, so a post seen again
 	// keeps its id; refs what a post's replies are found by. Comments
 	// likewise, and lists where each list of replies got to, by post and
-	// reply (0 for the post's own).
+	// reply (0 for the post's own). quoted is the post each one quotes, seen
+	// with it. views are the reports not sent yet.
 	posts       map[string]int64
+	quoted      map[int64]string
+	views       []viewReport
 	next        int64
 	refs        map[int64]postRef
 	comments    map[string]int64
@@ -115,6 +126,7 @@ func (f *threadsFeed) clear() {
 	f.kind, f.cursor, f.started, f.more, f.dry = backend.ForYou, "", false, false, false
 	f.session, f.source, f.units, f.lastAt, f.given = nil, "", nil, 0, map[int64]bool{}
 	f.posts = map[string]int64{}
+	f.quoted, f.views = map[int64]string{}, nil
 	f.refs = map[int64]postRef{}
 	f.comments = map[string]int64{}
 	f.commentOf = map[int64]commentRef{}
@@ -208,42 +220,117 @@ func buildFeedState(units []feedUnit, at int64, n int) textAppState {
 	return st
 }
 
-// variables are the next page's, as the website's feed asks for it: the
-// first, then each after it, or after a page that came empty, a first one
-// again that names what was given. now is when it's asked (ms).
-func (f *threadsFeed) variables(now int64) map[string]any {
-	var state textAppState
-	data := map[string]any{"feed_view_info": "[]"}
-	switch {
-	case !f.started:
-		// A first load names nothing given yet, as of now.
-		state = buildFeedState(nil, now, 0)
-		data["pagination_source"] = paginationSource(f.kind)
-	case f.dry:
-		// Threads ran out of posts for this run of pages: a first load
-		// again, but naming what was given, so it isn't given again.
-		state = buildFeedState(f.units, f.lastAt, threadsLastN)
-		data["pagination_source"] = paginationSource(f.kind)
-	default:
-		state = buildFeedState(f.units, f.lastAt, threadsLastN)
-		source := f.source
-		if source == "" {
-			source = paginationSource(f.kind)
+// viewReport is one post in view, as the website's feed_view_info has it.
+type viewReport struct {
+	MediaID  string           `json:"media_id"`
+	MediaPct int              `json:"media_pct"`
+	TimeInfo map[string]int64 `json:"time_info"`
+	Version  int              `json:"version"`
+}
+
+// NoteViews keeps the reports of posts in view, to go with the next load:
+// only of posts this run gave, each post once, its newest time winning as on
+// the website.
+func (t *Threads) NoteViews(views []backend.FeedView) {
+	f := &t.feed
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range views {
+		ref, ok := f.refs[v.PostID]
+		if !ok || ref.pk == "" || v.Ms < minViewMs {
+			continue
 		}
-		data["pagination_source"] = source
-		data["reason"] = "pagination"
-		data["session_id"] = json.RawMessage("null")
-		if len(f.session) > 0 {
-			data["session_id"] = f.session
+		f.addView(ref.pk, v.Ms)
+		// The website counts a quoted post, drawn with it, on its own.
+		if q := f.quoted[v.PostID]; q != "" {
+			f.addView(q, v.Ms)
 		}
 	}
-	encoded, _ := json.Marshal(state)
-	data["feed_state"] = string(encoded)
+}
+
+// addView keeps a report, forgetting the oldest past maxViews; f.mu is held.
+func (f *threadsFeed) addView(pk string, ms int64) {
+	ms = min(ms, maxViewMs)
+	info := map[string]int64{"10": ms, "25": ms, "50": ms, "75": ms}
+	for i := range f.views {
+		if f.views[i].MediaID == pk {
+			f.views[i].TimeInfo = info
+			return
+		}
+	}
+	if len(f.views) >= maxViews {
+		f.views = f.views[1:]
+	}
+	f.views = append(f.views, viewReport{MediaID: pk, MediaPct: 1, TimeInfo: info, Version: viewVersion})
+}
+
+// addViewInfo adds what's to report to a request's data: on For you only,
+// since the website's Following has no such thing. f.mu is held.
+func (f *threadsFeed) addViewInfo(data map[string]any) {
+	if f.kind != backend.ForYou {
+		return
+	}
+	views := f.views
+	if views == nil {
+		views = []viewReport{}
+	}
+	encoded, _ := json.Marshal(views)
+	data["feed_view_info"] = string(encoded)
+}
+
+// request is the next page's query and variables, as the website's feed asks
+// for them: the first with a query of its own and nothing given, naming no
+// views unless it's a load again from the top, then each after it, or after
+// a page that came empty a first one again that names what was given.
+// lastN is how many threads feed_state names.
+func (f *threadsFeed) request(lastN int) (string, map[string]any) {
+	source := paginationSource(f.kind)
+	if !f.started {
+		data := map[string]any{"feed_state": feedStateText(nil, f.lastAt, 0), "pagination_source": source, "reason": "cold_start_fetch"}
+		if f.lastAt != 0 {
+			f.addViewInfo(data)
+		}
+		return threadsFirstQuery, map[string]any{"data": data, "variant": string(f.kind)}
+	}
+	data := map[string]any{"feed_state": feedStateText(f.units, f.lastAt, lastN)}
+	f.addViewInfo(data)
 	vars := map[string]any{"first": threadsPageSize, "variant": string(f.kind), "data": data}
-	if f.started && !f.dry {
-		vars["after"] = f.cursor
+	if f.dry {
+		// Threads ran out of posts for this run of pages.
+		data["pagination_source"] = source
+		return threadsFeedQuery, vars
 	}
-	return vars
+	if f.source != "" {
+		source = f.source
+	}
+	data["pagination_source"] = source
+	data["reason"] = "pagination"
+	data["session_id"] = json.RawMessage("null")
+	if len(f.session) > 0 {
+		data["session_id"] = f.session
+	}
+	vars["after"] = f.cursor
+	return threadsFeedQuery, vars
+}
+
+// feedStateText is buildFeedState as a request carries it.
+func feedStateText(units []feedUnit, at int64, n int) string {
+	encoded, _ := json.Marshal(buildFeedState(units, at, n))
+	return string(encoded)
+}
+
+// lastN is how many threads feed_state names: what the page's experiment
+// says, as the website's code reads it, else threadsLastN.
+func (t *Threads) lastN(s *threadsSession) int {
+	t.net.Lock()
+	defer t.net.Unlock()
+	n := threadsLastN
+	if s.page != nil {
+		if raw, ok := s.page.qex["5205"]; ok && json.Unmarshal(raw, &n) != nil {
+			n = threadsLastN
+		}
+	}
+	return min(max(n, 0), maxUnits)
 }
 
 // LoadFeed is the next page of the feed kind (for you, unless it says).
@@ -252,7 +339,7 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 	if kind == "" {
 		kind = backend.ForYou
 	}
-	_, epoch, err := t.current(ctx)
+	s, epoch, err := t.current(ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -263,20 +350,29 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 	if fresh || kind != f.kind {
 		f.restart(kind)
 	}
+	from := threadsBase + "/"
+	if kind == backend.Following {
+		from = threadsBase + "/following"
+		f.views = nil
+	}
 	if f.started && !f.more {
 		return []proto.Post{}, false, nil
 	}
+	lastN := t.lastN(s)
 	posts := []proto.Post{}
 	var page threadsFeedPage
 	tries := 0
 	for range feedTries {
 		tries++
 		now := time.Now().UnixMilli()
-		data, err := t.ask(ctx, epoch, threadsFeedQuery, f.variables(now), threadsBase+"/")
+		name, vars := f.request(lastN)
+		data, err := t.ask(ctx, epoch, name, vars, from)
 		if err != nil {
 			warnFailed(ctx, "threads: feed failed", err)
 			return nil, false, err
 		}
+		reported := len(f.views)
+		f.views = nil
 		page, err = parseThreadsFeed(data)
 		if err != nil {
 			hlog.Warn("threads: feed unreadable", hlog.Kind(err))
@@ -293,6 +389,8 @@ func (t *Threads) LoadFeed(ctx context.Context, _ int, fresh bool, box backend.B
 		st := feedStats{threads: true, ads: page.ads, unreadable: page.unreadable, rows: page.rows}
 		got, news := t.feedPosts(f, page.threads, box, &st)
 		posts = append(posts, got...)
+		hlog.Info("threads: feed page", hlog.Int("edges", int64(page.edges)), hlog.Int("posts", int64(news)),
+			hlog.Int("views", int64(reported)))
 		// With no cursor, or nothing at all, the next is a new start.
 		f.dry = page.more && (page.cursor == "" || (news == 0 && page.edges == 0))
 		f.more = page.more
@@ -522,6 +620,9 @@ func (t *Threads) feedPosts(f *threadsFeed, threads []feedThread, box backend.Bo
 			}
 			p.ID, p.Context, p.Continues = f.idFor(m, p.URL), context, !first
 			first = false
+			if q := m.Info.Share.Quoted; q != nil && p.Quoted != nil {
+				f.quoted[p.ID] = mediaPK(&q.feedMedia)
+			}
 			thread = append(thread, p)
 		}
 		anyNew := false

@@ -36,9 +36,24 @@ type Feeder interface {
 	// newest posts. box is what each picture is drawn in, so its thumbnail
 	// is no bigger than that needs. kind is which of the network's feeds
 	// (Threads'; "" is the default, and Instagram has only one): another
-	// than the last load's starts from the top, as fresh does. It never
-	// tells the network what was looked at.
+	// than the last load's starts from the top, as fresh does. It tells the
+	// network what was looked at only as far as a ViewReporter was told to.
 	LoadFeed(ctx context.Context, limit int, fresh bool, box Box, kind FeedKind) (posts []proto.Post, more bool, err error)
+}
+
+// FeedView is a post of a feed the user had in view, and for how long it
+// last stayed there.
+type FeedView struct {
+	PostID int64 `json:"post_id"`
+	Ms     int64 `json:"ms"`
+}
+
+// ViewReporter is a feed whose network is told what was in view, as its own
+// website tells it: Threads' For you, whose pages thin out without it.
+type ViewReporter interface {
+	// NoteViews keeps views to go with the next load of the feed that sends
+	// them, the server calling it just before LoadFeed.
+	NoteViews(views []FeedView)
 }
 
 // FeedKind is one of a network's feeds: Threads has two.

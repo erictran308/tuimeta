@@ -1030,6 +1030,7 @@ impl App {
                 failed = Some(e.into());
                 self.hang_up();
             }
+            self.note_feed_views();
             // After the frame: where the video playing shows now.
             if failed.is_none() {
                 notify::send(&self.video_placement());
@@ -1153,6 +1154,11 @@ impl App {
 
     fn on_terminal_event(&mut self, event: Event) {
         if matches!(event, Event::Key(_) | Event::Paste(_) | Event::FocusGained) {
+            // Nothing wakes the loop as someone leaves: what's in view stopped
+            // counting when they did, which only this can still tell.
+            if !self.present() {
+                self.note_feed_views();
+            }
             self.last_input = Instant::now();
             self.last_input_wall = SystemTime::now();
         }
@@ -2625,6 +2631,30 @@ impl App {
         }
     }
 
+    /// After a frame: which of the feed's posts are in view now. Nothing is
+    /// when nobody can be looking, from the last key on when they've gone.
+    fn note_feed_views(&mut self) {
+        let now = Instant::now();
+        let present = self.present();
+        let watched = matches!(self.screen, Screen::Main) && present && !self.popup_over_chat();
+        let until = match present {
+            true => now,
+            false => (self.last_input + self.away_after()).min(now),
+        };
+        // A video filling the window hides the posts drawn under it.
+        let filling = self
+            .playing
+            .as_ref()
+            .filter(|p| p.full_screen)
+            .map(|p| p.post_id);
+        if let Some(feed) = self.feed.as_mut() {
+            if let Some(post) = filling {
+                feed.drawn = vec![post];
+            }
+            feed.note_views(watched, until);
+        }
+    }
+
     /// The user would see a new message in this chat without being told:
     /// tuimeta's window has focus. Where the terminal never reports focus,
     /// only the chat being read counts.
@@ -2908,7 +2938,8 @@ impl App {
         }
         // Its video stops; the posts are kept to come back to, but not a
         // linked post's: the feed's row opens the feed.
-        if let Some(feed) = self.feed.take() {
+        if let Some(mut feed) = self.feed.take() {
+            feed.note_views(false, Instant::now());
             self.stop_video();
             self.close_comments();
             self.images.clear();
@@ -4227,11 +4258,15 @@ impl App {
         let mut feed = Feed::new(network);
         feed.following = following;
         if let Some(load) = feed.start_load(false) {
-            feed.request =
-                Some(
-                    self.meta
-                        .load_feed(network, feed::PAGE, false, picture, following, load),
-                );
+            feed.request = Some(self.meta.load_feed(
+                network,
+                feed::PAGE,
+                false,
+                picture,
+                following,
+                load,
+                &[],
+            ));
         }
         feed
     }
@@ -4423,6 +4458,7 @@ impl App {
                 picture,
                 feed.following,
                 load,
+                &feed.take_views(),
             );
             if let Some(old) = feed.sent(request) {
                 self.meta.cancel(old);
@@ -4450,6 +4486,7 @@ impl App {
                 picture,
                 feed.following,
                 load,
+                &feed.take_views(),
             );
             // A next page on its way would go after the posts these replace.
             if let Some(old) = feed.sent(request) {
@@ -4493,6 +4530,7 @@ impl App {
             return;
         }
         feed.following = following;
+        feed.switched();
         // Whatever was on its way was the other feed's.
         feed.loading = None;
         if let Some(load) = feed.start_load(true) {
@@ -4503,6 +4541,7 @@ impl App {
                 picture,
                 feed.following,
                 load,
+                &[],
             );
             if let Some(old) = feed.sent(request) {
                 self.meta.cancel(old);
@@ -8514,6 +8553,188 @@ mod tests {
             sent_with(&app, "load_feed").last().unwrap()["feed"],
             "for_you"
         );
+    }
+
+    /// Post 1 of the open feed has been in view for `seconds`.
+    fn in_view_for(app: &mut App, seconds: u64) {
+        let feed = app.feed.as_mut().unwrap();
+        feed.drawn = vec![1];
+        feed.note_views(true, Instant::now() - Duration::from_secs(seconds));
+    }
+
+    #[test]
+    fn threads_for_you_tells_the_next_load_what_left_view() {
+        let mut app = test_app("threads-views");
+        let none = KeyModifiers::NONE;
+        open_threads(&mut app);
+        threads_page(
+            &mut app,
+            (1..=10).map(|i| thread(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        assert!(
+            sent_with(&app, "load_feed")[0].get("views").is_none(),
+            "nothing seen yet"
+        );
+        // A frame says what's in view.
+        screen(&mut app);
+        assert!(app.feed.as_ref().unwrap().drawn.contains(&1));
+        // Post 1 was in view for two seconds, and the next frame doesn't show it.
+        in_view_for(&mut app, 2);
+        app.feed.as_mut().unwrap().drawn.clear();
+        app.note_feed_views();
+        press(&mut app, KeyCode::Char('r'), none);
+        let asked = sent_with(&app, "load_feed");
+        let views = asked.last().unwrap()["views"].as_array().unwrap();
+        assert_eq!(views.len(), 1, "{views:?}");
+        assert_eq!(views[0]["post_id"], 1);
+        assert!(views[0]["ms"].as_u64().unwrap() >= 2000, "{views:?}");
+    }
+
+    #[test]
+    fn nothing_is_in_view_under_a_popup_or_away_from_the_window() {
+        let mut app = test_app("threads-views-away");
+        let none = KeyModifiers::NONE;
+        open_threads(&mut app);
+        threads_page(
+            &mut app,
+            (1..=10).map(|i| thread(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        let left = |app: &mut App| app.feed.as_mut().unwrap().take_views();
+        // A prompt comes over the feed.
+        in_view_for(&mut app, 2);
+        press(&mut app, KeyCode::Char(':'), none);
+        app.feed.as_mut().unwrap().drawn = vec![1];
+        app.note_feed_views();
+        assert_eq!(left(&mut app).len(), 1);
+        press(&mut app, KeyCode::Esc, none);
+        // The window loses focus.
+        in_view_for(&mut app, 2);
+        app.terminal_focused = false;
+        app.note_feed_views();
+        assert_eq!(left(&mut app).len(), 1);
+        app.terminal_focused = true;
+        // Nobody pressed a key for ten minutes: it counts up to when they left.
+        in_view_for(&mut app, 601);
+        app.last_input -= Duration::from_secs(600);
+        app.feed.as_mut().unwrap().drawn = vec![1];
+        app.note_feed_views();
+        let views = left(&mut app);
+        let ms = views[0].ms;
+        assert!(
+            (u64::try_from(IDLE_AFTER.as_millis()).unwrap()..70_000).contains(&ms),
+            "{ms}"
+        );
+        // A key after nobody woke the loop at all: it still counts only up to
+        // when they left, not up to now.
+        app.last_input = Instant::now();
+        in_view_for(&mut app, 601);
+        app.last_input -= Duration::from_secs(600);
+        app.on_terminal_event(Event::FocusGained);
+        let ms = left(&mut app)[0].ms;
+        assert!(
+            (u64::try_from(IDLE_AFTER.as_millis()).unwrap()..70_000).contains(&ms),
+            "{ms}"
+        );
+        // Leaving the feed takes it out of view too.
+        app.last_input = Instant::now();
+        in_view_for(&mut app, 2);
+        app.leave_chat();
+        let kept = app.feeds_kept.get_mut(&Network::Threads).unwrap();
+        assert_eq!(kept.take_views().len(), 1);
+    }
+
+    #[test]
+    fn a_video_filling_the_window_takes_the_posts_under_it_out_of_view() {
+        let mut app = test_app("threads-views-full-screen");
+        open_threads(&mut app);
+        threads_page(
+            &mut app,
+            (1..=10).map(|i| thread(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        in_view_for(&mut app, 2);
+        app.playing = Some(Playing {
+            post_id: 2,
+            file_id: 1,
+            token: String::new(),
+            video: None,
+            audio: None,
+            player: None,
+            paused: false,
+            muted: false,
+            position: None,
+            duration: None,
+            full_screen: true,
+        });
+        // The frame still draws post 1, under the video.
+        app.feed.as_mut().unwrap().drawn = vec![1, 2, 3];
+        app.note_feed_views();
+        let views = app.feed.as_mut().unwrap().take_views();
+        assert_eq!(views.len(), 1, "{views:?}");
+        assert_eq!(views[0].post_id, 1);
+    }
+
+    #[test]
+    fn threads_following_tells_nothing_of_what_was_in_view() {
+        let mut app = test_app("threads-views-following");
+        open_threads(&mut app);
+        threads_page(
+            &mut app,
+            (1..=10).map(|i| thread(i, serde_json::json!({}))).collect(),
+            true,
+        );
+        in_view_for(&mut app, 2);
+        app.feed.as_mut().unwrap().drawn.clear();
+        app.note_feed_views();
+        command(&mut app, "following");
+        let asked = sent_with(&app, "load_feed");
+        assert_eq!(asked.last().unwrap()["feed"], "following");
+        assert!(asked.last().unwrap().get("views").is_none());
+        threads_page(
+            &mut app,
+            (11..=20)
+                .map(|i| thread(i, serde_json::json!({})))
+                .collect(),
+            true,
+        );
+        in_view_for(&mut app, 2);
+        app.feed.as_mut().unwrap().drawn.clear();
+        app.note_feed_views();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(
+            sent_with(&app, "load_feed")
+                .last()
+                .unwrap()
+                .get("views")
+                .is_none()
+        );
+        // Back to For you: Following's posts stay until its page comes, and
+        // aren't For you's to tell about.
+        threads_page(
+            &mut app,
+            (21..=30)
+                .map(|i| thread(i, serde_json::json!({})))
+                .collect(),
+            true,
+        );
+        command(&mut app, "for-you");
+        in_view_for(&mut app, 2);
+        app.feed.as_mut().unwrap().drawn.clear();
+        app.note_feed_views();
+        assert!(app.feed.as_mut().unwrap().take_views().is_empty());
+        threads_page(
+            &mut app,
+            (31..=40)
+                .map(|i| thread(i, serde_json::json!({})))
+                .collect(),
+            true,
+        );
+        in_view_for(&mut app, 2);
+        app.feed.as_mut().unwrap().drawn.clear();
+        app.note_feed_views();
+        assert_eq!(app.feed.as_mut().unwrap().take_views().len(), 1);
     }
 
     #[test]

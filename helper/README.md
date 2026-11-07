@@ -266,20 +266,31 @@ Everything sent to threads.com, at most one request at a time and at least
   never asked for; one already asked for reached Threads all the same.
 - GraphQL queries, `POST https://www.threads.com/api/graphql`, with the
   form and headers the page's own code sends (`x-ig-app-id`, `x-fb-lsd`,
-  `x-csrftoken`, `x-asbd-id`, `x-fb-friendly-name`, the page as referer):
-  only three, and only ever a query, never a mutation (the one function
+  `x-csrftoken`, `x-asbd-id`, `x-fb-friendly-name`, `x-web-session-id`,
+  `x-fb-entry-nonce`, the page as referer):
+  only four, and only ever a query, never a mutation (the one function
   that sends GraphQL refuses anything the website's code doesn't mark
   `query`, and any name with `Mutation` in it, before a request is made):
-  - `BarcelonaFeedPaginationDirectQuery`, the feed (`load_feed`): 10
-    posts a page, `variant` `for_you` or `following`, `after` the page
-    before's cursor, and `data`: `pagination_source`, from the second page
-    `reason: "pagination"` and the feed's `session_id`, `feed_state` (which
-    threads were given, by id and item type, and when the last page was
-    asked: what any page tells Threads to get the next one), and
-    `feed_view_info`, the list of posts seen and for how long, which the
-    helper always sends empty (`"[]"`), as a page just opened does. A load
-    asks for at most three pages, only while the ones before had nothing
-    to show.
+  - `BarcelonaFeedDirectQuery`, the feed's first page (`load_feed`, and again
+    on `fresh`): `variant` and `data`, with `reason: "cold_start_fetch"`, an
+    empty `feed_state` and `pagination_source`, and on `fresh` what was in
+    view.
+  - `BarcelonaFeedPaginationDirectQuery`, the pages after it: 10 posts a
+    page, `variant` `for_you` or `following`, `after` the page before's
+    cursor, and `data`: `pagination_source`, `reason: "pagination"`, the
+    feed's `session_id`, `feed_state` (which threads were given, by id and
+    item type, and when the last page was asked: what any page tells Threads
+    to get the next one, the page's experiment 5205 saying how many are
+    named), and on `for_you` `feed_view_info`. A load asks for at most three
+    pages, only while the ones before had nothing to show.
+  - `feed_view_info` **tells Threads what was looked at**: for each post
+    `load_feed`'s `views` names, `{"media_id", "media_pct": 1, "time_info":
+    {"10","25","50","75": ms}, "version": 24}`, the website's own report, and
+    the same for a post it quotes. On Following it isn't sent, as the
+    website's Following doesn't. Without it Threads' pages fall from about 7
+    rows to 1 to 4 from about the eighth page on, then to none (tried in a
+    browser on 2026-11-07), and restarting from there gives mostly posts
+    already given.
   - `BarcelonaPostPageDownwardQuery` and
     `BarcelonaPostPageDirectRepliesRefetchQuery`, a post's replies and the
     ones after them (`load_comments`), top ones first, from the post's
@@ -287,9 +298,10 @@ Everything sent to threads.com, at most one request at a time and at least
     with the reply's id, as the reply's page asks them.
   Each carries every feature flag the query declares, worked out as the
   website's code works it out from the gates the page shipped (an unknown
-  one is off), so the request is the page's own. None of the website's
-  logging is ever sent (no `/ajax/bz`, no Falco, no impressions or
-  video-play events), and nothing is liked, reposted, followed or answered.
+  one is off), so the request is the page's own. Apart from
+  `feed_view_info`, none of the website's logging is ever sent (no
+  `/ajax/bz`, no Falco, no impressions or video-play events), and nothing is
+  liked, reposted, followed or answered.
 - When Threads stops taking a query as sent (a variable it now needs, a
   document it no longer knows), its definition is read again from the
   website's JavaScript: the page is loaded again (the post's page, as a

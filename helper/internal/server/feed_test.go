@@ -92,6 +92,85 @@ func withFeeder(t *testing.T, setup func(*feeder)) (*harness, *feeder) {
 	return h, fd
 }
 
+// viewedFeeder is a feed whose network is told what was in view.
+type viewedFeeder struct {
+	feeder
+	noted [][]backend.FeedView
+}
+
+func (f *viewedFeeder) NoteViews(views []backend.FeedView) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.noted = append(f.noted, slices.Clone(views))
+}
+
+func TestLoadFeedHandsWhatWasInViewToANetworkThatReportsIt(t *testing.T) {
+	var fd *viewedFeeder
+	h := startWith(t, func(h *harness) {
+		fd = &viewedFeeder{feeder: feeder{readyNet: readyNet{Unavailable: backend.Unavailable{Net: proto.Instagram, Events: h.srv.Events}, deps: h.srv.Deps(proto.Instagram)}}}
+		h.srv.Add(fd)
+	})
+	h.c.Event("account", 0, func(l wiretest.Line) bool {
+		return wiretest.Field[string](t, l, "network") == "instagram" && wiretest.Field[string](t, l, "state") == "ready"
+	})
+	views := make([]map[string]any, MaxFeedViews+5)
+	for i := range views {
+		views[i] = map[string]any{"post_id": i + 1, "ms": 300}
+	}
+	if l := h.c.Call("load_feed", map[string]any{"network": "instagram", "views": views}); l.Error != nil {
+		t.Fatalf("got %s", l.Raw)
+	}
+	h.c.Call("load_feed", map[string]any{"network": "instagram"})
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if len(fd.noted) != 1 || len(fd.noted[0]) != MaxFeedViews || fd.noted[0][0] != (backend.FeedView{PostID: 1, Ms: 300}) {
+		t.Errorf("noted %d lists", len(fd.noted))
+	}
+}
+
+func TestWhatWasInViewIsKeptEvenByALoadThatNeverGetsItsTurn(t *testing.T) {
+	var fd *viewedFeeder
+	h := startWith(t, func(h *harness) {
+		fd = &viewedFeeder{feeder: feeder{loads: make(chan struct{}), readyNet: readyNet{Unavailable: backend.Unavailable{Net: proto.Instagram, Events: h.srv.Events}, deps: h.srv.Deps(proto.Instagram)}}}
+		h.srv.Add(fd)
+	})
+	h.c.Event("account", 0, func(l wiretest.Line) bool {
+		return wiretest.Field[string](t, l, "network") == "instagram" && wiretest.Field[string](t, l, "state") == "ready"
+	})
+	// One load holds the line, and the next is still waiting behind it when
+	// what it carries is kept.
+	first := h.c.Request("load_feed", map[string]any{"network": "instagram", "limit": 1})
+	second := h.c.Request("load_feed", map[string]any{"network": "instagram", "limit": 2, "views": []map[string]any{{"post_id": 7, "ms": 900}}})
+	noted := func() int {
+		fd.mu.Lock()
+		defer fd.mu.Unlock()
+		return len(fd.noted)
+	}
+	for deadline := time.Now().Add(5 * time.Second); noted() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("what was in view waited for the load's turn")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if asked, _ := fd.seen(); slices.Contains(asked, 2) {
+		t.Errorf("the second load already ran: %v", asked)
+	}
+	close(fd.loads)
+	h.c.Response(first)
+	h.c.Response(second)
+}
+
+func TestANetworkThatDoesntReportViewsLoadsItsFeedWithoutThem(t *testing.T) {
+	h, fd := withFeeder(t, nil)
+	l := h.c.Call("load_feed", map[string]any{"network": "instagram", "views": []map[string]any{{"post_id": 1, "ms": 900}}})
+	if l.Error != nil {
+		t.Fatalf("got %s", l.Raw)
+	}
+	if asked, _ := fd.seen(); len(asked) != 1 {
+		t.Errorf("asked %v", asked)
+	}
+}
+
 func TestOnlyANetworkWithAFeedLoadsOne(t *testing.T) {
 	h, fd := withFeeder(t, nil)
 	l := h.c.Call("load_feed", map[string]any{"network": "instagram", "limit": 7, "fresh": true})
