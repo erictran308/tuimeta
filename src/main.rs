@@ -86,8 +86,11 @@ async fn main() -> Result<()> {
         if images::panic_is_contained() {
             return;
         }
+        // The frame it died drawing may be holding the screen (`term::draw`),
+        // which would hide the message below.
         let _ = execute!(
             stdout(),
+            crossterm::terminal::EndSynchronizedUpdate,
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableFocusChange

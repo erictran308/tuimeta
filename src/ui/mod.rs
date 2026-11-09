@@ -707,6 +707,11 @@ fn draw_main(frame: &mut Frame, app: &mut App, colors: &Colors) {
                     feed,
                     focused: app.focus == Focus::Messages && !in_comments,
                     covered: popup_over_chat || full_screen,
+                    glide_at: (app.settings.smooth_scrolling
+                        && !app.images.paints_over()
+                        && !popup_over_chat
+                        && !full_screen)
+                        .then_some(now),
                     playing: app
                         .playing
                         .as_ref()
@@ -1441,6 +1446,12 @@ fn draw_settings(
         SettingsMenu::ANIMATIONS,
         check(settings.animations),
         "Animations (lights on focus, popups, toasts, new messages)",
+    );
+    add(
+        &mut lines,
+        SettingsMenu::SMOOTH_SCROLLING,
+        check(settings.smooth_scrolling),
+        "Smooth scrolling in the feeds",
     );
     lines.push(Line::default());
     lines.push(heading(" Composer"));

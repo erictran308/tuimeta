@@ -17,6 +17,7 @@ use tokio::time::Instant;
 
 use crate::messages::{self, MediaFile, Preview};
 use crate::meta::{self, FeedPost, FeedView, MediaKind, Network};
+use crate::motion::{GLIDE_ROWS, Glide};
 use crate::text;
 
 /// Posts asked for at a time.
@@ -32,6 +33,10 @@ pub const AHEAD: usize = 10;
 /// they're in view: few, since each takes memory, but enough for the next
 /// post's to be there when `j` gets to it.
 pub const MADE_AHEAD: usize = 3;
+/// Posts Ctrl-d and Ctrl-u move the cursor by. Further than this is a jump
+/// (`gg`, `G`), which the view doesn't slide through: that would only make
+/// images of posts gone by in a moment.
+pub const JUMP: isize = 3;
 /// A post in view for less than this isn't told about: threads.com's limit.
 const MIN_VIEW: Duration = Duration::from_millis(250);
 /// The most posts kept to tell about, the oldest going first: as many as one
@@ -370,6 +375,11 @@ pub struct Feed {
     /// The first post drawn, by index; the view keeps it so the selected
     /// one shows.
     pub top: usize,
+    /// The view on its way to where `top` puts it.
+    glide: Option<Glide>,
+    /// The cursor moved since the last frame, little enough for the view to
+    /// slide after it.
+    may_glide: bool,
     /// Which photo or video of a carousel shows, by post id; the first
     /// when there's none.
     shown: HashMap<i64, usize>,
@@ -417,6 +427,8 @@ impl Feed {
             ids: HashSet::new(),
             selected: 0,
             top: 0,
+            glide: None,
+            may_glide: false,
             shown: HashMap::new(),
             loading: None,
             request: None,
@@ -599,6 +611,8 @@ impl Feed {
             self.shown.clear();
             self.selected = 0;
             self.top = 0;
+            self.glide = None;
+            self.may_glide = false;
             self.empty_pages = 0;
             self.others_posts = false;
         }
@@ -636,6 +650,7 @@ impl Feed {
     pub fn move_cursor(&mut self, delta: isize) {
         let last = self.posts.len().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
+        self.may_glide = delta.unsigned_abs() <= JUMP.unsigned_abs();
         // Moving on after a failed load tries again near the end, and so
         // does moving down after one that brought nothing new.
         if delta > 0 {
@@ -643,6 +658,77 @@ impl Feed {
         } else {
             self.error = None;
         }
+    }
+
+    /// When a frame has put `top` where the view rests now, from `before`:
+    /// how many rows off that place to draw the posts this frame, more than
+    /// 0 being lower down. It's 0 while the view isn't on its way, and
+    /// always with no `now` (see `ui::feed::View::glide_at`). The view sets
+    /// out only after a short cursor move that took `top` elsewhere, from
+    /// at most [`GLIDE_ROWS`] rows away and no more than `pane`, the rest of
+    /// the way at once: a whole pane moving is dizzying, and it makes no
+    /// images of all it would go past. `height` is the rows a post takes.
+    pub fn glide_rows(
+        &mut self,
+        before: usize,
+        pane: u16,
+        now: Option<Instant>,
+        height: impl Fn(&Self, usize) -> u16,
+    ) -> i32 {
+        let moved = std::mem::take(&mut self.may_glide);
+        let Some(now) = now else {
+            self.glide = None;
+            return 0;
+        };
+        let mut rows = self.glide.as_mut().map_or(0, |g| g.show(now));
+        if moved && before != self.top {
+            let most = i32::from(pane).min(GLIDE_ROWS);
+            let mut between = 0;
+            for i in self.top.min(before)..self.top.max(before) {
+                between += i32::from(height(self, i));
+                if between >= most {
+                    break;
+                }
+            }
+            // Pressed again on the way, it goes on from where it got to.
+            rows += if self.top > before { between } else { -between };
+            rows = rows.clamp(-most, most);
+            self.glide = Some(Glide::new(rows, now));
+        }
+        if rows == 0 {
+            self.glide = None;
+        }
+        rows
+    }
+
+    /// The post a frame starts drawing at and the row it starts on, with
+    /// the view `rows` off its place: above the pane (less than 0) when its
+    /// top is cut off, and with nothing above it left out altogether.
+    pub fn first_drawn(&self, rows: i32, height: impl Fn(&Self, usize) -> u16) -> (usize, i32) {
+        let (mut i, mut y) = (self.top, rows);
+        while y > 0 && i > 0 {
+            i -= 1;
+            y -= i32::from(height(self, i));
+        }
+        while y < 0 && i + 1 < self.posts.len() {
+            let rows = i32::from(height(self, i));
+            if y + rows > 0 {
+                break;
+            }
+            y += rows;
+            i += 1;
+        }
+        (i, y)
+    }
+
+    /// The view is sliding, or may set out with the next frame.
+    pub fn sliding(&self) -> bool {
+        self.may_glide || self.glide.is_some()
+    }
+
+    /// When to draw again, while the view slides.
+    pub fn glide_frame(&self, now: Instant) -> Option<Instant> {
+        self.glide.and_then(|g| g.next_frame(now))
     }
 
     /// Asks again for what's after the last post, as moving down past it
@@ -723,6 +809,126 @@ impl Feed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn feed_of(posts: i64) -> Feed {
+        let mut feed = Feed::new(Network::Instagram);
+        let load = feed.start_load(false).unwrap();
+        let posts = (1..=posts).map(|id| post(id, serde_json::json!({})));
+        feed.on_page(load, Ok((posts.collect(), false)));
+        feed
+    }
+
+    fn ten_rows(_: &Feed, _: usize) -> u16 {
+        10
+    }
+
+    #[test]
+    fn a_short_move_eases_the_view_the_rows_it_went_and_from_glide_rows_away_at_most() {
+        use crate::motion::GLIDE;
+        let mut feed = feed_of(8);
+        let now = Instant::now();
+        feed.move_cursor(1);
+        feed.top = 1;
+        assert_eq!(feed.glide_rows(0, 30, Some(now), ten_rows), 10);
+        assert_eq!(feed.first_drawn(10, ten_rows), (0, 0), "where it was");
+        assert!(feed.glide_frame(now).is_some());
+        assert!(
+            feed.glide_frame(now + GLIDE * 2).is_some(),
+            "drawn rows off: one more frame shows it there"
+        );
+
+        let now = now + GLIDE;
+        feed.move_cursor(-1);
+        feed.top = 0;
+        assert_eq!(feed.glide_rows(1, 30, Some(now), ten_rows), -10, "back up");
+        assert_eq!(feed.first_drawn(-10, ten_rows), (1, 0), "where it was");
+
+        let now = now + GLIDE;
+        feed.move_cursor(JUMP);
+        feed.top = 3;
+        assert_eq!(
+            feed.glide_rows(0, 30, Some(now), ten_rows),
+            GLIDE_ROWS,
+            "the rest of the way at once"
+        );
+
+        let now = now + GLIDE;
+        feed.move_cursor(1);
+        feed.top = 4;
+        assert_eq!(
+            feed.glide_rows(3, 8, Some(now), ten_rows),
+            8,
+            "no more than the pane"
+        );
+    }
+
+    #[test]
+    fn a_frame_starts_at_the_first_post_any_of_which_is_in_the_pane() {
+        let mut feed = feed_of(8);
+        feed.top = 3;
+        assert_eq!(feed.first_drawn(0, ten_rows), (3, 0), "at rest");
+        assert_eq!(feed.first_drawn(15, ten_rows), (1, -5), "the post cut off");
+        assert_eq!(feed.first_drawn(-25, ten_rows), (5, -5));
+        feed.top = 0;
+        assert_eq!(feed.first_drawn(5, ten_rows), (0, 5), "nothing above");
+    }
+
+    #[test]
+    fn pressed_again_on_the_way_the_view_goes_on_from_where_it_got_to() {
+        use crate::motion::GLIDE;
+        let mut feed = feed_of(8);
+        let now = Instant::now();
+        feed.move_cursor(1);
+        feed.top = 1;
+        assert_eq!(feed.glide_rows(0, 30, Some(now), ten_rows), 10);
+        let halfway = now + GLIDE / 2;
+        feed.move_cursor(1);
+        feed.top = 2;
+        assert_eq!(feed.glide_rows(1, 30, Some(halfway), ten_rows), 11);
+        assert_eq!(
+            feed.glide_rows(2, 30, Some(halfway), ten_rows),
+            11,
+            "a frame with no key press goes on as it was"
+        );
+    }
+
+    #[test]
+    fn the_view_goes_at_once_after_a_jump_a_new_page_or_with_no_time_to_slide_in() {
+        let mut feed = feed_of(8);
+        let now = Instant::now();
+        feed.move_cursor(isize::MAX);
+        feed.top = 7;
+        assert_eq!(feed.glide_rows(0, 30, Some(now), ten_rows), 0, "G");
+        assert_eq!(feed.glide_frame(now), None);
+
+        feed.top = 6;
+        assert_eq!(
+            feed.glide_rows(7, 30, Some(now), ten_rows),
+            0,
+            "no key took it there: the window changed"
+        );
+
+        feed.move_cursor(-1);
+        feed.top = 5;
+        assert_eq!(feed.glide_rows(6, 30, None, ten_rows), 0);
+
+        feed.move_cursor(-1);
+        feed.top = 4;
+        assert_ne!(feed.glide_rows(5, 30, Some(now), ten_rows), 0);
+        assert_eq!(
+            feed.glide_rows(4, 30, None, ten_rows),
+            0,
+            "a popup stops it where it would rest"
+        );
+        assert_eq!(feed.glide_frame(now), None);
+
+        feed.move_cursor(-1);
+        feed.top = 3;
+        assert_ne!(feed.glide_rows(4, 30, Some(now), ten_rows), 0);
+        let load = feed.start_load(true).unwrap();
+        feed.on_page(load, Ok((vec![post(9, serde_json::json!({}))], false)));
+        assert_eq!(feed.glide_frame(now), None, "its rows were of posts gone");
+    }
 
     /// A post as the helper sends it: a photo by Alice, with `fields`
     /// instead of what it has.

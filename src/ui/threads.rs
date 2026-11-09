@@ -17,7 +17,8 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
 use super::feed::{
-    COMMENT, HEART, PLAY, VERIFIED, View, ago, count, draw_still, empty_feed, feed_end, seek_bar,
+    COMMENT, HEART, PLAY, VERIFIED, View, ago, count, draw_still, empty_feed, feed_end, post_rows,
+    seek_bar,
 };
 use super::{border, bordered, truncate};
 use crate::feed::{self, Feed, Item, LinkCard, Post};
@@ -139,6 +140,7 @@ pub fn draw(
         )
     };
     // The selected post in view, all of it if it fits.
+    let before = feed.top;
     feed.selected = feed.selected.min(feed.posts.len() - 1);
     feed.top = feed.top.min(feed.selected);
     while feed.top < feed.selected
@@ -149,29 +151,28 @@ pub fn draw(
     {
         feed.top += 1;
     }
+    let height = |feed: &Feed, i: usize| lay(feed, i).lines.len() as u16;
+    let off = feed.glide_rows(before, inner.height, view.glide_at, height);
+    let pane = i32::from(inner.height);
 
     let mut video_box = None;
-    let mut y: u16 = 0;
-    let mut i = feed.top;
+    let (mut i, mut y) = feed.first_drawn(off, height);
     let mut in_view = Vec::new();
-    while i < feed.posts.len() && y < inner.height {
+    while i < feed.posts.len() && y < pane {
         let drawn = lay(feed, i);
         let total = drawn.lines.len() as u16;
-        let shown = total.min(inner.height - y);
-        if counts_as_in_view(shown, total, inner.height, font) {
+        let (at, above) = post_rows(column, y, total);
+        if off == 0 && counts_as_in_view(at.height, total, inner.height, font) {
             in_view.push(feed.posts[i].id);
         }
-        let at = Rect {
-            y: inner.y + y,
-            height: shown,
-            ..column
-        };
-        frame.render_widget(Paragraph::new(drawn.lines), at);
+        frame.render_widget(Paragraph::new(drawn.lines).scroll((above, 0)), at);
         for picture in &drawn.pictures {
-            if y + picture.y >= inner.height {
+            let top = y + i32::from(picture.y);
+            // Nor is one slid past the pane's top asked for.
+            if top >= pane || top + i32::from(picture.rows) <= 0 {
                 continue;
             }
-            let position = (picture.x, y + picture.y);
+            let position = (picture.x, top as i16);
             match picture.avatar {
                 true => draw_avatar(
                     frame,
@@ -193,31 +194,55 @@ pub fn draw(
                 ),
             }
         }
-        // Pepper's box can't be cut by the pane's edge: all of it, or none.
-        if let Some(spot) = drawn.playing
-            && y + spot.y + spot.height <= inner.height
+        // Pepper's box can't be cut by the pane's edge: all of it, or none,
+        // and it would be told of every row of a slide: it waits for the
+        // view to rest.
+        if let Some(spot) = drawn.playing.filter(|_| off == 0)
+            && y + i32::from(spot.y + spot.height) <= pane
         {
+            let top = y as u16 + spot.y;
             video_box = Some(Rect::new(
                 column.x + spot.x,
-                inner.y + y + spot.y,
+                inner.y + top,
                 spot.width,
                 spot.height,
             ));
             // The seek bar, in the blank row right under it.
             if let Some((position, length)) = view.progress
-                && y + spot.y + spot.height < inner.height
+                && i32::from(top + spot.height) < pane
             {
                 let row = Rect::new(
                     column.x + spot.x,
-                    inner.y + y + spot.y + spot.height,
+                    inner.y + top + spot.height,
                     spot.width,
                     1,
                 );
                 frame.render_widget(seek_bar(position, length, spot.width.into(), colors), row);
             }
         }
-        y = y.saturating_add(total);
+        y += i32::from(total);
         i += 1;
+    }
+    // What counts as in view is where the view comes to rest, as without
+    // the slide: a post gone by on the way isn't one looked at, and Threads
+    // is told what's looked at. Its pictures come first, though they're not
+    // in the pane yet.
+    if off != 0 {
+        let mut y = 0;
+        for i in feed.top..feed.posts.len() {
+            if y >= inner.height {
+                break;
+            }
+            let drawn = lay(feed, i);
+            let total = drawn.lines.len() as u16;
+            if counts_as_in_view(total.min(inner.height - y), total, inner.height, font) {
+                in_view.push(feed.posts[i].id);
+            }
+            for picture in &drawn.pictures {
+                images.want(&picture.still, picture.cols, picture.rows);
+            }
+            y = y.saturating_add(total);
+        }
     }
     feed.drawn = in_view;
     // The next posts' pictures download before they're in view, and the
@@ -243,10 +268,10 @@ pub fn draw(
             images.prefetch(still);
         }
     }
-    if i == feed.posts.len() && y < inner.height {
+    if i == feed.posts.len() && (0..pane).contains(&y) {
         let end = feed_end(feed);
         if let Some(end) = end {
-            let row = Rect::new(inner.x, inner.y + y, inner.width, 1);
+            let row = Rect::new(inner.x, inner.y + y as u16, inner.width, 1);
             frame.render_widget(
                 Line::from(truncate(&end, inner.width.into()))
                     .fg(colors.muted)
@@ -799,7 +824,7 @@ fn draw_avatar(
     frame: &mut Frame,
     area: Rect,
     still: &Preview,
-    at: (u16, u16),
+    at: (u16, i16),
     images: &mut Images,
     covered: bool,
 ) {
@@ -808,7 +833,7 @@ fn draw_avatar(
         return;
     }
     if let Some(image) = images.get(still, AVATAR_COLS, AVATAR_ROWS, covered) {
-        let position = SignedPosition::from((at.0 as i16, at.1 as i16));
+        let position = SignedPosition::from((at.0 as i16, at.1));
         frame.render_widget(SlicedImage::new(image, position), area);
     }
 }
@@ -840,6 +865,53 @@ mod tests {
 
     fn text(spans: &[Span]) -> String {
         spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn what_counts_as_in_view_is_where_the_view_comes_to_rest_not_what_it_slides_past() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui_image::picker::Picker;
+
+        let run = |glide_at: Option<tokio::time::Instant>| {
+            let mut feed = Feed::new(Network::Threads);
+            let load = feed.start_load(false).unwrap();
+            let posts = (1..=3).map(|id| {
+                let fields = serde_json::json!({"media": [], "caption": "a\nb\nc\nd\ne\nf",
+                    "url": "https://www.threads.com/@alice.example/post/ABC"});
+                crate::feed::tests::post(id, fields)
+            });
+            feed.on_page(load, Ok((posts.collect(), false)));
+            let mut images = Images::new(
+                Picker::halfblocks(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            );
+            let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+            let mut frame_of = |feed: &mut Feed, at: Option<tokio::time::Instant>| {
+                terminal
+                    .draw(|frame| {
+                        let view = View {
+                            feed,
+                            focused: true,
+                            covered: false,
+                            playing: None,
+                            progress: None,
+                            glide_at: at,
+                        };
+                        draw(frame, frame.area(), view, &mut images, &Colors::default());
+                    })
+                    .unwrap();
+            };
+            frame_of(&mut feed, None);
+            feed.move_cursor(1);
+            frame_of(&mut feed, glide_at);
+            feed
+        };
+        let start = tokio::time::Instant::now();
+        let sliding = run(Some(start));
+        assert!(sliding.glide_frame(start).is_some(), "on its way");
+        assert_eq!(sliding.drawn, run(None).drawn);
+        assert!(!sliding.drawn.contains(&1), "{:?}", sliding.drawn);
     }
 
     #[test]
@@ -1022,6 +1094,7 @@ mod tests {
                     covered: false,
                     playing: None,
                     progress: None,
+                    glide_at: None,
                 };
                 draw(frame, frame.area(), view, &mut images, &Colors::default());
             })

@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use tokio::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use super::{Cover, border, bordered, truncate};
@@ -54,6 +55,10 @@ pub struct View<'a> {
     /// Where that video is and how long it is, in seconds, once its player
     /// says: the seek bar under it.
     pub progress: Option<(f64, f64)>,
+    /// The time of this frame, when the view may slide to where the cursor
+    /// took it: not under a popup, with smooth scrolling off, or where a
+    /// picture would be sent again for every row it moves (sixel, iTerm2).
+    pub glide_at: Option<Instant>,
 }
 
 /// Draws the feed in `area`. Returns where the video playing is to show,
@@ -112,6 +117,7 @@ pub fn draw(
         FRAME_ROWS + rows + caption.len() as u16
     };
     // The selected post in view, all of it if it fits.
+    let before = feed.top;
     feed.selected = feed.selected.min(feed.posts.len() - 1);
     feed.top = feed.top.min(feed.selected);
     while feed.top < feed.selected
@@ -122,12 +128,13 @@ pub fn draw(
     {
         feed.top += 1;
     }
+    let off = feed.glide_rows(before, inner.height, view.glide_at, height);
+    let pane = i32::from(inner.height);
 
     let now = Local::now().timestamp();
     let mut video_box = None;
-    let mut y: u16 = 0;
-    let mut i = feed.top;
-    while i < feed.posts.len() && y < inner.height {
+    let (mut i, mut y) = feed.first_drawn(off, height);
+    while i < feed.posts.len() && y < pane {
         let ((cols, rows), caption) = layout(feed, i);
         let post = &feed.posts[i];
         let index = feed.shown_index(post);
@@ -162,45 +169,67 @@ pub fn draw(
         );
         lines.push(Line::default());
         let total = lines.len() as u16;
-        let shown = total.min(inner.height - y);
-        let at = Rect {
-            y: inner.y + y,
-            height: shown,
-            ..column
-        };
-        frame.render_widget(Paragraph::new(lines), at);
+        let (at, above) = post_rows(column, y, total);
+        frame.render_widget(Paragraph::new(lines).scroll((above, 0)), at);
         // The photo, centered under the author and the blank row after.
         let x = 2 + width.saturating_sub(cols) / 2;
         let media_y = y + 2;
+        let media_end = media_y + i32::from(rows);
+        let middle = media_y + i32::from(rows / 2);
         if let Some(still) = item.and_then(|it| it.still.as_ref()) {
-            draw_still(
-                frame,
-                column,
-                still,
-                (x, media_y),
-                (cols, rows),
-                images,
-                view.covered,
-                colors,
-            );
-        } else if item.is_some_and(|it| it.video) && media_y + rows / 2 < inner.height {
-            let row = Rect::new(column.x + x, inner.y + media_y + rows / 2, cols, 1);
+            // One slid past the pane's top isn't asked for.
+            if media_end > 0 {
+                draw_still(
+                    frame,
+                    column,
+                    still,
+                    (x, media_y as i16),
+                    (cols, rows),
+                    images,
+                    view.covered,
+                    colors,
+                );
+            }
+        } else if item.is_some_and(|it| it.video) && (0..pane).contains(&middle) {
+            let row = Rect::new(column.x + x, inner.y + middle as u16, cols, 1);
             frame.render_widget(Line::from("▶ Video").fg(colors.subtle).centered(), row);
         }
-        // Pepper's box can't be cut by the pane's edge: all of it, or none.
-        if playing.is_some() && media_y + rows <= inner.height {
-            video_box = Some(Rect::new(column.x + x, inner.y + media_y, cols, rows));
+        // Pepper's box can't be cut by the pane's edge: all of it, or none,
+        // and it would be told of every row of a slide: it waits for the
+        // view to rest.
+        if off == 0 && playing.is_some() && media_end <= pane {
+            video_box = Some(Rect::new(
+                column.x + x,
+                inner.y + media_y as u16,
+                cols,
+                rows,
+            ));
         }
         // The seek bar, in the blank row right under it.
-        if playing.is_some()
+        if off == 0
+            && playing.is_some()
             && let Some((position, length)) = view.progress
-            && media_y + rows < inner.height
+            && media_end < pane
         {
-            let row = Rect::new(column.x + x, inner.y + media_y + rows, cols, 1);
+            let row = Rect::new(column.x + x, inner.y + media_end as u16, cols, 1);
             frame.render_widget(seek_bar(position, length, cols.into(), colors), row);
         }
-        y = y.saturating_add(total);
+        y += i32::from(total);
         i += 1;
+    }
+    // Where the view is going comes first, though it's not in the pane yet.
+    if off != 0 {
+        let (mut i, mut y) = (feed.top, 0);
+        while i < feed.posts.len() && y < inner.height {
+            let post = &feed.posts[i];
+            let item = post.media.get(feed.shown_index(post));
+            if let Some(still) = item.and_then(|it| it.still.as_ref()) {
+                let ((cols, rows), _) = layout(feed, i);
+                images.want(still, cols, rows);
+            }
+            y = y.saturating_add(height(feed, i));
+            i += 1;
+        }
     }
     // The next posts' photos download before they're in view, and the
     // nearest few are made into images at the size they'll be drawn
@@ -218,10 +247,10 @@ pub fn draw(
             }
         }
     }
-    if i == feed.posts.len() && y < inner.height {
+    if i == feed.posts.len() && (0..pane).contains(&y) {
         let end = feed_end(feed);
         if let Some(end) = end {
-            let row = Rect::new(inner.x, inner.y + y, inner.width, 1);
+            let row = Rect::new(inner.x, inner.y + y as u16, inner.width, 1);
             frame.render_widget(
                 Line::from(truncate(&end, inner.width.into()))
                     .fg(colors.muted)
@@ -576,6 +605,20 @@ fn media_cells(item: Option<&Item>, width: u16, max_rows: u16, font: FontSize) -
     )
 }
 
+/// The part of `column` a post of `total` rows takes when it starts at row
+/// `y` of it (above it, less than 0, while the view slides), and how many
+/// of the post's rows that leaves out at the top.
+pub(super) fn post_rows(column: Rect, y: i32, total: u16) -> (Rect, u16) {
+    let above = (-y).clamp(0, i32::from(total)) as u16;
+    let top = y.clamp(0, i32::from(column.height)) as u16;
+    let at = Rect {
+        y: column.y + top,
+        height: (total - above).min(column.height - top),
+        ..column
+    };
+    (at, above)
+}
+
 /// Paints a photo at `at` (inside `area`) over `size` cells, or says it's
 /// coming. Under a popup, sixel and iTerm2 pictures wait, as in a chat.
 #[allow(clippy::too_many_arguments)]
@@ -583,7 +626,7 @@ pub(super) fn draw_still(
     frame: &mut Frame,
     area: Rect,
     still: &Preview,
-    at: (u16, u16),
+    at: (u16, i16),
     size: (u16, u16),
     images: &mut Images,
     covered: bool,
@@ -595,17 +638,22 @@ pub(super) fn draw_still(
         return;
     }
     if let Some(image) = images.get(still, cols, rows, covered) {
-        let position = SignedPosition::from((at.0 as i16, at.1 as i16));
+        let position = SignedPosition::from((at.0 as i16, at.1));
         frame.render_widget(SlicedImage::new(image, position), area);
         return;
     }
-    let middle = at.1 + rows / 2;
-    if middle < area.height {
+    let middle = at.1 + (rows / 2) as i16;
+    if (0..area.height as i16).contains(&middle) {
         let label = match images.is_broken(still) {
             true => "Preview unavailable",
             false => "Loading…",
         };
-        let row = Rect::new(area.x + at.0, area.y + middle, cols.min(area.width), 1);
+        let row = Rect::new(
+            area.x + at.0,
+            area.y + middle as u16,
+            cols.min(area.width),
+            1,
+        );
         frame.render_widget(Line::from(label).fg(colors.subtle).centered(), row);
     }
 }
@@ -613,6 +661,154 @@ pub(super) fn draw_still(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `n` posts, by "Post 1", "Post 2"…, each `media` shows.
+    fn feed_of(n: i64, media: serde_json::Value) -> (Feed, Images) {
+        use ratatui_image::picker::Picker;
+        let mut feed = Feed::new(crate::meta::Network::Instagram);
+        let load = feed.start_load(false).unwrap();
+        let posts = (1..=n).map(|id| {
+            let name = format!("Post {id}");
+            let mut fields = serde_json::json!({"author": {"name": name, "username": "someone"}});
+            if media.is_array() {
+                fields["media"] = media.clone();
+            }
+            crate::feed::tests::post(id, fields)
+        });
+        feed.on_page(load, Ok((posts.collect(), false)));
+        let images = Images::new(
+            Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        (feed, images)
+    }
+
+    /// Draws the feed in 24 rows, which one post nearly fills: what's on
+    /// the screen's rows, and where the video's box went.
+    fn drawn(
+        feed: &mut Feed,
+        images: &mut Images,
+        glide_at: Option<Instant>,
+        playing: Option<(i64, i32, &'static str)>,
+    ) -> (Vec<String>, Option<Rect>) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (cols, rows) = (80, 26);
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        let mut video = None;
+        terminal
+            .draw(|frame| {
+                let view = View {
+                    feed: &mut *feed,
+                    focused: true,
+                    covered: false,
+                    playing,
+                    progress: None,
+                    glide_at,
+                };
+                video = draw(frame, frame.area(), view, images, &Colors::default());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row = |y: u16| (0..cols).map(|x| buf[(x, y)].symbol()).collect();
+        ((0..rows).map(row).collect(), video)
+    }
+
+    fn row_of(rows: &[String], text: &str) -> Option<usize> {
+        rows.iter().position(|r| r.contains(text))
+    }
+
+    #[test]
+    fn the_view_jumps_most_of_the_way_then_eases_onto_the_post_and_rests_there() {
+        use crate::motion::{GLIDE, GLIDE_ROWS};
+        let (mut feed, mut images) = feed_of(3, serde_json::Value::Null);
+        let start = Instant::now();
+        let (rest, _) = drawn(&mut feed, &mut images, Some(start), None);
+        assert_eq!(row_of(&rest, "Post 1"), Some(1));
+        let far = row_of(&rest, "Post 2").unwrap() - 1;
+
+        feed.move_cursor(1);
+        let (first, _) = drawn(&mut feed, &mut images, Some(start), None);
+        let settle = GLIDE_ROWS as usize;
+        assert!(far > settle, "a post further away than a settle");
+        assert_eq!(row_of(&first, "Post 2"), Some(1 + settle), "{first:#?}");
+        assert_eq!(row_of(&first, "Post 1"), None, "already above the pane");
+        assert_eq!(feed.top, 1, "where it's going");
+
+        let halfway = start + GLIDE / 2;
+        let (half, _) = drawn(&mut feed, &mut images, Some(halfway), None);
+        let left = (GLIDE_ROWS as f32 / 8.0).round() as usize;
+        assert_eq!(row_of(&half, "Post 2"), Some(1 + left), "{half:#?}");
+        assert_eq!(
+            row_of(&half, "Post 1"),
+            None,
+            "its author is above the pane"
+        );
+        assert!(feed.glide_frame(halfway).is_some());
+
+        let end = start + GLIDE;
+        let (settled, _) = drawn(&mut feed, &mut images, Some(end), None);
+        assert_eq!(row_of(&settled, "Post 2"), Some(1));
+        assert_eq!(feed.glide_frame(end), None, "no more frames");
+    }
+
+    #[test]
+    fn going_back_up_the_post_above_comes_down_from_behind_the_panes_top() {
+        use crate::motion::{GLIDE, GLIDE_ROWS};
+        let (mut feed, mut images) = feed_of(3, serde_json::Value::Null);
+        let (rest, _) = drawn(&mut feed, &mut images, None, None);
+        let far = row_of(&rest, "Post 2").unwrap() - 1;
+        let counts = row_of(&rest, "12 likes").unwrap() - 1;
+        feed.move_cursor(1);
+        drawn(&mut feed, &mut images, None, None);
+
+        let start = Instant::now();
+        feed.move_cursor(-1);
+        let (first, _) = drawn(&mut feed, &mut images, Some(start), None);
+        assert_eq!(
+            row_of(&first, "Post 2"),
+            Some(1 + far - GLIDE_ROWS as usize),
+            "most of the way at once"
+        );
+
+        let (half, _) = drawn(&mut feed, &mut images, Some(start + GLIDE / 2), None);
+        let left = (GLIDE_ROWS as f32 / 8.0).round() as usize;
+        assert_eq!(row_of(&half, "Post 1"), None, "still behind the top");
+        assert_eq!(
+            row_of(&half, "12 likes"),
+            Some(1 + counts - left),
+            "the rows of it that show are its last ones: {half:#?}"
+        );
+        assert_eq!(row_of(&half, "Post 2"), Some(1 + far - left));
+
+        let (settled, _) = drawn(&mut feed, &mut images, Some(start + GLIDE), None);
+        assert_eq!(row_of(&settled, "Post 1"), Some(1));
+    }
+
+    #[test]
+    fn with_no_time_to_slide_in_the_post_is_there_at_once() {
+        let (mut feed, mut images) = feed_of(3, serde_json::Value::Null);
+        drawn(&mut feed, &mut images, None, None);
+        feed.move_cursor(1);
+        let (rows, _) = drawn(&mut feed, &mut images, None, None);
+        assert_eq!(row_of(&rows, "Post 2"), Some(1));
+        assert_eq!(feed.glide_frame(Instant::now()), None);
+    }
+
+    #[test]
+    fn a_video_gets_its_box_only_once_the_view_rests() {
+        use crate::motion::GLIDE;
+        let media = serde_json::json!([{"kind": "video", "file_id": 7, "duration": 15}]);
+        let (mut feed, mut images) = feed_of(3, media);
+        let start = Instant::now();
+        drawn(&mut feed, &mut images, Some(start), None);
+        feed.move_cursor(1);
+        let playing = Some((2, 7, "playing"));
+        let (_, on_the_way) = drawn(&mut feed, &mut images, Some(start), playing);
+        assert_eq!(on_the_way, None);
+        let (_, there) = drawn(&mut feed, &mut images, Some(start + GLIDE), playing);
+        assert!(there.is_some());
+    }
 
     #[test]
     fn full_screen_a_video_keeps_its_shape_and_one_of_no_known_shape_takes_all_the_room() {
@@ -808,6 +1004,7 @@ mod tests {
                     covered: false,
                     playing: None,
                     progress: None,
+                    glide_at: None,
                 };
                 draw(frame, frame.area(), view, &mut images, &Colors::default());
             })

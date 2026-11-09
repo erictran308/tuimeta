@@ -4,7 +4,10 @@
 use std::io::{self, Stdout, Write, stdout};
 
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, enable_raw_mode,
+};
+use ratatui::Frame;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::{Cell, CellWidth};
 use ratatui::layout::{Position, Size};
@@ -37,6 +40,26 @@ pub fn send(terminal: &mut Terminal, code: &str) -> io::Result<()> {
     let out = &mut terminal.backend_mut().0;
     out.write_all(code.as_bytes())?;
     Write::flush(out)
+}
+
+/// Draws a frame, with `whole` one the terminal shows all at once when it's
+/// finished rather than as it's written: a frame reaches it in many small
+/// writes, and one moving every row, painted part way through, looks torn.
+/// Terminals without synchronized output ignore the marks around it.
+pub fn draw<W: Write>(
+    terminal: &mut ratatui::Terminal<Crossterm<W>>,
+    whole: bool,
+    render: impl FnOnce(&mut Frame),
+) -> io::Result<()> {
+    if whole {
+        execute!(terminal.backend_mut().0, BeginSynchronizedUpdate)?;
+    }
+    let drawn = terminal.draw(render).map(|_| ());
+    // Even if drawing failed: the terminal would go on holding the screen.
+    if whole {
+        execute!(terminal.backend_mut().0, EndSynchronizedUpdate)?;
+    }
+    drawn
 }
 
 /// ratatui's crossterm backend, drawing each frame's changes in the order
@@ -303,5 +326,63 @@ mod tests {
         ];
         let expected: Vec<_> = expected.map(|(x, s)| (x, s.to_string())).to_vec();
         assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn a_frame_that_fails_to_draw_still_lets_go_of_the_screen() {
+        use ratatui::widgets::Paragraph;
+        use ratatui::{TerminalOptions, Viewport};
+
+        struct FailsOnX<'a>(&'a mut Vec<u8>);
+        impl Write for FailsOnX<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.contains(&b'x') {
+                    return Err(io::Error::other("gone"));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut out = Vec::new();
+        let backend = Crossterm(CrosstermBackend::new(FailsOnX(&mut out)));
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 5, 1));
+        let options = TerminalOptions { viewport };
+        let mut terminal = ratatui::Terminal::with_options(backend, options).unwrap();
+        let drawn = super::draw(&mut terminal, true, |frame| {
+            frame.render_widget(Paragraph::new("x"), frame.area());
+        });
+        assert!(drawn.is_err());
+        drop(terminal);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.ends_with("\x1b[?2026l"), "{out:?}");
+    }
+
+    #[test]
+    fn a_frame_drawn_whole_is_held_between_the_marks_and_others_are_not() {
+        use ratatui::widgets::Paragraph;
+        use ratatui::{TerminalOptions, Viewport};
+
+        let bytes = |whole: bool| {
+            let mut out = Vec::new();
+            let backend = Crossterm(CrosstermBackend::new(&mut out));
+            let viewport = Viewport::Fixed(Rect::new(0, 0, 5, 1));
+            let options = TerminalOptions { viewport };
+            let mut terminal = ratatui::Terminal::with_options(backend, options).unwrap();
+            super::draw(&mut terminal, whole, |frame| {
+                frame.render_widget(Paragraph::new("hello"), frame.area());
+            })
+            .unwrap();
+            drop(terminal);
+            String::from_utf8(out).unwrap()
+        };
+        let whole = bytes(true);
+        assert!(whole.starts_with("\x1b[?2026h"), "{whole:?}");
+        let text = whole.find("hello").expect("the frame");
+        assert!(whole[text..].contains("\x1b[?2026l"), "{whole:?}");
+        assert!(!bytes(false).contains("2026"));
     }
 }

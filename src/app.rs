@@ -32,7 +32,7 @@ use crate::picker::{ChatPicker, Choice};
 use crate::player::{self, Player, PlayerEvent};
 use crate::reactions::{self, ReactMenu};
 use crate::settings::{self, Settings, Side};
-use crate::term::Terminal;
+use crate::term::{self, Terminal};
 use crate::text;
 use crate::theme::{Colors, Corners, Themes};
 use crate::ui;
@@ -48,8 +48,6 @@ const MIN_LOADED: usize = 30;
 const LOAD_AHEAD: usize = 10;
 /// Rows moved by Ctrl-d / Ctrl-u.
 const HALF_PAGE: isize = 10;
-/// Posts of the feed moved by Ctrl-d / Ctrl-u.
-const FEED_JUMP: isize = 3;
 /// How long to wait for the helper to disconnect on quit.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a toast stays up.
@@ -424,8 +422,10 @@ impl SettingsMenu {
     pub const PILLS: usize = Self::CORNERS + 1;
     /// The "animations" row.
     pub const ANIMATIONS: usize = Self::PILLS + 1;
+    /// The "smooth scrolling in the feeds" row.
+    pub const SMOOTH_SCROLLING: usize = Self::ANIMATIONS + 1;
     /// The "Normal mode after sending" row.
-    pub const AFTER_SEND: usize = Self::ANIMATIONS + 1;
+    pub const AFTER_SEND: usize = Self::SMOOTH_SCROLLING + 1;
     /// The "wrap long lines in the composer" row.
     pub const WRAP_COMPOSER: usize = Self::AFTER_SEND + 1;
     /// The "sound while focused too" row, first under the sound's heading.
@@ -1024,8 +1024,10 @@ impl App {
             if failed.is_none() {
                 self.images.send_deletions(terminal);
             }
+            // A slide moves every row: shown half written, it would tear.
+            let whole = self.feed.as_ref().is_some_and(Feed::sliding);
             if failed.is_none()
-                && let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut self))
+                && let Err(e) = term::draw(terminal, whole, |frame| ui::draw(frame, &mut self))
             {
                 failed = Some(e.into());
                 self.hang_up();
@@ -1054,9 +1056,11 @@ impl App {
                 .as_ref()
                 .filter(|_| self.slides_toast())
                 .and_then(|t| motion::toast_frame(t.shown, t.until, Instant::now()));
+            let gliding = self.glide_wake();
             let wake = [
                 moving,
                 sliding,
+                gliding,
                 self.toast.as_ref().map(|t| t.until),
                 self.notifier.next_at(),
                 self.picker.as_ref().and_then(ChatPicker::search_at),
@@ -3606,6 +3610,16 @@ impl App {
             || self.picker.is_some()
     }
 
+    /// When to draw the feed's slide again, while the feed is what's drawn:
+    /// otherwise no frame would ever move it on, and the run loop would go
+    /// on waking for one.
+    fn glide_wake(&self) -> Option<Instant> {
+        if !matches!(self.screen, Screen::Main) || self.open.is_some() {
+            return None;
+        }
+        self.feed.as_ref()?.glide_frame(Instant::now())
+    }
+
     /// The toast slides in and out. Not where sixel or iTerm2 pictures may
     /// be under it: a picture's cells uncovered a frame at a time would
     /// send it to the terminal again each frame, over the toast.
@@ -4056,6 +4070,9 @@ impl App {
                     self.motion.stop();
                 }
             }
+            SettingsMenu::SMOOTH_SCROLLING => {
+                settings.smooth_scrolling = !settings.smooth_scrolling;
+            }
             SettingsMenu::AFTER_SEND => settings.normal_after_send = !settings.normal_after_send,
             SettingsMenu::WRAP_COMPOSER => settings.wrap_composer = !settings.wrap_composer,
             SettingsMenu::SOUND_FOCUSED => {
@@ -4367,8 +4384,8 @@ impl App {
         let motion = match key.code {
             KeyCode::Char('j') | KeyCode::Down => Some(1),
             KeyCode::Char('k') | KeyCode::Up => Some(-1),
-            KeyCode::Char('d') if ctrl => Some(FEED_JUMP),
-            KeyCode::Char('u') if ctrl => Some(-FEED_JUMP),
+            KeyCode::Char('d') if ctrl => Some(feed::JUMP),
+            KeyCode::Char('u') if ctrl => Some(-feed::JUMP),
             KeyCode::Char('g') if pending_g => Some(isize::MIN),
             KeyCode::Char('G') => Some(isize::MAX),
             _ => None,
@@ -5332,6 +5349,57 @@ mod tests {
         let after = saved();
         assert!(!after.normal_after_send, "{after:?}");
         assert!(after.block_gaps, "{after:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_slide_wakes_the_run_loop_only_while_the_feed_is_what_is_drawn() {
+        let mut app = test_app("feed-glide-wake");
+        open_the_feed(&mut app);
+        let posts = (1..=6).map(|i| post(i, serde_json::json!({}))).collect();
+        feed_page(&mut app, posts, false);
+        screen(&mut app);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        screen(&mut app);
+        assert!(app.glide_wake().is_some());
+        app.screen = login_screen(LoginStep::Choose { selected: 0 });
+        assert_eq!(app.glide_wake(), None, "the login screen draws no feed");
+    }
+
+    #[test]
+    fn smooth_scrolling_has_a_row_of_its_own_and_works_apart_from_animations() {
+        let dir = std::env::temp_dir().join(format!("tuimeta-smooth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let images = Images::new(Picker::halfblocks(), unbounded_channel().0);
+        let meta = Meta::detached(unbounded_channel().0);
+        let mut app = crate::demo::demo_app(meta, images, &dir);
+        let none = KeyModifiers::NONE;
+        press(&mut app, KeyCode::Char('?'), none);
+        press(&mut app, KeyCode::Tab, none);
+        app.settings_menu.as_mut().unwrap().selected = SettingsMenu::ANIMATIONS;
+        press(&mut app, KeyCode::Char('j'), none);
+        let menu = app.settings_menu.as_ref().unwrap();
+        assert_eq!(menu.selected, SettingsMenu::SMOOTH_SCROLLING);
+        press(&mut app, KeyCode::Enter, none);
+        let saved = Settings::load(&settings::path(&dir)).unwrap();
+        assert!(!saved.smooth_scrolling, "{saved:?}");
+        assert!(saved.animations, "only its own: {saved:?}");
+        press(&mut app, KeyCode::Esc, none);
+
+        open_the_feed(&mut app);
+        let posts = (1..=6).map(|i| post(i, serde_json::json!({}))).collect();
+        feed_page(&mut app, posts, false);
+        let slides = |app: &mut App| {
+            screen(app);
+            press(app, KeyCode::Char('j'), KeyModifiers::NONE);
+            screen(app);
+            let feed = app.feed.as_ref().unwrap();
+            feed.glide_frame(Instant::now()).is_some()
+        };
+        assert!(!slides(&mut app), "off, with animations on");
+        app.settings.smooth_scrolling = true;
+        app.settings.animations = false;
+        assert!(slides(&mut app), "on, with animations off");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -8238,6 +8306,8 @@ mod tests {
     #[test]
     fn c_shows_a_posts_comments_beside_it_while_its_video_plays_on() {
         let mut app = test_app("feed-comments");
+        // A video's box waits for a slide to end, and no time passes here.
+        app.settings.smooth_scrolling = false;
         let none = KeyModifiers::NONE;
         app.pepper = Some(Pepper {
             port: "x.1".into(),

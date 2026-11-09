@@ -28,6 +28,9 @@ pub struct Settings {
     /// keys when tuimeta's window gets focus, popups fading in, new messages
     /// glowing as they come, and the toast sliding in and out.
     pub animations: bool,
+    /// In the feeds, moving to another post jumps most of the way and eases
+    /// the last rows, rather than jumping all of it. Apart from `animations`.
+    pub smooth_scrolling: bool,
     /// Chats highlighted with `H`, by id.
     pub highlighted_chats: Vec<i64>,
     /// How new messages are announced: "auto" picks what the terminal
@@ -66,6 +69,7 @@ impl Default for Settings {
             corners: Corners::default(),
             nerd_font: false,
             animations: true,
+            smooth_scrolling: true,
             highlighted_chats: Vec::new(),
             notifications: Notifications::default(),
             notification_sound: None,
@@ -107,7 +111,17 @@ impl Settings {
                 return Err(e).with_context(|| format!("cannot read {}", config::shown(path)));
             }
         };
-        toml::from_str(&text).with_context(|| format!("{} is invalid", config::shown(path)))
+        let mut settings: Self =
+            toml::from_str(&text).with_context(|| format!("{} is invalid", config::shown(path)))?;
+        // A file from before this setting: whoever had turned animations off
+        // asked for nothing to move, so it doesn't start to.
+        if text
+            .parse::<toml::Table>()
+            .is_ok_and(|table| !table.contains_key("smooth_scrolling"))
+        {
+            settings.smooth_scrolling = settings.animations;
+        }
+        Ok(settings)
     }
 
     /// The chat list's width as drawn, in percent: within [`LIST_WIDTHS`],
@@ -166,6 +180,7 @@ mod tests {
             corners: Corners::Square,
             nerd_font: true,
             animations: false,
+            smooth_scrolling: true,
             highlighted_chats: vec![-1001234567890, 42],
             notifications: Notifications::Off,
             notification_sound: Some("chime".into()),
@@ -180,7 +195,7 @@ mod tests {
         settings.save(&file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap().trim(),
-            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
+            "theme = \"latte\"\ncorners = \"square\"\nnerd_font = true\nanimations = false\nsmooth_scrolling = true\nhighlighted_chats = [-1001234567890, 42]\nnotifications = \"off\"\nnotification_sound = \"chime\"\nsound_when_focused = true\nnormal_after_send = true\nwrap_composer = false\nblock_gaps = false\nchat_gaps = false\nchat_list_side = \"right\"\nchat_list_width = 40"
         );
         assert_eq!(Settings::load(&file).unwrap(), settings);
         assert!(
@@ -204,6 +219,14 @@ mod tests {
         assert_eq!(old.corners, Corners::Auto);
         assert!(!old.nerd_font);
         assert!(old.animations);
+        assert!(old.smooth_scrolling);
+        std::fs::write(&file, "animations = false").unwrap();
+        assert!(
+            !Settings::load(&file).unwrap().smooth_scrolling,
+            "nothing that moved stays off with animations off"
+        );
+        std::fs::write(&file, "animations = false\nsmooth_scrolling = true").unwrap();
+        assert!(Settings::load(&file).unwrap().smooth_scrolling);
 
         // A theme that's gone is the app's to deal with, not a broken file.
         std::fs::write(&file, r#"theme = "deleted""#).unwrap();
