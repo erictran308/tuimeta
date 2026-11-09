@@ -2,6 +2,12 @@
 
 Older versions' changes are in the git log.
 
+## 0.6.0 (2026-11-09)
+
+### Added
+
+- **Smooth scrolling in Instagram's and Threads' feeds.** Moving to another post with `j`, `k`, `Ctrl-d` or `Ctrl-u` now jumps most of the way and eases the last few rows, instead of landing all at once. `gg` and `G` still jump, and so does every move on terminals that draw pictures with sixel or iTerm2's protocol. It has its own row in `?`, **Smooth scrolling** (`smooth_scrolling = false` in `settings.toml`), apart from **Animations**; if you had turned Animations off, it starts off too. What Threads is told about the posts you view doesn't change.
+
 ## 0.5.0 (2026-11-07)
 
 > [!CAUTION]
